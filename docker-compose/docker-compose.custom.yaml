@@ -1,0 +1,51 @@
+# GPUStack Custom Image Docker Compose
+# 使用阿里云 ACR 上的自定义镜像（含二开前端）
+#
+# 前置条件：
+#   1. 服务器上已登录阿里云 ACR：
+#      docker login --username=281541534@qq.com registry.cn-chengdu.aliyuncs.com
+#   2. 服务器有 GPU（可选，用于模型推理）
+#
+# 使用方法：
+#   cd docker-compose
+#   docker compose -f docker-compose.custom.yaml up -d
+#
+# 查看日志：
+#   docker logs -f gpustack-server
+
+services:
+  gpustack-server:
+    image: registry.cn-chengdu.aliyuncs.com/lmzjai/gpustack-custom:dev
+    container_name: gpustack-server
+    restart: unless-stopped
+    # GPU 支持（如需使用 GPU 推理，取消下面注释）
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    volumes:
+      - gpustack-data:/var/lib/gpustack
+      # 如需调用宿主机 Docker 部署 Worker，挂载 Docker socket
+      # - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "80:80"
+      # Higress 网关管理端口（如需外部访问可开放）
+      # - "10161:10161"
+    environment:
+      # 禁用内置可观测性（如需使用外部 Prometheus/Grafana，参考 docker-compose.external-observability.yaml）
+      # - GPUSTACK_DISABLE_BUILTIN_OBSERVABILITY=true
+      # 自定义数据目录
+      - GPUSTACK_DATA_DIR=/var/lib/gpustack
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    # 如需 privileged 模式运行（部分 GPU 检测需要）
+    # privileged: true
+
+volumes:
+  gpustack-data:
+    driver: local
