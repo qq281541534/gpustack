@@ -346,7 +346,60 @@ GPUStack **不支持 LDAP**。如需对接 LDAP/AD，建议使用 **Dex** 作为
 
 ---
 
-## 十、快速参考：OIDC 最小配置
+## 十、本地开发环境启动（含 SSO）
+
+### 10.1 启动命令
+
+```bash
+cd ~/thirdComponent/AI/gpustack
+
+GPUSTACK_DATABASE_URL="postgresql://postgres:ysf2020@127.0.0.1:5432/gpustack?sslmode=disable" \
+uv run gpustack start \
+  --port 8080 \
+  --api-port 38080 \
+  --data-dir ~/thirdComponent/AI/gpustack/data/gpustack \
+  --gateway-mode disabled \
+  --oidc-issuer "http://localhost:8100" \
+  --oidc-client-id "lmzj_ecdb42c6e7e541d949971942" \
+  --oidc-client-secret "avEIsPocJaHRJmD12eBnvt345VOdtB8MTPugErsZCcym2EKpkPQbOamNuBu5dnny" \
+  --oidc-redirect-uri "http://localhost:38080/auth/oidc/callback" \
+  --external-auth-name "preferred_username" \
+  --external-auth-full-name "name"
+```
+
+### 10.2 参数说明
+
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `--oidc-issuer` | `http://localhost:8100` | 公司 SSO 服务地址 |
+| `--oidc-client-id` | `lmzj_ecdb42c6e7e541d949971942` | OIDC Client ID |
+| `--oidc-client-secret` | `avEIsPocJaHRJmD12eBnvt345VOdtB8MTPugErsZCcym2EKpkPQbOamNuBu5dnny` | OIDC Client Secret |
+| `--oidc-redirect-uri` | `http://localhost:38080/auth/oidc/callback` | GPUStack 回调地址 |
+| `--external-auth-name` | `preferred_username` | 用户名字段映射 |
+| `--external-auth-full-name` | `name` | 全名字段映射 |
+
+### 10.3 测试访问
+
+1. 浏览器打开 `http://localhost:38080/`
+2. 登录页显示 **"Login with SSO"** 按钮
+3. 点击跳转至公司 SSO 登录页
+4. 登录成功后自动返回 GPUStack
+
+### 10.4 常见问题
+
+**登录页没有 SSO 按钮？**
+- 强制刷新浏览器（`Cmd+Shift+R`）
+- 检查 F12 Console 是否有报错
+- 确认前端产物已重新编译同步：
+  ```bash
+  cd ~/thirdComponent/AI/gpustack-ui && pnpm build
+  rm -rf ~/thirdComponent/AI/gpustack/gpustack/ui/*
+  cp -r ~/thirdComponent/AI/gpustack-ui/dist/* ~/thirdComponent/AI/gpustack/gpustack/ui/
+  ```
+
+---
+
+## 十一、快速参考：OIDC 最小配置
 
 ```bash
 # 启动参数方式
