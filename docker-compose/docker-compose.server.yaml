@@ -1,6 +1,6 @@
 services:
   gpustack-server:
-    image: ${IMAGE_REGISTRY:-docker.io}/${IMAGE_NAMESPACE:-gpustack}/gpustack:${GPUSTACK_TAG:-latest}
+    image: ${IMAGE_REGISTRY:-registry.cn-chengdu.aliyuncs.com}/${IMAGE_NAMESPACE:-lmzjai}/gpustack-custom:${GPUSTACK_TAG:-dev}
     container_name: gpustack-server
     restart: unless-stopped
     volumes:
