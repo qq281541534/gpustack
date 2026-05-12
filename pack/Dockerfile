@@ -54,6 +54,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LC_ALL='en_US.UTF-8'
 
 RUN <<EOF
+    # Replace APT source to Alibaba Cloud mirror
+    sed -i 's|http://archive.ubuntu.com/ubuntu/|https://mirrors.aliyun.com/ubuntu/|g' /etc/apt/sources.list
+    sed -i 's|http://security.ubuntu.com/ubuntu/|https://mirrors.aliyun.com/ubuntu/|g' /etc/apt/sources.list
+
     # Tools
 
     # Refresh
@@ -241,6 +245,7 @@ hatchling
 py-spy
 poetry
 EOT
+    pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple
     pip install -r /tmp/requirements.txt
 
     # Cleanup
@@ -390,7 +395,7 @@ COPY docker-compose/grafana/grafana_dashboards/ /etc/dashboards/
 
 ## Install Skopeo
 
-ARG GOPROXY="https://proxy.golang.org,direct"
+ARG GOPROXY="https://goproxy.cn,direct"
 
 RUN <<EOF
     # Skopeo
@@ -513,7 +518,7 @@ RUN --mount=type=cache,target=/root/.cache \
         WHEEL_PACKAGE="$(ls /workspace/gpustack/dist/*.whl)[audio]";
     fi
 
-    uv pip install --no-build-isolation --extra-index-url https://download.pytorch.org/whl/cpu/ \
+    uv pip install --no-build-isolation --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pytorch-wheels/cpu/ \
         ${WHEEL_PACKAGE}
 
     # Download tools

@@ -34,6 +34,12 @@ function download_ui() {
   local tmp_ui_path="${ui_path}/tmp"
   local tag="latest"
 
+  # 优先使用本地已存在的 UI（支持二开自定义前端）
+  if [[ -d "${ui_path}" && -f "${ui_path}/index.html" ]]; then
+    gpustack::log::info "local UI assets found, skipping remote download"
+    return
+  fi
+
   if [[ "${GIT_VERSION}" != "v0.0.0" ]]; then
     tag="${GIT_VERSION}"
   fi
