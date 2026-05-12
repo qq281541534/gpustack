@@ -217,7 +217,127 @@ https://github.com/gpustack/gpustack/releases
 
 ---
 
-## 六、快速参考
+## 六、镜像构建与部署
+
+### 6.1 GitHub Actions 自动构建（推荐）
+
+本项目已配置 GitHub Actions，支持在 GitHub 云端自动构建 Docker 镜像并推送到阿里云 ACR。
+
+**前置条件**：
+1. 在 GitHub 仓库 `Settings → Secrets and variables → Actions` 中配置以下 Secrets：
+   - `ALIYUN_ACR_USERNAME`: `281541534@qq.com`
+   - `ALIYUN_ACR_PASSWORD`: `lmzjai@2026`
+2. 阿里云 ACR 命名空间 `lmzjai` 和镜像仓库 `gpustack-custom` 已创建
+
+**触发构建**：
+1. 打开 GitHub 仓库 → **Actions** 标签
+2. 选择 **Build Custom GPUStack Image**
+3. 点击右侧 **Run workflow**
+4. 参数说明：
+   - `tag`: 镜像标签，默认 `dev`
+   - `frontend_ref`: 前端仓库分支，默认 `dev`
+   - `push_image`: 勾选则推送到阿里云 ACR
+
+**构建流程**：
+```
+拉取后端代码(dev) → 拉取前端代码(gpustack-ui/dev) → 编译前端 → 复制到 gpustack/ui/
+→ 构建 linux/amd64 Docker 镜像 → 推送到 registry.cn-chengdu.aliyuncs.com/lmzjai/gpustack-custom:<tag>
+```
+
+构建预计 **15~30 分钟**。
+
+### 6.2 本地构建脚本（可选）
+
+如需在本地构建镜像（需 Docker 环境能访问 Docker Hub）：
+
+```bash
+# 赋予执行权限
+chmod +x hack/build-image.sh
+
+# 默认构建（linux/amd64，使用国内镜像源）
+./hack/build-image.sh
+
+# 指定标签和平台
+./hack/build-image.sh --tag v1.0.0 --platform linux/amd64
+
+# 查看帮助
+./hack/build-image.sh --help
+```
+
+> ⚠️ **注意**：本地构建需要能正常访问 Docker Hub 拉取基础镜像。当前本地环境因网络限制无法完成构建，建议使用 GitHub Actions。
+
+### 6.3 Docker Compose 部署
+
+项目已修改 `docker-compose/` 下的配置文件，默认使用阿里云 ACR 自定义镜像。
+
+**镜像地址**：
+```
+registry.cn-chengdu.aliyuncs.com/lmzjai/gpustack-custom:dev
+```
+
+**部署步骤**：
+
+```bash
+# 1. 登录阿里云 ACR（服务器上只需执行一次）
+docker login --username=281541534@qq.com registry.cn-chengdu.aliyuncs.com
+# 输入密码: lmzjai@2026
+
+# 2. 进入 docker-compose 目录
+cd docker-compose
+
+# 3. 启动服务（默认配置，内置 PostgreSQL + Higress + Grafana + Prometheus）
+docker compose -f docker-compose.server.yaml up -d
+
+# 4. 查看日志
+docker logs -f gpustack-server
+
+# 5. 访问
+http://<服务器IP>/
+```
+
+**如需使用外部监控（Prometheus + Grafana）**：
+
+```bash
+docker compose -f docker-compose.external-observability.yaml up -d
+```
+
+**GPU 支持（可选）**：
+
+编辑 `docker-compose.server.yaml`，取消 `deploy.resources.reservations.devices` 段的注释即可启用 NVIDIA GPU 支持。
+
+**环境变量覆盖**：
+
+如需临时切换回官方镜像或其他镜像，可通过环境变量覆盖：
+
+```bash
+IMAGE_REGISTRY=docker.io IMAGE_NAMESPACE=gpustack GPUSTACK_TAG=latest \
+docker compose -f docker-compose.server.yaml up -d
+```
+
+### 6.4 二开前端产物同步
+
+前端二开代码在 `gpustack-ui` 仓库中修改。如需更新后端中的前端产物：
+
+```bash
+# 1. 编译前端
+cd ~/thirdComponent/AI/gpustack-ui
+pnpm build
+
+# 2. 复制到后端
+rm -rf ~/thirdComponent/AI/gpustack/gpustack/ui/*
+cp -r ~/thirdComponent/AI/gpustack-ui/dist/* ~/thirdComponent/AI/gpustack/gpustack/ui/
+
+# 3. 提交（如需要）
+cd ~/thirdComponent/AI/gpustack
+git add gpustack/ui/
+git commit -m "chore: sync frontend build"
+```
+
+> 注：GitHub Actions 构建时已自动执行上述步骤，从 `gpustack-ui/dev` 分支拉取并编译前端，无需手动同步。
+
+---
+
+## 七、快速参考
 
 | 操作 | 命令 |
 |------|------|
@@ -228,6 +348,10 @@ https://github.com/gpustack/gpustack/releases
 | 合并上游 | `git merge upstream/main` |
 | 创建功能分支 | `git checkout -b feature/xxx` |
 | 推送分支 | `git push origin feature/xxx` |
+| 本地构建镜像 | `./hack/build-image.sh --tag v1.0.0` |
+| Docker Compose 部署 | `docker compose -f docker-compose.server.yaml up -d` |
+| 登录阿里云 ACR | `docker login --username=281541534@qq.com registry.cn-chengdu.aliyuncs.com` |
+| 前端产物同步 | `cp -r gpustack-ui/dist/* gpustack/ui/` |
 
 ---
 
