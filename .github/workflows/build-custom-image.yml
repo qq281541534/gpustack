@@ -1,0 +1,139 @@
+# GitHub Actions Workflow: Build Custom GPUStack Docker Image
+# Builds GPUStack backend + customized frontend, pushes to Aliyun ACR.
+# Trigger: Manual (workflow_dispatch)
+
+name: Build Custom GPUStack Image
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '镜像标签 (例如: dev, v1.0.0, latest)'
+        required: true
+        default: 'dev'
+      frontend_ref:
+        description: '前端仓库分支/标签 (gpustack-ui)'
+        required: true
+        default: 'dev'
+      push_image:
+        description: '构建完成后推送到阿里云 ACR'
+        type: boolean
+        required: true
+        default: true
+
+env:
+  # 阿里云 ACR 配置
+  ACR_REGISTRY: registry.cn-chengdu.aliyuncs.com
+  ACR_NAMESPACE: lmzjai
+  ACR_REPOSITORY: gpustack-custom
+
+jobs:
+  build-custom-image:
+    name: Build & Push Custom Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      # --------------------------------------------------------------
+      # 1. Checkout Backend (当前仓库)
+      # --------------------------------------------------------------
+      - name: Checkout GPUStack Backend
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # --------------------------------------------------------------
+      # 2. Checkout Frontend (gpustack-ui 二开仓库)
+      # --------------------------------------------------------------
+      - name: Checkout GPUStack UI (Frontend)
+        uses: actions/checkout@v4
+        with:
+          repository: qq281541534/gpustack-ui
+          ref: ${{ github.event.inputs.frontend_ref }}
+          path: gpustack-ui
+
+      # --------------------------------------------------------------
+      # 3. Setup Node.js + pnpm
+      # --------------------------------------------------------------
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: gpustack-ui/pnpm-lock.yaml
+
+      # --------------------------------------------------------------
+      # 4. Build Frontend
+      # --------------------------------------------------------------
+      - name: Build Frontend
+        run: |
+          cd gpustack-ui
+          pnpm install --frozen-lockfile
+          pnpm build
+          echo "Frontend build completed."
+          ls -la dist/
+
+      # --------------------------------------------------------------
+      # 5. Copy Frontend Assets to Backend
+      # --------------------------------------------------------------
+      - name: Copy Frontend to Backend
+        run: |
+          rm -rf gpustack/ui
+          mkdir -p gpustack/ui
+          cp -r gpustack-ui/dist/* gpustack/ui/
+          echo "Frontend assets copied to gpustack/ui/"
+          ls -la gpustack/ui/
+
+      # --------------------------------------------------------------
+      # 6. Setup Docker Buildx
+      # --------------------------------------------------------------
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver-opts: |
+            env.BUILDKIT_STEP_LOG_MAX_SIZE=-1
+            env.BUILDKIT_STEP_LOG_MAX_SPEED=-1
+
+      # --------------------------------------------------------------
+      # 7. Login Aliyun ACR
+      # --------------------------------------------------------------
+      - name: Login to Aliyun ACR
+        if: github.event.inputs.push_image == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ALIYUN_ACR_USERNAME }}
+          password: ${{ secrets.ALIYUN_ACR_PASSWORD }}
+
+      # --------------------------------------------------------------
+      # 8. Docker Metadata
+      # --------------------------------------------------------------
+      - name: Docker Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/${{ env.ACR_REPOSITORY }}
+          tags: |
+            type=raw,value=${{ github.event.inputs.tag }}
+
+      # --------------------------------------------------------------
+      # 9. Build & Push
+      # --------------------------------------------------------------
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: pack/Dockerfile
+          platforms: linux/amd64
+          push: ${{ github.event.inputs.push_image == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            UI_DOWNLOAD=true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
