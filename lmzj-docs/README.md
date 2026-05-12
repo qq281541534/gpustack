@@ -134,7 +134,7 @@ git push origin main
 ```
 main (与官方同步，尽量不直接修改)
   │
-  ├── develop (内部开发主干，基于 main)
+  ├── dev (内部开发主干，基于 main)
   │     │
   │     ├── feature/xxx (具体功能分支)
   │     ├── feature/yyy
@@ -160,12 +160,12 @@ git checkout -b feature/my-custom-feature
 git add .
 git commit -m "feat: 自定义功能描述"
 
-# 5. 合并到 develop（或 main，视团队策略而定）
-git checkout develop
+# 5. 合并到 dev（或 main，视团队策略而定）
+git checkout dev
 git merge feature/my-custom-feature
 
 # 6. 推送
-git push origin develop
+git push origin dev
 ```
 
 ### 4.3 同步时的冲突处理
@@ -197,7 +197,7 @@ git push origin main
 
 ### 5.1 不要直接修改 main 分支
 
-`main` 分支建议保持与官方同步，这样每次 sync 最简单。所有二开代码应该在 `develop` 或 `feature/*` 分支上进行。
+`main` 分支建议保持与官方同步，这样每次 sync 最简单。所有二开代码应该在 `dev` 或 `feature/*` 分支上进行。
 
 ### 5.2 关注 Release 标签
 
