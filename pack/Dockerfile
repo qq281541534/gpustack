@@ -39,7 +39,7 @@ FROM gpustack/mirrored-higress-api-server:${HIGRESS_APISERVER_VERSION} AS apiser
 FROM gpustack/mirrored-higress-higress:${HIGRESS_VERSION} AS controller
 FROM gpustack/mirrored-higress-pilot:${HIGRESS_VERSION} AS pilot
 FROM gpustack/mirrored-higress-gateway:${HIGRESS_VERSION} AS gateway
-FROM ubuntu:24.04@sha256:d1e2e92c075e5ca139d51a140fff46f84315c0fdce203eab2807c7e495eff4f9 AS base
+FROM ubuntu:24.04 AS base
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
 
 ARG TARGETPLATFORM
