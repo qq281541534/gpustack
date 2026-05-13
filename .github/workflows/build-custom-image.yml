@@ -84,10 +84,21 @@ jobs:
       # --------------------------------------------------------------
       - name: Copy Frontend to Backend
         run: |
-          rm -rf gpustack/ui
-          mkdir -p gpustack/ui
-          cp -r gpustack-ui/dist/* gpustack/ui/
-          echo "Frontend assets copied to gpustack/ui/"
+          # 如果后端仓库已包含自定义 UI（二开产物已提交），优先使用
+          if [ -f "gpustack/ui/index.html" ] && [ -d "gpustack-ui/dist" ]; then
+            echo "Backend already has custom UI, merging with latest frontend build..."
+            rm -rf gpustack/ui
+            mkdir -p gpustack/ui
+            cp -r gpustack-ui/dist/* gpustack/ui/
+          elif [ -d "gpustack-ui/dist" ]; then
+            echo "Using freshly built frontend from gpustack-ui..."
+            rm -rf gpustack/ui
+            mkdir -p gpustack/ui
+            cp -r gpustack-ui/dist/* gpustack/ui/
+          else
+            echo "Using existing UI assets from backend repo"
+          fi
+          echo "Frontend assets ready in gpustack/ui/"
           ls -la gpustack/ui/
 
       # --------------------------------------------------------------
