@@ -13,6 +13,8 @@ services:
     ports:
       - "80:80"
       - "10161:10161"
+    networks:
+      - docker_default
 
   prometheus:
     image: ${IMAGE_REGISTRY:-docker.io}/${PROMETHEUS_IMAGE_NAMESPACE:-prom}/prometheus:${PROMETHEUS_TAG:-latest}
@@ -45,3 +47,7 @@ services:
 volumes:
   prom_data: {}
   gpustack-data: {}
+
+networks:
+  docker_default:
+    external: true

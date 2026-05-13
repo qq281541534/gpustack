@@ -9,6 +9,12 @@ services:
       - gpustack-data:/var/lib/gpustack
     ports:
       - "8080:80"
+    networks:
+      - docker_default
 
 volumes:
   gpustack-data: {}
+
+networks:
+  docker_default:
+    external: true
