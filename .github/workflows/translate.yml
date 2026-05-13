@@ -10,6 +10,8 @@ on:
     types: [created, edited]
 jobs:
   translate:
+    # Disabled in fork: upstream translation workflow not needed
+    if: false
     permissions:
       issues: write
       discussions: write

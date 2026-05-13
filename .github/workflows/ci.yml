@@ -18,6 +18,8 @@ on:
 
 jobs:
   linux-build:
+    # Disabled in fork: upstream CI not applicable to our custom build workflow
+    if: false
     timeout-minutes: 20
     runs-on: ubuntu-latest
 

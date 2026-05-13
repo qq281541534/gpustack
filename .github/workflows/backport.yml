@@ -19,6 +19,8 @@ permissions:
 
 jobs:
   backport:
+    # Disabled in fork: upstream backport workflow not needed
+    if: false
     name: Backport pull request
     runs-on: ubuntu-latest
     if: github.event.pull_request.merged || github.event_name == 'workflow_dispatch'

@@ -44,6 +44,8 @@ env:
 
 jobs:
   pack:
+    # Disabled in fork: upstream Docker packaging not applicable, we use build-custom-image.yml instead
+    if: false
     runs-on: ubuntu-22.04
     timeout-minutes: 360
     steps:
