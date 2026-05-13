@@ -3,6 +3,8 @@ services:
     image: ${IMAGE_REGISTRY:-registry.cn-chengdu.aliyuncs.com}/${IMAGE_NAMESPACE:-lmzjai}/gpustack-custom:${GPUSTACK_TAG:-dev}
     container_name: gpustack-server
     restart: unless-stopped
+    env_file:
+      - .env
     volumes:
       - gpustack-data:/var/lib/gpustack
     ports:

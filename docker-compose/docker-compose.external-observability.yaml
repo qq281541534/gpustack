@@ -3,6 +3,8 @@ services:
     image: ${IMAGE_REGISTRY:-registry.cn-chengdu.aliyuncs.com}/${GPUSTACK_IMAGE_NAMESPACE:-lmzjai}/gpustack-custom:${GPUSTACK_TAG:-dev}
     container_name: gpustack-server
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       - GPUSTACK_DISABLE_BUILTIN_OBSERVABILITY=true
       - GPUSTACK_GRAFANA_URL=${GPUSTACK_GRAFANA_URL:?set to browser-reachable Grafana URL}

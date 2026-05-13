@@ -314,6 +314,29 @@ IMAGE_REGISTRY=docker.io IMAGE_NAMESPACE=gpustack GPUSTACK_TAG=latest \
 docker compose -f docker-compose.server.yaml up -d
 ```
 
+**SSO 配置（OIDC / SAML）**：
+
+Docker Compose 部署已支持通过 `.env` 文件配置 SSO，参数留空即禁用 SSO（只显示本地登录）。
+
+```bash
+# 1. 复制模板
+cd docker-compose
+cp .env.example .env
+
+# 2. 编辑 .env，填写 SSO 参数（以 OIDC 为例）
+# GPUSTACK_OIDC_ISSUER=https://keycloak.example.com/realms/master
+# GPUSTACK_OIDC_CLIENT_ID=gpustack
+# GPUSTACK_OIDC_CLIENT_SECRET=<your-secret>
+# GPUSTACK_OIDC_REDIRECT_URI=https://gpustack.example.com/auth/oidc/callback
+# GPUSTACK_EXTERNAL_AUTH_NAME=preferred_username
+# GPUSTACK_EXTERNAL_AUTH_FULL_NAME=name
+
+# 3. 启动服务
+ docker compose -f docker-compose.server.yaml up -d
+```
+
+> 详细参数说明请参考 `SSO-INTEGRATION.md`。`.env` 文件已加入 `.gitignore`，不会被提交到仓库。
+
 ### 6.4 二开前端产物同步
 
 前端二开代码在 `gpustack-ui` 仓库中修改。如需更新后端中的前端产物：
@@ -350,6 +373,7 @@ git commit -m "chore: sync frontend build"
 | 推送分支 | `git push origin feature/xxx` |
 | 本地构建镜像 | `./hack/build-image.sh --tag v1.0.0` |
 | Docker Compose 部署 | `docker compose -f docker-compose.server.yaml up -d` |
+| Docker Compose + SSO | `cp docker-compose/.env.example docker-compose/.env` → 编辑 → `docker compose -f docker-compose.server.yaml up -d` |
 | 登录阿里云 ACR | `docker login --username=281541534@qq.com registry.cn-chengdu.aliyuncs.com` |
 | 前端产物同步 | `cp -r gpustack-ui/dist/* gpustack/ui/` |
 
