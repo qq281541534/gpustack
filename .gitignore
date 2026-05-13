@@ -63,6 +63,7 @@ local_settings.py
 # development db
 database.db
 .data
+data
 
 # Flask stuff:
 instance/
@@ -156,7 +157,7 @@ __pycache__/
 
 # GPUStack related
 */third_party/bin
-*/ui/
+
 *.ma
 
 # macOS
