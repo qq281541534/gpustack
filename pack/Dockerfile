@@ -138,7 +138,10 @@ RUN <<EOF
     # Install
     apt-get install -y --no-install-recommends \
         make ninja-build pkg-config ccache
-    curl --retry 3 --retry-connrefused -fL "https://github.com/Kitware/CMake/releases/download/v3.31.7/cmake-3.31.7-linux-$(uname -m).tar.gz" | tar -zx -C /usr --strip-components 1
+    curl --retry 3 --retry-connrefused -fL "https://github.com/Kitware/CMake/releases/download/v3.31.7/cmake-3.31.7-linux-$(uname -m).tar.gz" -o /tmp/cmake.tar.gz || \
+    curl --retry 3 --retry-connrefused -fL "https://mirrors.huaweicloud.com/cmake/3.31.7/cmake-3.31.7-linux-$(uname -m).tar.gz" -o /tmp/cmake.tar.gz; \
+    tar -zx -C /usr --strip-components 1 -f /tmp/cmake.tar.gz; \
+    rm -f /tmp/cmake.tar.gz
 
     # Install dependencies
     apt-get install -y --no-install-recommends \
@@ -200,7 +203,10 @@ RUN <<EOF
     # Update alternatives
     if [[ -f /etc/alternatives/python3 ]]; then update-alternatives --remove-all python3; fi; update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1
     if [[ -f /etc/alternatives/python ]]; then update-alternatives --remove-all python; fi; update-alternatives --install /usr/bin/python python /usr/bin/python${PYTHON_VERSION} 1
-    curl -sS "https://bootstrap.pypa.io/get-pip.py" | python${PYTHON_VERSION}
+    curl -sS --retry 3 --retry-connrefused "https://bootstrap.pypa.io/get-pip.py" -o /tmp/get-pip.py || \
+    curl -sS --retry 3 --retry-connrefused "https://mirrors.aliyun.com/pypi/simple/get-pip.py" -o /tmp/get-pip.py || \
+    python${PYTHON_VERSION} -m ensurepip --upgrade; \
+    if [ -f /tmp/get-pip.py ]; then python${PYTHON_VERSION} /tmp/get-pip.py; rm -f /tmp/get-pip.py; fi
     if [[ -f /etc/alternatives/2to3 ]]; then update-alternatives --remove-all 2to3; fi; update-alternatives --install /usr/bin/2to3 2to3 /usr/bin/2to3${PYTHON_VERSION} 1 || true
     if [[ -f /etc/alternatives/pydoc3 ]]; then update-alternatives --remove-all pydoc3; fi; update-alternatives --install /usr/bin/pydoc3 pydoc3 /usr/bin/pydoc${PYTHON_VERSION} 1 || true
     if [[ -f /etc/alternatives/idle3 ]]; then update-alternatives --remove-all idle3; fi; update-alternatives --install /usr/bin/idle3 idle3 /usr/bin/idle${PYTHON_VERSION} 1 || true
@@ -269,8 +275,10 @@ RUN set -eux; \
     esac; \
     echo "Installing s6-overlay ${S6_OVERLAY_VERSION} for arch: ${S6_ARCH} (from TARGETARCH=${TARGETARCH})"; \
     base_url="https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}"; \
+    mirror_url="https://ghfast.top/https://github.com/just-containers/s6-overlay/releases/download/v${S6_OVERLAY_VERSION}"; \
     for pkg in noarch ${S6_ARCH}; do \
-        wget -q -O "/tmp/s6-overlay-${pkg}.tar.xz" "${base_url}/s6-overlay-${pkg}.tar.xz"; \
+        wget -q -O "/tmp/s6-overlay-${pkg}.tar.xz" "${base_url}/s6-overlay-${pkg}.tar.xz" || \
+        wget -q -O "/tmp/s6-overlay-${pkg}.tar.xz" "${mirror_url}/s6-overlay-${pkg}.tar.xz"; \
     done \
     && echo "📦  Extracting s6-overlay ..." \
     && tar -C / -Jxpf /tmp/s6-overlay-noarch.tar.xz \
@@ -401,7 +409,11 @@ RUN <<EOF
     # Skopeo
 
     # Install Go
-    curl --retry 3 --retry-connrefused -fL "https://go.dev/dl/go1.23.3.${TARGETOS}-${TARGETARCH}.tar.gz" | tar -zx -C /usr/local
+    curl --retry 3 --retry-connrefused -fL "https://go.dev/dl/go1.23.3.${TARGETOS}-${TARGETARCH}.tar.gz" -o /tmp/go.tar.gz || \
+    curl --retry 3 --retry-connrefused -fL "https://dl.google.com/go/go1.23.3.${TARGETOS}-${TARGETARCH}.tar.gz" -o /tmp/go.tar.gz || \
+    curl --retry 3 --retry-connrefused -fL "https://mirrors.ustc.edu.cn/golang/go1.23.3.${TARGETOS}-${TARGETARCH}.tar.gz" -o /tmp/go.tar.gz; \
+    tar -zx -C /usr/local -f /tmp/go.tar.gz; \
+    rm -f /tmp/go.tar.gz
     export PATH="/usr/local/go/bin:${PATH}"
     export GOPROXY="${GOPROXY}"
     export
@@ -409,7 +421,13 @@ RUN <<EOF
     # Download
     git -C /tmp clone --recursive --shallow-submodules \
         --depth 1 --branch v1.20.0 --single-branch \
-        https://github.com/containers/skopeo.git skopeo
+        https://github.com/containers/skopeo.git skopeo || \
+    git -C /tmp clone --recursive --shallow-submodules \
+        --depth 1 --branch v1.20.0 --single-branch \
+        https://gitee.com/mirrors/skopeo.git skopeo || \
+    git -C /tmp clone --recursive --shallow-submodules \
+        --depth 1 --branch v1.20.0 --single-branch \
+        https://ghfast.top/https://github.com/containers/skopeo.git skopeo
 
     # Build and install
     pushd /tmp/skopeo \
@@ -470,14 +488,24 @@ RUN <<EOF
 
     curl --retry 3 --retry-connrefused -fL \
         "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-${PROM_ARCH}.tar.gz" \
-        | tar -zx -C /opt
+        -o /tmp/prometheus.tar.gz || \
+    curl --retry 3 --retry-connrefused -fL \
+        "https://ghfast.top/https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-${PROM_ARCH}.tar.gz" \
+        -o /tmp/prometheus.tar.gz; \
+    tar -zx -C /opt -f /tmp/prometheus.tar.gz; \
+    rm -f /tmp/prometheus.tar.gz
     mv "/opt/prometheus-${PROMETHEUS_VERSION}.linux-${PROM_ARCH}" /opt/prometheus
     ln -s /opt/prometheus/prometheus /usr/local/bin/prometheus
     ln -s /opt/prometheus/promtool /usr/local/bin/promtool
 
     curl --retry 3 --retry-connrefused -fL \
         "https://dl.grafana.com/oss/release/grafana-${GRAFANA_VERSION}.linux-${GRAFANA_ARCH}.tar.gz" \
-        | tar -zx -C /opt
+        -o /tmp/grafana.tar.gz || \
+    curl --retry 3 --retry-connrefused -fL \
+        "https://ghfast.top/https://dl.grafana.com/oss/release/grafana-${GRAFANA_VERSION}.linux-${GRAFANA_ARCH}.tar.gz" \
+        -o /tmp/grafana.tar.gz; \
+    tar -zx -C /opt -f /tmp/grafana.tar.gz; \
+    rm -f /tmp/grafana.tar.gz
     mv "/opt/grafana-${GRAFANA_VERSION}" /opt/grafana
     ln -s /opt/grafana/bin/grafana-server /usr/local/bin/grafana-server
     ln -s /opt/grafana/bin/grafana-cli /usr/local/bin/grafana-cli
