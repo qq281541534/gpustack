@@ -1,0 +1,18 @@
+services:
+  gpustack-server:
+    image: ${IMAGE_REGISTRY:-registry.cn-chengdu.aliyuncs.com}/${IMAGE_NAMESPACE:-lmzjai}/gpustack-custom:${GPUSTACK_TAG:-dev}
+    container_name: gpustack-server
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - gpustack-data:/var/lib/gpustack
+      - ./ssl:/etc/gpustack/ssl
+        #      - /home/ubuntu/software/gpustack/ui:/usr/local/lib/python3.11/dist-packages/gpustack/ui
+    ports:
+      - "80:80"
+      - "443:443"
+
+volumes:
+  gpustack-data: {}
+
