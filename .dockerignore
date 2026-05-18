@@ -1,6 +1,15 @@
 build/
 dist/
 
+.git/
+.github/
+.venv/
+.tox/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
 **/__pycache__/
 .mypy_cache/
 
@@ -10,3 +19,11 @@ dist/
 .cache/
 .python-version
 .data
+.DS_Store
+.idea/
+.vscode/
+
+gpustack-ui/
+docs/
+lmzj-docs/
+tests/

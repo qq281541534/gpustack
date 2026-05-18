@@ -19,6 +19,10 @@
 #        BUILD_DATE  -  The build date of the version.
 
 function gpustack::version::get_version_vars() {
+  local env_git_commit="${GIT_COMMIT:-}"
+  local env_git_version="${GIT_VERSION:-}"
+  local env_git_tree_state="${GIT_TREE_STATE:-}"
+
   #shellcheck disable=SC2034
   BUILD_DATE=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
   GIT_TREE_STATE="unknown"
@@ -80,5 +84,9 @@ function gpustack::version::get_version_vars() {
 
     # respect specified version
     GIT_VERSION=${VERSION:-${GIT_VERSION}}
+  else
+    GIT_COMMIT="${env_git_commit:-${GIT_COMMIT}}"
+    GIT_TREE_STATE="${env_git_tree_state:-${GIT_TREE_STATE}}"
+    GIT_VERSION="${VERSION:-${env_git_version:-${GIT_VERSION}}}"
   fi
 }
