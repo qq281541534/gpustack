@@ -405,7 +405,8 @@ COPY docker-compose/grafana/grafana_dashboards/ /etc/dashboards/
 
 ARG GOPROXY="https://goproxy.cn,direct"
 
-RUN <<EOF
+RUN --mount=type=cache,target=/root/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build <<EOF
     # Skopeo
 
     # Install Go
@@ -451,9 +452,7 @@ EOT
     skopeo --version
 
     # Cleanup go
-    go clean -cache -modcache -testcache \
-        && rm -rf /usr/local/go \
-        && rm -rf /root/.cache/go-build
+    rm -rf /usr/local/go
 
     # Cleanup
     rm -rf /var/tmp/* \
@@ -521,6 +520,8 @@ EOF
 ## Install GPUStack
 
 ARG UI_DOWNLOAD=true
+ARG VERSION=v0.0.0
+ARG GIT_COMMIT=unknown
 
 RUN --mount=type=cache,target=/root/.cache \
     --mount=type=bind,target=/workspace/gpustack,rw <<EOF
@@ -531,6 +532,8 @@ RUN --mount=type=cache,target=/root/.cache \
     export UV_SYSTEM_PYTHON=1
     export UV_LINK_MODE=copy
     export UI_DOWNLOAD=${UI_DOWNLOAD}
+    export VERSION=${VERSION}
+    export GIT_COMMIT=${GIT_COMMIT}
 
     # Build GPUStack
     cd /workspace/gpustack \
@@ -620,6 +623,7 @@ RUN --mount=type=bind,from=rocm-base,source=/opt/rocm/share,target=/opt/rocm/sha
     fi
 EOF
 ENV AMD_VISIBLE_DEVICES="all" \
+    LD_LIBRARY_PATH="" \
     GPUSTACK_RUNTIME_DEPLOY_MIRRORED_DEPLOYMENT_IGNORE_VOLUMES="/opt/rocm"
 
 ## Active all Ascend devices detection,

@@ -35,6 +35,9 @@ function set_version() {
 function restore_version_file() {
   local version_file="${ROOT_DIR}/gpustack/__init__.py"
   local pyproject_file="${ROOT_DIR}/pyproject.toml"
+  if ! git -C "${ROOT_DIR}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    return
+  fi
   git checkout -- "${version_file}" "${pyproject_file}"
 }
 
