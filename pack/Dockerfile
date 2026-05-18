@@ -28,6 +28,7 @@ ARG HIGRESS_VERSION=2.1.9
 ARG HIGRESS_APISERVER_VERSION=0.0.26
 ARG PROMETHEUS_VERSION=3.5.1
 ARG GRAFANA_VERSION=12.2.4
+ARG ROCM_BASE_PLATFORM=linux/amd64
 
 # Stage Base
 #
@@ -303,7 +304,7 @@ ENV S6_KEEP_ENV=1 \
 # Vendor ROCm libraries from ROCm base image,
 # now only linux/amd64 is supported.
 # Must build on linux/amd64 platform.
-FROM --platform=${BUILDPLATFORM} rocm/dev-ubuntu-22.04:${GPUSTACK_RUNTIME_ROCM_VERSION} AS rocm-base
+FROM --platform=${ROCM_BASE_PLATFORM} rocm/dev-ubuntu-22.04:${GPUSTACK_RUNTIME_ROCM_VERSION} AS rocm-base
 
 FROM ${GPUSTACK_BASE_IMAGE} AS gpustack
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
@@ -522,6 +523,7 @@ EOF
 ARG UI_DOWNLOAD=true
 ARG VERSION=v0.0.0
 ARG GIT_COMMIT=unknown
+ARG GPUSTACK_PACKAGE_EXTRAS=audio
 
 RUN --mount=type=cache,target=/root/.cache \
     --mount=type=bind,target=/workspace/gpustack,rw <<EOF
@@ -534,19 +536,27 @@ RUN --mount=type=cache,target=/root/.cache \
     export UI_DOWNLOAD=${UI_DOWNLOAD}
     export VERSION=${VERSION}
     export GIT_COMMIT=${GIT_COMMIT}
+    export GPUSTACK_PACKAGE_EXTRAS=${GPUSTACK_PACKAGE_EXTRAS}
+
+    case "${GPUSTACK_PACKAGE_EXTRAS}" in
+        ""|"audio"|"all"|"vllm") ;;
+        *)
+            echo "ERROR: GPUSTACK_PACKAGE_EXTRAS must be empty, audio, all, or vllm." >&2
+            exit 1
+            ;;
+    esac
 
     # Build GPUStack
     cd /workspace/gpustack \
         && git config --global --add safe.directory /workspace/gpustack \
         && make build
 
-    # Install GPUStack.
-    # FIXME: There is no linux/arm64 vLLM prebuilt wheel,
-    #        so we only install the all wheel for linux/amd64.
-    if [ "${TARGETARCH}" == "amd64" ]; then
-        WHEEL_PACKAGE="$(ls /workspace/gpustack/dist/*.whl)[all]";
+    # Install GPUStack. Production server images default to "audio" to avoid
+    # bundling vLLM/CUDA inference runtimes into the control-plane image.
+    if [ -n "${GPUSTACK_PACKAGE_EXTRAS}" ]; then
+        WHEEL_PACKAGE="$(ls /workspace/gpustack/dist/*.whl)[${GPUSTACK_PACKAGE_EXTRAS}]";
     else
-        WHEEL_PACKAGE="$(ls /workspace/gpustack/dist/*.whl)[audio]";
+        WHEEL_PACKAGE="$(ls /workspace/gpustack/dist/*.whl)";
     fi
 
     uv pip install --no-build-isolation --extra-index-url https://mirrors.tuna.tsinghua.edu.cn/pytorch-wheels/cpu/ \

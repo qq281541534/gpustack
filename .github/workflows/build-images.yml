@@ -26,6 +26,10 @@ on:
         type: boolean
         required: true
         default: true
+      package_extras:
+        description: "Python package extras for the server image: audio for production slim, all for full runtime"
+        required: true
+        default: "audio"
 
 permissions:
   contents: read
@@ -57,7 +61,20 @@ jobs:
             echo "backend_sha must be a full 40-character lowercase git SHA." >&2
             exit 1
           fi
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            package_extras="${{ github.event.inputs.package_extras }}"
+          else
+            package_extras="audio"
+          fi
+          case "${package_extras}" in
+            ""|audio|all|vllm) ;;
+            *)
+              echo "package_extras must be empty, audio, all, or vllm." >&2
+              exit 1
+              ;;
+          esac
           echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
+          echo "package_extras=${package_extras}" >> "${GITHUB_OUTPUT}"
 
       - name: Checkout GPUStack Backend
         uses: actions/checkout@v4
@@ -147,5 +164,6 @@ jobs:
             UI_DOWNLOAD=true
             VERSION=v0.0.0
             GIT_COMMIT=${{ steps.release.outputs.sha }}
-          cache-from: type=gha,scope=gpustack-image-linux-amd64
-          cache-to: type=gha,mode=max,scope=gpustack-image-linux-amd64
+            GPUSTACK_PACKAGE_EXTRAS=${{ steps.release.outputs.package_extras }}
+          cache-from: type=gha,scope=gpustack-image-linux-amd64-${{ steps.release.outputs.package_extras || 'none' }}
+          cache-to: type=gha,mode=max,scope=gpustack-image-linux-amd64-${{ steps.release.outputs.package_extras || 'none' }}

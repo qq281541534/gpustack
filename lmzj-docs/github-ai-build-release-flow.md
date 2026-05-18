@@ -18,6 +18,8 @@ docs_directory: lmzj-docs/
 registry: registry.cn-chengdu.aliyuncs.com/lmzjai
 image_names:
   - gpustack-custom
+production_image_profile: slim-server
+production_package_extras: audio
 frontend_repository: qq281541534/gpustack-ui
 frontend_default_ref: dev
 deploy_workflow: .github/workflows/deploy-production.yml
@@ -87,6 +89,10 @@ issue_closure: human_after_verified_release
 - 从 `qq281541534/gpustack-ui` 构建二开前端。
 - 构建并推送
   `registry.cn-chengdu.aliyuncs.com/lmzjai/gpustack-custom:<full-sha>`。
+- 默认传入 `GPUSTACK_PACKAGE_EXTRAS=audio`，构建 slim server 镜像，避免把
+  `vllm`、PyTorch/CUDA/xformers 等推理运行栈打进生产 control-plane 镜像。
+- 如确需 full runtime 镜像，手动触发时可设置 `package_extras=all`，但该镜像不得
+  替代默认生产 server 镜像，部署前必须单独评估磁盘容量和回滚空间。
 
 ### `.github/workflows/deploy-production.yml`
 

@@ -232,18 +232,24 @@ https://github.com/gpustack/gpustack/releases
 
 **触发构建**：
 1. 打开 GitHub 仓库 → **Actions** 标签
-2. 选择 **Build Custom GPUStack Image**
+2. 选择 **Build Immutable GPUStack Image**
 3. 点击右侧 **Run workflow**
 4. 参数说明：
-   - `tag`: 镜像标签。生产发布必须使用完整 40 位 commit SHA
+   - `backend_sha`: 后端完整 40 位 commit SHA
    - `frontend_ref`: 前端仓库分支，默认 `dev`
    - `push_image`: 勾选则推送到阿里云 ACR
+   - `package_extras`: 生产 server 镜像默认使用 `audio`；只有明确需要 full runtime
+     时才使用 `all`
 
 **构建流程**：
 ```
 拉取后端代码(dev) → 拉取前端代码(gpustack-ui/dev) → 编译前端 → 复制到 gpustack/ui/
 → 构建 linux/amd64 Docker 镜像 → 推送到 registry.cn-chengdu.aliyuncs.com/lmzjai/gpustack-custom:<full-sha>
 ```
+
+生产 server 镜像默认是 slim profile，不安装 `vllm`、PyTorch/CUDA/xformers 等推理
+运行栈。需要 all-in-one/full runtime 时，手动构建可把 `package_extras` 设为 `all`，
+但部署前必须单独确认生产服务器磁盘容量和回滚空间。
 
 构建预计 **15~30 分钟**。
 

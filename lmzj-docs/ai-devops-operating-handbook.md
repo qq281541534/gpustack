@@ -68,6 +68,9 @@ PR 不得包含：
 - 源 SHA 关联到已合并进 `dev` 的 PR。
 - 镜像 tag 是完整 40 位 commit SHA。
 - 镜像推送到配置的 ACR 仓库。
+- 生产 server 镜像使用 `GPUSTACK_PACKAGE_EXTRAS=audio` 的 slim profile，不默认安装
+  `all` extras。`all` 会引入 `vllm`、PyTorch/CUDA/xformers 等推理运行栈，只能作为
+  明确评估过磁盘容量的 full runtime 镜像使用。
 
 `PR merged` 只表示代码被接受，不表示已经部署生产。镜像构建只表示代码被打包。
 

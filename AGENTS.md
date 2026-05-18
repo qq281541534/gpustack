@@ -12,7 +12,9 @@
 - Production PR target: `dev`.
 - Production image source branch: `dev`.
 - Registry: `registry.cn-chengdu.aliyuncs.com/lmzjai`.
-- Production image: `gpustack-custom`.
+- Production image: `gpustack-custom`，默认使用 slim server 构建。
+- Production package extras: `audio`。不要在生产 server 镜像默认安装 `all`，
+  因为 `all` 会引入 `vllm`、PyTorch/CUDA/xformers 等推理运行栈，显著放大镜像。
 - Frontend customization source: `qq281541534/gpustack-ui`，默认分支 `dev`。
 - LMZJ 专属流程文档目录：`lmzj-docs/`。
 - GPUStack upstream 原有产品文档目录：`docs/`，不要放入 LMZJ 专属 AI 交付、
@@ -78,6 +80,9 @@ Issue
 ## 构建和部署规则
 
 - 生产镜像必须由 GitHub Actions 构建，不在生产服务器构建。
+- 生产 server 镜像默认构建参数为 `GPUSTACK_PACKAGE_EXTRAS=audio`。
+- 只有明确需要 all-in-one/full runtime 镜像时，才允许把
+  `GPUSTACK_PACKAGE_EXTRAS` 改为 `all`；full 镜像不得替代默认生产 server 镜像。
 - 生产镜像 tag 必须是完整 40 位 commit SHA。
 - 不部署 `latest`、`dev`、版本别名或短 SHA 到生产。
 - 生产部署必须使用手动 deploy workflow，并指定完整 SHA tag。
