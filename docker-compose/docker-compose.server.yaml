@@ -12,7 +12,7 @@ services:
         PROMETHEUS_VERSION: ${PROMETHEUS_VERSION:-3.5.1}
         GRAFANA_VERSION: ${GRAFANA_VERSION:-12.2.4}
         UI_DOWNLOAD: ${UI_DOWNLOAD:-true}
-    image: ${IMAGE_REGISTRY:-registry.cn-chengdu.aliyuncs.com}/${IMAGE_NAMESPACE:-lmzjai}/gpustack-custom:${GPUSTACK_TAG:-dev}
+    image: ${IMAGE_REGISTRY:-registry.cn-chengdu.aliyuncs.com}/${IMAGE_NAMESPACE:-lmzjai}/${IMAGE_REPOSITORY:-gpustack-custom}:${GPUSTACK_TAG:-dev}
     container_name: gpustack-server
     restart: unless-stopped
     env_file:

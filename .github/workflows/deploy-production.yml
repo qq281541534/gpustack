@@ -1,0 +1,92 @@
+name: Deploy GPUStack Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Full 40-character image tag to deploy"
+        required: true
+      confirm_production_deploy:
+        description: "Type DEPLOY <image_tag>"
+        required: true
+      compose_files:
+        description: "Space-separated compose files on the production server"
+        required: true
+        default: "docker-compose.server.yaml"
+      healthcheck_base_url:
+        description: "Production base URL for /healthz and /readyz"
+        required: true
+        default: "http://127.0.0.1"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Pull-only deploy
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Validate deployment input
+        id: input
+        run: |
+          set -euo pipefail
+          image_tag="${{ github.event.inputs.image_tag }}"
+          confirmation="${{ github.event.inputs.confirm_production_deploy }}"
+          if [[ ! "${image_tag}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "image_tag must be a full 40-character lowercase git SHA." >&2
+            exit 1
+          fi
+          if [[ "${image_tag}" == "latest" || "${image_tag}" == "dev" || "${image_tag}" == v* ]]; then
+            echo "latest, dev, and version alias tags are not allowed." >&2
+            exit 1
+          fi
+          if [[ "${confirmation}" != "DEPLOY ${image_tag}" ]]; then
+            echo "confirm_production_deploy must be exactly: DEPLOY ${image_tag}" >&2
+            exit 1
+          fi
+          echo "image_tag=${image_tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout deployment script
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_PORT: ${{ secrets.PROD_SSH_PORT }}
+          PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "${PROD_SSH_KEY}" > ~/.ssh/gpustack_prod
+          chmod 600 ~/.ssh/gpustack_prod
+          ssh-keyscan -p "${PROD_SSH_PORT:-22}" "${PROD_SSH_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Deploy image on production server
+        env:
+          IMAGE_TAG: ${{ steps.input.outputs.image_tag }}
+          IMAGE_REGISTRY: ${{ vars.ACR_REGISTRY || 'registry.cn-chengdu.aliyuncs.com' }}
+          IMAGE_NAMESPACE: ${{ vars.ACR_NAMESPACE || 'lmzjai' }}
+          GPUSTACK_IMAGE_NAMESPACE: ${{ vars.ACR_NAMESPACE || 'lmzjai' }}
+          IMAGE_REPOSITORY: ${{ vars.ACR_REPOSITORY || 'gpustack-custom' }}
+          PROD_DEPLOY_PATH: ${{ secrets.PROD_DEPLOY_PATH }}
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_PORT: ${{ secrets.PROD_SSH_PORT }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          COMPOSE_FILES: ${{ github.event.inputs.compose_files }}
+          HEALTHCHECK_BASE_URL: ${{ github.event.inputs.healthcheck_base_url }}
+        run: |
+          set -euo pipefail
+          remote_env=$(printf \
+            'IMAGE_REGISTRY=%q IMAGE_NAMESPACE=%q GPUSTACK_IMAGE_NAMESPACE=%q IMAGE_REPOSITORY=%q PROD_DEPLOY_PATH=%q COMPOSE_FILES=%q HEALTHCHECK_BASE_URL=%q' \
+            "${IMAGE_REGISTRY}" \
+            "${IMAGE_NAMESPACE}" \
+            "${GPUSTACK_IMAGE_NAMESPACE}" \
+            "${IMAGE_REPOSITORY}" \
+            "${PROD_DEPLOY_PATH}" \
+            "${COMPOSE_FILES}" \
+            "${HEALTHCHECK_BASE_URL}")
+          ssh -i ~/.ssh/gpustack_prod -p "${PROD_SSH_PORT:-22}" \
+            "${PROD_SSH_USER}@${PROD_SSH_HOST}" \
+            "${remote_env} bash -s -- '${IMAGE_TAG}'" < scripts/deploy-images.sh
