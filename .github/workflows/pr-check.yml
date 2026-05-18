@@ -1,0 +1,31 @@
+name: AI Issue to Production PR Check
+
+on:
+  pull_request:
+    branches:
+      - dev
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  process-lint:
+    name: PR process lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate PR process
+        run: python scripts/ai_process_lint.py --event-path "$GITHUB_EVENT_PATH" --target-branch dev
+
+  lightweight-validation:
+    name: Lightweight repository validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compile release scripts
+        run: python -m compileall scripts

@@ -353,15 +353,15 @@ GPUStack **不支持 LDAP**。如需对接 LDAP/AD，建议使用 **Dex** 作为
 ```bash
 cd ~/thirdComponent/AI/gpustack
 
-GPUSTACK_DATABASE_URL="postgresql://postgres:ysf2020@127.0.0.1:5432/gpustack?sslmode=disable" \
+GPUSTACK_DATABASE_URL="postgresql://<user>:<password>@127.0.0.1:5432/gpustack?sslmode=disable" \
 uv run gpustack start \
   --port 8080 \
   --api-port 38080 \
   --data-dir ~/thirdComponent/AI/gpustack/data/gpustack \
   --gateway-mode disabled \
   --oidc-issuer "http://localhost:8100" \
-  --oidc-client-id "lmzj_ecdb42c6e7e541d949971942" \
-  --oidc-client-secret "avEIsPocJaHRJmD12eBnvt345VOdtB8MTPugErsZCcym2EKpkPQbOamNuBu5dnny" \
+  --oidc-client-id "<oidc-client-id>" \
+  --oidc-client-secret "<oidc-client-secret>" \
   --oidc-redirect-uri "http://localhost:38080/auth/oidc/callback" \
   --external-auth-name "preferred_username" \
   --external-auth-full-name "name"
@@ -372,8 +372,8 @@ uv run gpustack start \
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | `--oidc-issuer` | `http://localhost:8100` | 公司 SSO 服务地址 |
-| `--oidc-client-id` | `lmzj_ecdb42c6e7e541d949971942` | OIDC Client ID |
-| `--oidc-client-secret` | `avEIsPocJaHRJmD12eBnvt345VOdtB8MTPugErsZCcym2EKpkPQbOamNuBu5dnny` | OIDC Client Secret |
+| `--oidc-client-id` | `<oidc-client-id>` | OIDC Client ID |
+| `--oidc-client-secret` | `<oidc-client-secret>` | OIDC Client Secret |
 | `--oidc-redirect-uri` | `http://localhost:38080/auth/oidc/callback` | GPUStack 回调地址 |
 | `--external-auth-name` | `preferred_username` | 用户名字段映射 |
 | `--external-auth-full-name` | `name` | 全名字段映射 |
