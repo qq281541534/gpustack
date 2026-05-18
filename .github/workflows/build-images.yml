@@ -110,29 +110,11 @@ jobs:
           cp -r gpustack-ui/dist/* gpustack/ui/
 
       - name: Setup Docker Buildx
-        id: setup-buildx
         uses: docker/setup-buildx-action@v3
         with:
           driver-opts: |
             env.BUILDKIT_STEP_LOG_MAX_SIZE=-1
             env.BUILDKIT_STEP_LOG_MAX_SPEED=-1
-
-      - name: Setup BuildKit Cache Mounts
-        id: setup-buildkit-cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ github.workspace }}/.cache/buildkit
-          key: buildkit-cache-mount-${{ runner.os }}-${{ hashFiles('uv.lock', 'pack/Dockerfile') }}
-          restore-keys: |
-            buildkit-cache-mount-${{ runner.os }}-
-
-      - name: Restore BuildKit Cache Mounts
-        uses: reproducible-containers/buildkit-cache-dance@v3
-        with:
-          builder: ${{ steps.setup-buildx.outputs.name }}
-          cache-dir: ${{ github.workspace }}/.cache/buildkit
-          dockerfile: ${{ github.workspace }}/pack/Dockerfile
-          skip-extraction: ${{ steps.setup-buildkit-cache.outputs.cache-hit }}
 
       - name: Login to Aliyun ACR
         if: ${{ github.event_name == 'push' || github.event.inputs.push_image == 'true' }}
