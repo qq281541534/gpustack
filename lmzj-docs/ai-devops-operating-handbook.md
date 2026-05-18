@@ -26,8 +26,10 @@ GPUStack upstream `docs/` 目录继续作为上游产品文档目录维护，不
 - 启用 Require approvals。
 - 启用 Dismiss stale approvals when new commits are pushed。
 - 创建 `production` environment。
-- 在 `production` environment 中启用 required reviewers。
-- 启用 prevent self-review。
+- `production` environment 必须存在并保存生产 secrets；多人维护时启用 required
+  reviewers 和 prevent self-review。
+- 单人维护 bootstrap 阶段可关闭 production required reviewers，避免“对话确认部署”
+  和 GitHub UI 审批重复；此时必须保留 `DEPLOY <full-sha>` 输入确认。
 - deployment branches 只允许 `dev`。
 - Production secrets 只放在 `production` environment。
 
@@ -79,11 +81,13 @@ PR 不得包含：
 - `compose_files`: 生产服务器上的 compose 文件列表。
 - `healthcheck_base_url`: 生产服务器可访问的基础 URL。
 
-`deploy-production.yml` 必须绑定 `environment: production`。GitHub 会在读取
-production environment secrets 前暂停 job，等待 required reviewers 批准。
+`deploy-production.yml` 必须绑定 `environment: production`，并使用 production
+environment secrets。单人维护 bootstrap 阶段可不启用 required reviewers，但必须保留
+完整 SHA 和 `DEPLOY <full-sha>` 强确认。
 
 生产服务器必须：
 
+- 使用 workflow 同步到 `PROD_DEPLOY_PATH` 的生产 compose 文件。
 - 拉取指定镜像。
 - 执行 `docker compose up -d --no-build`。
 - 验证 `/healthz` 和 `/readyz`。

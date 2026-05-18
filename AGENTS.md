@@ -30,8 +30,10 @@ GitHub UI 中配置以下平台门禁：
 - 启用 Require approvals。
 - 启用 Dismiss stale approvals when new commits are pushed。
 - 创建 `production` environment。
-- 在 `production` environment 中启用 required reviewers。
-- 启用 prevent self-review。
+- `production` environment 必须存在并保存生产 secrets；多人维护时启用 required
+  reviewers 和 prevent self-review。
+- 单人维护 bootstrap 阶段可关闭 production required reviewers，避免“对话确认部署”
+  和 GitHub UI 审批重复；此时必须保留 `DEPLOY <full-sha>` 输入确认。
 - deployment branches 只允许 `dev`。
 - 生产相关 secrets 优先放入 `production` environment，不放普通 repository secrets。
 
@@ -79,8 +81,9 @@ Issue
 - 生产镜像 tag 必须是完整 40 位 commit SHA。
 - 不部署 `latest`、`dev`、版本别名或短 SHA 到生产。
 - 生产部署必须使用手动 deploy workflow，并指定完整 SHA tag。
-- `deploy-production.yml` 必须绑定 `environment: production`，让 GitHub 在读取
-  production secrets 前强制等待 required reviewers 批准。
+- `deploy-production.yml` 必须绑定 `environment: production`，使用 production secrets。
+  单人维护 bootstrap 阶段可不启用 required reviewers，但必须保留完整 SHA 和
+  `DEPLOY <full-sha>` 强确认。
 - 生产服务器只拉取镜像并执行 `docker compose up -d --no-build`。
 - 回滚使用 registry 中上一版不可变完整 SHA 镜像。
 

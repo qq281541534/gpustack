@@ -45,8 +45,10 @@ issue_closure: human_after_verified_release
 - 启用 Require approvals，至少 1 个非作者 human approval。
 - 启用 Dismiss stale approvals when new commits are pushed。
 - 创建 `production` environment。
-- 在 `production` environment 中启用 required reviewers。
-- 启用 prevent self-review，避免触发部署的人自己批准生产部署。
+- `production` environment 必须存在并保存生产 secrets；多人维护时启用 required
+  reviewers 和 prevent self-review。
+- 单人维护 bootstrap 阶段可关闭 production required reviewers，避免“对话确认部署”
+  和 GitHub UI 审批重复；此时必须保留 `DEPLOY <full-sha>` 输入确认。
 - deployment branches 只允许 `dev`。
 - Production secrets 放入 `production` environment，不放普通 repository secrets。
 
@@ -89,7 +91,9 @@ issue_closure: human_after_verified_release
 ### `.github/workflows/deploy-production.yml`
 
 - 只允许手动触发。
-- 绑定 `environment: production`，由 GitHub Environment required reviewers 强制生产审批。
+- 绑定 `environment: production`，使用 production environment secrets。
+- 部署前把仓库中的 `docker-compose/<compose_file>` 同步到生产服务器
+  `PROD_DEPLOY_PATH`，避免服务器残留旧 compose 文件。
 - `image_tag` 必须是完整 40 位 SHA。
 - `confirm_production_deploy` 必须精确输入 `DEPLOY <image_tag>`。
 - 通过 SSH 在生产服务器执行 `scripts/deploy-images.sh`。

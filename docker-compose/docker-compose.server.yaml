@@ -1,17 +1,5 @@
 services:
   gpustack-server:
-    build:
-      context: ${GPUSTACK_BUILD_CONTEXT:-..}
-      dockerfile: pack/Dockerfile
-      args:
-        PYTHON_VERSION: ${PYTHON_VERSION:-3.11}
-        GPUSTACK_BASE_IMAGE: ${GPUSTACK_BASE_IMAGE:-base}
-        GPUSTACK_RUNTIME_ROCM_VERSION: ${GPUSTACK_RUNTIME_ROCM_VERSION:-7.0.2}
-        HIGRESS_VERSION: ${HIGRESS_VERSION:-2.1.9}
-        HIGRESS_APISERVER_VERSION: ${HIGRESS_APISERVER_VERSION:-0.0.26}
-        PROMETHEUS_VERSION: ${PROMETHEUS_VERSION:-3.5.1}
-        GRAFANA_VERSION: ${GRAFANA_VERSION:-12.2.4}
-        UI_DOWNLOAD: ${UI_DOWNLOAD:-true}
     image: ${IMAGE_REGISTRY:-registry.cn-chengdu.aliyuncs.com}/${IMAGE_NAMESPACE:-lmzjai}/${IMAGE_REPOSITORY:-gpustack-custom}:${GPUSTACK_TAG:-dev}
     container_name: gpustack-server
     restart: unless-stopped
@@ -20,7 +8,7 @@ services:
     volumes:
       - gpustack-data:/var/lib/gpustack
     ports:
-      - "8080:80"
+      - "${GPUSTACK_HOST_PORT:-8080}:80"
     networks:
       - docker_default
 
