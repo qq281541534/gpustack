@@ -62,14 +62,19 @@ issue_closure: human_after_verified_release
 4. PR body 使用 `Refs #<issue>`，不得使用 `Closes`、`Fixes`、`Resolves`。
 5. PR checks 通过。
 6. 人工审核并合并 PR。
-7. GitHub Actions 从 `dev` 构建不可变镜像
+7. PR 合并后，执行后续检查的 agent 必须先同步本地 `dev`，并用
+   `git status --short --branch`、`git log -1 --oneline` 确认本地 HEAD 已包含 merge
+   commit。
+8. GitHub Actions 从 `dev` 构建不可变镜像
    `gpustack-custom:<full-40-character-sha>`。
-8. 人工明确确认是否将该完整 SHA 镜像部署到生产。
-9. 手动触发生产部署 workflow，生产服务器只拉取镜像并执行
+9. 部署前审查 image digest/size、生产目标磁盘余量、dependency profile，以及
+   production compose/manifest。
+10. 人工明确确认是否将该完整 SHA 镜像部署到生产。
+11. 手动触发生产部署 workflow，生产服务器只拉取镜像并执行
    `docker compose up -d --no-build`。
-10. 验证 `/healthz`、`/readyz` 和必要业务路径。
-11. 记录发布证据和上一版可回滚完整 SHA。
-12. 人工在生产验证和回滚准备完成后关闭 Issue。
+12. 验证 `/healthz`、`/readyz` 和必要业务路径。
+13. 记录发布证据和上一版可回滚完整 SHA。
+14. 人工在生产验证和回滚准备完成后关闭 Issue。
 
 ## Workflow 分工
 
@@ -93,6 +98,9 @@ issue_closure: human_after_verified_release
   `vllm`、PyTorch/CUDA/xformers 等推理运行栈打进生产 control-plane 镜像。
 - 如确需 full runtime 镜像，手动触发时可设置 `package_extras=all`，但该镜像不得
   替代默认生产 server 镜像，部署前必须单独评估磁盘容量和回滚空间。
+- `AGENTS.md`、`CLAUDE.md`、`.trae/**`、`README*`、`docs/**`、`lmzj-docs/**`、
+  `skills/**`、PR template 和纯 process/lint 脚本变更属于 non-runtime，不得触发或
+  执行生产镜像 build/push。
 
 ### `.github/workflows/deploy-production.yml`
 
@@ -104,6 +112,48 @@ issue_closure: human_after_verified_release
 - `confirm_production_deploy` 必须精确输入 `DEPLOY <image_tag>`。
 - 通过 SSH 在生产服务器执行 `scripts/deploy-images.sh`。
 - 部署脚本必须拒绝 `latest`、`dev`、版本别名和短 SHA。
+
+## Post-Merge Local Sync
+
+PR 合并后继续 image build、deploy inspection 或 production verification 前，不得假设本地
+worktree 自动跟随远程 `dev`。执行后续检查的 agent 必须先运行：
+
+```bash
+git fetch origin dev
+git switch dev
+git pull --ff-only origin dev
+git status --short --branch
+git log -1 --oneline
+```
+
+如果当前是 Codex worktree、detached HEAD 或需要保留当前分支，至少要 fetch 后明确检查
+`origin/dev` 的最新 merge commit。未确认本地 HEAD 包含 merge commit 前，不继续构建或部署判断。
+
+## Pre-Deploy Review
+
+`image_built` 只表示镜像已构建和推送，不表示可部署。请求生产部署确认前必须完成：
+
+- Image tag 是完整 40 位 SHA，记录 digest 和 size。
+- 目标生产机器磁盘余量足够 pull、解压、启动新容器，并保留必要回滚空间。
+- dependency profile 已确认；生产 server 默认使用 `audio`，不得误用 `all`/full runtime
+  作为默认生产 control-plane 镜像。
+- production compose/manifest 已审查，确认使用不可变镜像、无 `build:`、无 `latest`/短 SHA，
+  secrets、volumes、ports、health checks、restart policy 和部署路径适合生产。
+
+审查失败或仍有 unknown/unresolved 项时，不得请求生产部署确认。
+
+## Workflow Resume
+
+长耗时 workflow 中断、会话恢复或上下文丢失后，先重新查询 run 状态，而不是沿用上一轮口头结论：
+
+```bash
+gh run list --workflow "<workflow>" --branch dev
+gh run view <run-id> --json status,conclusion,jobs,url
+```
+
+恢复时必须报告 final conclusion、job log 摘要和 health check 证据。没有 final conclusion 或
+health check 证据时，状态只能是 `workflow_in_progress`、`verification missing` 或
+`unresolved`，不得写成“部署成功”。
 
 ## GitHub 配置
 
@@ -139,11 +189,14 @@ Repository variables:
 - Merge commit:
 - Build workflow:
 - Deploy workflow:
+- Pre-deploy review: passed/failed/unresolved
 
 ## Images
 
 - GPUStack: registry.cn-chengdu.aliyuncs.com/lmzjai/gpustack-custom:<full-sha>
 - Digest:
+- Image size:
+- Dependency profile:
 
 ## Validation
 
@@ -168,4 +221,6 @@ Repository variables:
 ## 旧流程兼容说明
 
 现有 `.github/workflows/build-custom-image.yml` 是历史手动构建入口，可作为迁移期
-legacy workflow 保留；生产发布应优先使用 `build-images.yml` 产出的完整 SHA 镜像。
+legacy workflow 保留，但它不得用于 `dev`、`latest`、版本别名或短 SHA 镜像；只能接受位于
+`dev` 且关联到已合并 PR 的完整 40 位 SHA。生产发布优先使用 `build-images.yml` 产出的完整
+SHA 镜像。

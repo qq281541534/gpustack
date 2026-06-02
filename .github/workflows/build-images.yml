@@ -5,8 +5,18 @@ on:
     branches:
       - dev
     paths-ignore:
+      - "AGENTS.md"
+      - "CLAUDE.md"
+      - ".trae/**"
       - "mkdocs.yml"
+      - "README"
+      - "README.*"
       - "docs/**"
+      - "lmzj-docs/**"
+      - "skills/**"
+      - ".github/pull_request_template.md"
+      - "scripts/ai_process_lint.py"
+      - "scripts/verify_image_build_source.py"
       - "**.md"
       - "**.mdx"
       - "**.png"

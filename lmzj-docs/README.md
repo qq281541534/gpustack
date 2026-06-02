@@ -160,12 +160,8 @@ git checkout -b feature/my-custom-feature
 git add .
 git commit -m "feat: 自定义功能描述"
 
-# 5. 合并到 dev（或 main，视团队策略而定）
-git checkout dev
-git merge feature/my-custom-feature
-
-# 6. 推送
-git push origin dev
+# 5. 推送功能分支并创建 PR 到 dev
+git push origin feature/my-custom-feature
 ```
 
 ### 4.3 同步时的冲突处理
@@ -250,6 +246,20 @@ https://github.com/gpustack/gpustack/releases
 生产 server 镜像默认是 slim profile，不安装 `vllm`、PyTorch/CUDA/xformers 等推理
 运行栈。需要 all-in-one/full runtime 时，手动构建可把 `package_extras` 设为 `all`，
 但部署前必须单独确认生产服务器磁盘容量和回滚空间。
+
+PR 合并后继续检查构建或部署前，先同步本地 `dev` 并确认本地 HEAD 已包含 merge commit：
+
+```bash
+git fetch origin dev
+git switch dev
+git pull --ff-only origin dev
+git status --short --branch
+git log -1 --oneline
+```
+
+镜像构建成功后，还必须审查 image digest/size、目标生产机器磁盘余量、dependency profile 和
+production compose/manifest。缺少 final workflow conclusion 或 health check 证据时，状态只能是
+`unresolved`，不得报告“部署成功”。
 
 构建预计 **15~30 分钟**。
 
@@ -378,7 +388,7 @@ git commit -m "chore: sync frontend build"
 | 合并上游 | `git merge upstream/main` |
 | 创建功能分支 | `git checkout -b feature/xxx` |
 | 推送分支 | `git push origin feature/xxx` |
-| 本地构建镜像 | `./hack/build-image.sh --tag v1.0.0` |
+| 手动构建不可变镜像 | `Build Immutable GPUStack Image`，输入完整 40 位 SHA |
 | Docker Compose 部署 | `GPUSTACK_TAG=<full-sha> docker compose -f docker-compose.server.yaml up -d --no-build` |
 | Docker Compose + SSO | `cp docker-compose/.env.example docker-compose/.env` → 编辑 → `docker compose -f docker-compose.server.yaml up -d` |
 | 登录阿里云 ACR | `docker login --username=<ALIYUN_ACR_USERNAME> registry.cn-chengdu.aliyuncs.com` |

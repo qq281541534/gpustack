@@ -40,6 +40,9 @@ GPUStack upstream `docs/` 目录继续作为上游产品文档目录维护，不
 - 上游同步、功能开发、镜像构建、生产部署必须拆开。
 - 优先使用 extension、adapter、plugin、独立服务或 proxy 层，谨慎修改 upstream core。
 - 所有生产相关 PR 都必须说明后续同步 `gpustack/gpustack` 的潜在冲突风险。
+- PR 合并后继续构建、部署审查或生产验证前，先同步本地 `dev`，并用
+  `git status --short --branch`、`git log -1 --oneline` 确认本地 HEAD 已包含 merge
+  commit。
 
 ## PR 关口
 
@@ -71,8 +74,23 @@ PR 不得包含：
 - 生产 server 镜像使用 `GPUSTACK_PACKAGE_EXTRAS=audio` 的 slim profile，不默认安装
   `all` extras。`all` 会引入 `vllm`、PyTorch/CUDA/xformers 等推理运行栈，只能作为
   明确评估过磁盘容量的 full runtime 镜像使用。
+- `AGENTS.md`、`CLAUDE.md`、`.trae/**`、`README*`、`docs/**`、`lmzj-docs/**`、
+  `skills/**`、PR template 和纯 process/lint 脚本变更属于 non-runtime，不得构建或 push
+  生产镜像。
 
 `PR merged` 只表示代码被接受，不表示已经部署生产。镜像构建只表示代码被打包。
+
+## 部署前审查关口
+
+`image_built` 不等于可部署。请求生产部署确认前必须审查：
+
+- Image tag、digest、size。
+- 生产目标机器磁盘余量，必须足够 pull、解压、启动新容器，并保留必要回滚空间。
+- dependency profile，生产 server 默认 `audio`，不得把 `all`/full runtime 当默认生产镜像。
+- production compose/manifest，确认使用不可变完整 SHA 镜像，无 `build:`、无 `latest`/短
+  SHA，secrets、volumes、ports、health checks、restart policy 和生产部署路径已审查。
+
+审查失败或 unresolved 时，不得请求生产部署确认。
 
 ## 生产部署关口
 
@@ -101,6 +119,19 @@ environment secrets。单人维护 bootstrap 阶段可不启用 required reviewe
 - 构建生产镜像。
 - 部署 `latest`、`dev`、版本别名或短 SHA。
 - 执行 `docker system prune -a --volumes` 等跨项目清理。
+
+## Workflow 恢复
+
+长耗时 workflow 中断、会话恢复或上下文丢失后，必须重新查询：
+
+```bash
+gh run list --workflow "<workflow>" --branch dev
+gh run view <run-id> --json status,conclusion,jobs,url
+```
+
+恢复报告必须包含 final conclusion、job log 摘要和 health check 证据。没有 final
+conclusion 或 health check 证据时，只能标记为 `workflow_in_progress`、`verification
+missing` 或 `unresolved`，不得报告“部署成功”。
 
 ## 回滚
 

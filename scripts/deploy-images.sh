@@ -59,4 +59,8 @@ else
   echo "Rollback-ready previous tag: unknown; check registry or prior release evidence."
 fi
 
-docker image prune -f >/dev/null
+image_ref="${IMAGE_REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_REPOSITORY}"
+docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' \
+  | awk -v repo="${image_ref}" -v current="${IMAGE_TAG}" '$1 ~ "^" repo ":" && $1 != repo ":" current {print $2}' \
+  | sort -u \
+  | xargs -r docker image rm >/dev/null

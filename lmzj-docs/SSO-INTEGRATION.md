@@ -250,7 +250,7 @@ SSO 用户创建后默认角色为普通用户。如需赋予管理员权限：
 ```yaml
 services:
   gpustack-server:
-    image: registry.cn-chengdu.aliyuncs.com/lmzjai/gpustack-custom:dev
+    image: registry.cn-chengdu.aliyuncs.com/lmzjai/gpustack-custom:<full-40-character-sha>
     environment:
       - GPUSTACK_OIDC_ISSUER=https://keycloak.example.com/realms/master
       - GPUSTACK_OIDC_CLIENT_ID=gpustack
@@ -267,7 +267,7 @@ services:
 ```yaml
 services:
   gpustack-server:
-    image: registry.cn-chengdu.aliyuncs.com/lmzjai/gpustack-custom:dev
+    image: registry.cn-chengdu.aliyuncs.com/lmzjai/gpustack-custom:<full-40-character-sha>
     volumes:
       - ./config.yaml:/etc/gpustack/config.yaml:ro
       - gpustack-data:/var/lib/gpustack

@@ -1,6 +1,6 @@
 services:
   gpustack-server:
-    image: ${IMAGE_REGISTRY:-registry.cn-chengdu.aliyuncs.com}/${IMAGE_NAMESPACE:-lmzjai}/${IMAGE_REPOSITORY:-gpustack-custom}:${GPUSTACK_TAG:-dev}
+    image: ${IMAGE_REGISTRY:-registry.cn-chengdu.aliyuncs.com}/${IMAGE_NAMESPACE:-lmzjai}/${IMAGE_REPOSITORY:-gpustack-custom}:${GPUSTACK_TAG:?GPUSTACK_TAG must be a full 40-character SHA}
     container_name: gpustack-server
     restart: unless-stopped
     env_file:

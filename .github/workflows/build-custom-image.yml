@@ -1,6 +1,6 @@
-# GitHub Actions Workflow: Build Custom GPUStack Docker Image
-# Builds GPUStack backend + customized frontend, pushes to Aliyun ACR.
-# Trigger: Manual (workflow_dispatch)
+# Legacy manual build entry for custom GPUStack images.
+# Production releases should use build-images.yml. This workflow accepts only
+# immutable full SHA tags to avoid floating dev/latest images.
 
 name: Build Custom GPUStack Image
 
@@ -8,9 +8,8 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '镜像标签 (例如: dev, v1.0.0, latest)'
+        description: 'Full 40-character backend commit SHA from dev'
         required: true
-        default: 'dev'
       frontend_ref:
         description: '前端仓库分支/标签 (gpustack-ui)'
         required: true
@@ -34,14 +33,40 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Validate immutable image tag
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag }}"
+          if [[ ! "${tag}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "tag must be a full 40-character lowercase git SHA." >&2
+            exit 1
+          fi
+          case "${tag}" in
+            latest|dev|main|v*)
+              echo "Floating or version alias tags are not allowed." >&2
+              exit 1
+              ;;
+          esac
+
       # --------------------------------------------------------------
       # 1. Checkout Backend (当前仓库)
       # --------------------------------------------------------------
       - name: Checkout GPUStack Backend
         uses: actions/checkout@v4
         with:
-          ref: dev
+          ref: ${{ github.event.inputs.tag }}
           fetch-depth: 0
+
+      - name: Confirm SHA belongs to dev
+        run: |
+          set -euo pipefail
+          git fetch origin dev
+          git merge-base --is-ancestor "${{ github.event.inputs.tag }}" origin/dev
+
+      - name: Verify image build source
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python scripts/verify_image_build_source.py --sha "${{ github.event.inputs.tag }}" --base-branch dev
 
       # --------------------------------------------------------------
       # 2. Checkout Frontend (gpustack-ui 二开仓库)
