@@ -42,7 +42,10 @@ GitHub UI 中配置以下平台门禁：
 ## AI Issue to Production
 
 所有 issue、PR、CI/CD、release、deployment、verification、rollback 工作都必须遵循
-`skills/ai-issue-to-production/SKILL.md`。本文件只记录 GPUStack 项目特定事实和本地规则。
+`ai-issue-to-production`。该 skill 的公司级源仓库是
+`company-ai-skills/skills/ai-issue-to-production/`；Codex 全局安装路径通常是
+`/Volumes/data/Users/lcx/.codex/skills/ai-issue-to-production/`。本文件只记录 GPUStack
+项目特定事实和本地规则，不维护 repo-local skill 副本。
 
 必须执行的交付链路：
 
@@ -52,7 +55,10 @@ Issue
   -> PR to dev
   -> PR checks
   -> human review and merge
+  -> post-merge local sync to dev
   -> immutable image build from dev
+  -> pre-deploy artifact review
+  -> production manifest review
   -> explicit human production deployment approval
   -> pull-only production deployment
   -> health verification
@@ -67,6 +73,9 @@ Issue
 - 公司集成和生产发布源是 `dev`。
 - 功能分支、修复分支从最新 `dev` 创建。
 - 上游同步、功能开发、镜像构建、生产部署必须拆成独立关口。
+- PR 合并后继续检查构建或部署前，先同步本地 `dev`，并用
+  `git status --short --branch`、`git log -1 --oneline` 确认本地 HEAD 已包含 merge
+  commit。
 
 ## Issue 和 PR 规则
 
@@ -91,6 +100,14 @@ Issue
   `DEPLOY <full-sha>` 强确认。
 - 生产服务器只拉取镜像并执行 `docker compose up -d --no-build`。
 - 回滚使用 registry 中上一版不可变完整 SHA 镜像。
+- `image_built` 不等于可部署。部署前必须审查 image digest/size、目标磁盘余量、
+  dependency profile，以及 production compose/manifest 是否使用不可变镜像、正确
+  secrets、volumes、ports、health checks 和生产路径。
+- 长耗时 workflow 中断、会话恢复或上下文丢失后，必须重新查询 run final conclusion、
+  job logs 和 health check 证据；缺少证据时只能标记为 `unresolved`。
+- `AGENTS.md`、`CLAUDE.md`、`.trae/**`、`README*`、`docs/**`、`lmzj-docs/**`、
+  `skills/**`、PR template 和纯 process/lint 脚本变更属于 non-runtime，不得构建或
+  push 生产镜像。
 
 ## Secret 规则
 
