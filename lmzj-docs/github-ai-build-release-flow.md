@@ -99,7 +99,7 @@ issue_closure: ai_allowed_after_verified_release
 - 如确需 full runtime 镜像，手动触发时可设置 `package_extras=all`，但该镜像不得
   替代默认生产 server 镜像，部署前必须单独评估磁盘容量和回滚空间。
 - `AGENTS.md`、`CLAUDE.md`、`.claude/**`、`.trae/**`、`.cursor/**`、`README*`、`docs/**`、`lmzj-docs/**`、
-  `skills/**`、`.github/workflows/**`、PR template、deploy script、production
+  `skills/**`、`.github/workflows/**`、Issue template、PR template、deploy script、production
   compose/manifest 和纯 process/lint 脚本变更属于 non-runtime，不得触发或执行生产镜像
   build/push。
 

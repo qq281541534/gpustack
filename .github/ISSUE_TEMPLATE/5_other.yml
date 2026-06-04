@@ -1,18 +1,18 @@
-name: ⚡ Other
-description: Anything else not covered by other issue types
+name: ⚡ 其他
+description: 其他未被上述类型覆盖的问题或讨论
 assignees: [ ]
 
 body:
   - type: markdown
     attributes:
       value: |
-        🤔 Have something else to report or discuss? Please provide details below.
+        有其他需要反馈或讨论的内容？请补充以下信息。
 
   - type: textarea
     id: details
     attributes:
-      label: 📝 Details
-      description: Provide a clear description of the issue or topic.
-      placeholder: Describe your issue, idea, or question...
+      label: 📝 详细信息
+      description: 请清晰描述问题、想法或讨论主题。
+      placeholder: 请描述你的问题、想法或疑问...
     validations:
       required: true

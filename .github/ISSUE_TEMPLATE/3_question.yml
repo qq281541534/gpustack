@@ -1,5 +1,5 @@
-name: ❓ Question
-description: Ask a question about GPUStack
+name: ❓ 问题咨询
+description: 咨询 GPUStack 相关问题
 type: "Question"
 assignees: [ ]
 
@@ -7,22 +7,22 @@ body:
   - type: markdown
     attributes:
       value: |
-        🙋‍♂️ Have a question about GPUStack? Please fill in the details below so we can help you quickly.
+        有关于 GPUStack 的问题？请补充以下信息，方便我们更快理解和回复。
 
   - type: textarea
     id: question
     attributes:
-      label: 📝 Your Question
-      description: Provide a clear and concise description of your question.
-      placeholder: Type your question here...
+      label: 📝 你的问题
+      description: 请清晰、简洁地描述你的问题。
+      placeholder: 请在这里填写你的问题...
     validations:
       required: true
 
   - type: textarea
     id: context
     attributes:
-      label: 🔍 Additional Context
-      description: Add any relevant details, examples, or screenshots to help us understand your question.
-      placeholder: Optional context...
+      label: 🔍 补充背景
+      description: 请补充相关细节、示例或截图，帮助我们理解你的问题。
+      placeholder: 可选的补充背景...
     validations:
       required: false

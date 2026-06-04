@@ -39,6 +39,7 @@ jobs:
             "docs/**"
             "lmzj-docs/**"
             "skills/**"
+            ".github/ISSUE_TEMPLATE/**"
             ".github/pull_request_template.md"
             ".github/labeler.yml"
             ".github/labeler.yaml"
