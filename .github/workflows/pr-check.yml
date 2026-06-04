@@ -22,6 +22,8 @@ jobs:
 
       - name: Detect change scope
         id: scope
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           NON_RUNTIME_PATTERNS=(
@@ -64,15 +66,18 @@ jobs:
             "Makefile"
           )
 
-          if [ "${{ github.event.pull_request.changed_files }}" = "0" ] 2>/dev/null; then
+          # Use GitHub API to list changed files (avoids merge-base issues)
+          CHANGED_FILES=$(
+            gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+              --paginate --jq '.[].filename'
+          )
+
+          if [ -z "${CHANGED_FILES}" ]; then
             echo "No changed files detected, defaulting to runtime_changed=true."
             echo "runtime_changed=true" >> "${GITHUB_OUTPUT}"
             echo "unknown_changed=true" >> "${GITHUB_OUTPUT}"
             exit 0
           fi
-
-          git fetch origin ${{ github.base_ref }}
-          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD)
 
           runtime_changed="false"
           unknown_changed="false"
