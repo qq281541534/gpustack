@@ -75,7 +75,7 @@ PR 不得包含：
   `all` extras。`all` 会引入 `vllm`、PyTorch/CUDA/xformers 等推理运行栈，只能作为
   明确评估过磁盘容量的 full runtime 镜像使用。
 - `AGENTS.md`、`CLAUDE.md`、`.claude/**`、`.trae/**`、`.cursor/**`、`README*`、`docs/**`、`lmzj-docs/**`、
-  `skills/**`、`.github/workflows/**`、PR template、deploy script、production
+  `skills/**`、`.github/workflows/**`、Issue template、PR template、deploy script、production
   compose/manifest 和纯 process/lint 脚本变更属于 non-runtime，不得构建或 push 生产镜像。
 
 `PR merged` 只表示代码被接受，不表示已经部署生产。镜像构建只表示代码被打包。

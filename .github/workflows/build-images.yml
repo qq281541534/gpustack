@@ -17,6 +17,7 @@ on:
       - "lmzj-docs/**"
       - "skills/**"
       - ".github/workflows/**"
+      - ".github/ISSUE_TEMPLATE/**"
       - ".github/pull_request_template.md"
       - ".github/labeler.yml"
       - ".github/labeler.yaml"

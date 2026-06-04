@@ -113,7 +113,7 @@ Issue
 - 长耗时 workflow 中断、会话恢复或上下文丢失后，必须重新查询 run final conclusion、
   job logs 和 health check 证据；缺少证据时只能标记为 `unresolved`。
 - `AGENTS.md`、`CLAUDE.md`、`.claude/**`、`.trae/**`、`.cursor/**`、`README*`、`docs/**`、`lmzj-docs/**`、
-  `skills/**`、`.github/workflows/**`、PR template、deploy script、production
+  `skills/**`、`.github/workflows/**`、Issue template、PR template、deploy script、production
   compose/manifest 和纯 process/lint 脚本变更属于 non-runtime，不得构建或 push 生产镜像。
 
 ## Secret 规则

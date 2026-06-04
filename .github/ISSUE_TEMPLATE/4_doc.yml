@@ -1,5 +1,5 @@
-name: 📚 Documentation Update
-description: Request an update or improvement to GPUStack documentation
+name: 📚 文档更新
+description: 请求更新或改进 GPUStack 文档
 type: "Documentation"
 assignees: [ ]
 
@@ -7,22 +7,22 @@ body:
   - type: markdown
     attributes:
       value: |
-        📝 Need a documentation update? Please provide details below so we can improve the docs.
+        需要更新文档？请补充以下信息，帮助我们改进文档。
 
   - type: textarea
     id: related-problem
     attributes:
-      label: ❓ Related Problem or Issue
-      description: Describe the problem or add the related issue ID if applicable.
-      placeholder: Optional, e.g., "Related to issue #123"
+      label: ❓ 相关问题或 Issue
+      description: 请描述相关问题，或填写相关 Issue 编号。
+      placeholder: 可选，例如 "Related to issue #123"
     validations:
       required: false
 
   - type: textarea
     id: update-description
     attributes:
-      label: 💡 Description of Update
-      description: A clear and concise description of the documentation update you'd like.
-      placeholder: Explain what you want to change in the docs...
+      label: 💡 更新说明
+      description: 请简明描述你希望如何更新文档。
+      placeholder: 请说明希望修改或补充的文档内容...
     validations:
       required: true

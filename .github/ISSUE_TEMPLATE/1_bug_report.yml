@@ -1,5 +1,5 @@
-name: 🐞 Bug Report
-description: Report a problem to help us improve
+name: 🐞 缺陷报告
+description: 报告问题，帮助我们改进
 type: "Bug"
 assignees: [ ]
 
@@ -8,26 +8,26 @@ body:
     attributes:
       value: |
         🙏 Thank you for taking the time to report a bug!
-        Please fill out the details below so we can help you resolve the issue faster ⚡
+        感谢你提交缺陷报告。请尽量补充以下信息，方便我们更快定位和处理问题。
 
-        Before submitting, please note:
-        - If logs are lengthy, please upload them as a file or attachment instead of pasting them inline.
-        - When sharing code or logs, wrap them in code blocks (```).
-        - Providing the diagnostic information below will significantly accelerate troubleshooting.
+        提交前请注意：
+        - 如果日志较长，请以文件或附件形式上传，避免直接粘贴大量内容。
+        - 分享代码或日志时，请使用代码块（```）包裹。
+        - 补充下方诊断信息可以明显加快排查速度。
 
   - type: input
     id: gpustack-version
     attributes:
-      label: GPUStack version
-      placeholder: e.g. v0.7.1
+      label: GPUStack 版本
+      placeholder: 例如 v0.7.1
     validations:
       required: true
 
   - type: input
     id: os
     attributes:
-      label: Operating System & CPU Architecture
-      placeholder: e.g. Ubuntu 22.04, x86_64
+      label: 操作系统和 CPU 架构
+      placeholder: 例如 Ubuntu 22.04, x86_64
     validations:
       required: false
 
@@ -35,59 +35,59 @@ body:
     id: gpu
     attributes:
       label: GPU
-      placeholder: e.g. NVIDIA A100 40GB
+      placeholder: 例如 NVIDIA A100 40GB
     validations:
       required: false
 
   - type: textarea
     id: steps
     attributes:
-      label: ▶️ Steps to reproduce
-      description: How can we reproduce the behavior?
+      label: ▶️ 复现步骤
+      description: 请说明如何复现该问题。
       placeholder: |
-        1. Go to '...'
-        2. Click on '...'
-        3. Scroll down to '...'
-        4. See error
+        1. 进入 '...'
+        2. 点击 '...'
+        3. 滚动到 '...'
+        4. 看到错误
     validations:
       required: true
 
   - type: textarea
     id: result
     attributes:
-      label: ❌ Actual result
-      description: What happened?
-      placeholder: The actual behavior you observed
+      label: ❌ 实际结果
+      description: 实际发生了什么？
+      placeholder: 请描述你观察到的实际行为
     validations:
       required: false
 
   - type: textarea
     id: accelerator-diagnosis
     attributes:
-      label: 🔍 Accelerator detection diagnosis (if applicable)
+      label: 🔍 加速器检测诊断（如适用）
       description: |
-        If detection fails, run the following diagnostic command inside the problematic worker container and provide the output: `time GPUSTACK_RUNTIME_LOG_LEVEL=debug GPUSTACK_RUNTIME_LOG_EXCEPTION=1 gpustack-runtime detect --format json`.
+        如果检测失败，请在有问题的 worker 容器内运行以下诊断命令，并提供输出：`time GPUSTACK_RUNTIME_LOG_LEVEL=debug GPUSTACK_RUNTIME_LOG_EXCEPTION=1 gpustack-runtime detect --format json`。
       placeholder: |
-        Output(wrap with code block)
+        输出内容（请用代码块包裹）
     validations:
       required: false
 
   - type: textarea
     id: model-deployment-diagnosis
     attributes:
-      label: 🐳 Model deployment / container diagnosis (if applicable)
+      label: 🐳 模型部署 / 容器诊断（如适用）
       description: |
-        If deploying fails, run the following diagnostic command inside the problematic worker container and provide the output: `gpustack-runtime inspect <model instance name>`.
+        如果部署失败，请在有问题的 worker 容器内运行以下诊断命令，并提供输出：`gpustack-runtime inspect <model instance name>`。
       placeholder: |
-        Output(wrap with code block or file attachment)
+        输出内容（请用代码块包裹，或以文件附件上传）
     validations:
       required: false
 
   - type: textarea
     id: additional-info
     attributes:
-      label: Additional Information
+      label: 其他信息
       description: |
-        If you have any other information that might be helpful in diagnosing the issue, please provide it here.
+        如果还有其他有助于诊断问题的信息，请在这里补充。
     validations:
       required: false
