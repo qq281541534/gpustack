@@ -11,4 +11,4 @@
 
 本项目是 `secondary_development`：从 `dev` 创建分支，PR target 是 `dev`，生产镜像来源是
 `dev`。PR 使用 `Refs #<issue>`，不得使用 `Closes`、`Fixes`、`Resolves` 自动关闭 Issue。
-没有人类明确确认，不触发生产部署；Issue 只在人类确认部署、验证和回滚准备完成后关闭。
+没有人类明确确认，不触发生产部署；生产部署、验证和回滚准备证据齐全后，AI 可按人类明确指令关闭 Issue。

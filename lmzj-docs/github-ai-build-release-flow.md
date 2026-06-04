@@ -30,7 +30,7 @@ verification:
   - GET /readyz
 rollback:
   strategy: deploy_previous_full_sha
-issue_closure: human_after_verified_release
+issue_closure: ai_allowed_after_verified_release
 ```
 
 ## Public Repo L4 平台门禁
@@ -74,7 +74,7 @@ issue_closure: human_after_verified_release
    `docker compose up -d --no-build`。
 12. 验证 `/healthz`、`/readyz` 和必要业务路径。
 13. 记录发布证据和上一版可回滚完整 SHA。
-14. 人工在生产验证和回滚准备完成后关闭 Issue。
+14. 生产验证和回滚准备证据齐全后，AI 可按人类明确指令关闭 Issue。
 
 ## Workflow 分工
 
@@ -98,7 +98,7 @@ issue_closure: human_after_verified_release
   `vllm`、PyTorch/CUDA/xformers 等推理运行栈打进生产 control-plane 镜像。
 - 如确需 full runtime 镜像，手动触发时可设置 `package_extras=all`，但该镜像不得
   替代默认生产 server 镜像，部署前必须单独评估磁盘容量和回滚空间。
-- `AGENTS.md`、`CLAUDE.md`、`.trae/**`、`README*`、`docs/**`、`lmzj-docs/**`、
+- `AGENTS.md`、`CLAUDE.md`、`.claude/**`、`.trae/**`、`.cursor/**`、`README*`、`docs/**`、`lmzj-docs/**`、
   `skills/**`、`.github/workflows/**`、PR template、deploy script、production
   compose/manifest 和纯 process/lint 脚本变更属于 non-runtime，不得触发或执行生产镜像
   build/push。
