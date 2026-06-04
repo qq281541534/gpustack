@@ -10,9 +10,119 @@ permissions:
   pull-requests: read
 
 jobs:
-  process-lint:
+  detect-change-scope:
+    name: Detect change scope
+    runs-on: ubuntu-latest
+    outputs:
+      runtime_changed: ${{ steps.scope.outputs.runtime_changed }}
+      unknown_changed: ${{ steps.scope.outputs.unknown_changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect change scope
+        id: scope
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NON_RUNTIME_PATTERNS=(
+            "AGENTS.md"
+            "CLAUDE.md"
+            ".claude/**"
+            ".trae/**"
+            ".cursor/**"
+            "README"
+            "README.*"
+            "**.md"
+            "**.mdx"
+            "docs/**"
+            "lmzj-docs/**"
+            "skills/**"
+            ".github/pull_request_template.md"
+            ".github/labeler.yml"
+            ".github/labeler.yaml"
+            "scripts/ai_process_lint.py"
+            "scripts/verify_image_build_source.py"
+            "scripts/*audit*.py"
+          )
+          RELEASE_GOVERNANCE_PATTERNS=(
+            ".github/workflows/**"
+            "scripts/deploy-images.sh"
+            "docker-compose/**"
+          )
+          RUNTIME_PATTERNS=(
+            "gpustack/**"
+            "pack/**"
+            "Dockerfile"
+            "**/Dockerfile"
+            "docker-compose.yml"
+            "docker-compose.*.yml"
+            "requirements*.txt"
+            "pyproject.toml"
+            "poetry.lock"
+            "setup.py"
+            "setup.cfg"
+            "Makefile"
+          )
+
+          # Use GitHub API to list changed files (avoids merge-base issues)
+          CHANGED_FILES=$(
+            gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+              --paginate --jq '.[].filename'
+          )
+
+          if [ -z "${CHANGED_FILES}" ]; then
+            echo "No changed files detected, defaulting to runtime_changed=true."
+            echo "runtime_changed=true" >> "${GITHUB_OUTPUT}"
+            echo "unknown_changed=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          runtime_changed="false"
+          unknown_changed="false"
+
+          while IFS= read -r file; do
+            [ -z "${file}" ] && continue
+
+            is_non_runtime="false"
+            for pattern in "${NON_RUNTIME_PATTERNS[@]}"; do
+              if [[ "${file}" == ${pattern} ]]; then
+                is_non_runtime="true"
+                break
+              fi
+            done
+
+            is_release_gov="false"
+            for pattern in "${RELEASE_GOVERNANCE_PATTERNS[@]}"; do
+              if [[ "${file}" == ${pattern} ]]; then
+                is_release_gov="true"
+                break
+              fi
+            done
+
+            is_runtime="false"
+            for pattern in "${RUNTIME_PATTERNS[@]}"; do
+              if [[ "${file}" == ${pattern} ]]; then
+                is_runtime="true"
+                break
+              fi
+            done
+
+            if [ "${is_runtime}" = "true" ]; then
+              runtime_changed="true"
+            elif [ "${is_non_runtime}" = "false" ] && [ "${is_release_gov}" = "false" ]; then
+              unknown_changed="true"
+            fi
+          done <<< "${CHANGED_FILES}"
+
+          echo "runtime_changed=${runtime_changed}" >> "${GITHUB_OUTPUT}"
+          echo "unknown_changed=${unknown_changed}" >> "${GITHUB_OUTPUT}"
+
+  process-check:
     name: PR process lint
     runs-on: ubuntu-latest
+    needs: detect-change-scope
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,12 +130,39 @@ jobs:
       - name: Validate PR process
         run: python scripts/ai_process_lint.py --event-path "$GITHUB_EVENT_PATH" --target-branch dev
 
-  lightweight-validation:
-    name: Lightweight repository validation
+  runtime-check:
+    name: Runtime validation
     runs-on: ubuntu-latest
+    needs: detect-change-scope
+    if: needs.detect-change-scope.outputs.runtime_changed == 'true' || needs.detect-change-scope.outputs.unknown_changed == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Compile release scripts
         run: python -m compileall scripts
+
+      - name: Shellcheck deploy script
+        run: bash -n scripts/deploy-images.sh
+
+  pr-check:
+    name: PR check passed
+    runs-on: ubuntu-latest
+    needs: [detect-change-scope, process-check, runtime-check]
+    if: always()
+    steps:
+      - name: Evaluate results
+        run: |
+          set -euo pipefail
+          if [ "${{ needs.process-check.result }}" = "failure" ]; then
+            echo "Process check failed."
+            exit 1
+          fi
+          if [ "${{ needs.runtime-check.result }}" = "failure" ]; then
+            echo "Runtime check failed."
+            exit 1
+          fi
+          if [ "${{ needs.runtime-check.result }}" = "skipped" ]; then
+            echo "Runtime check skipped (non-runtime changes only)."
+          fi
+          echo "All PR checks passed."

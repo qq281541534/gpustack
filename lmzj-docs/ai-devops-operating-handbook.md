@@ -74,7 +74,7 @@ PR 不得包含：
 - 生产 server 镜像使用 `GPUSTACK_PACKAGE_EXTRAS=audio` 的 slim profile，不默认安装
   `all` extras。`all` 会引入 `vllm`、PyTorch/CUDA/xformers 等推理运行栈，只能作为
   明确评估过磁盘容量的 full runtime 镜像使用。
-- `AGENTS.md`、`CLAUDE.md`、`.trae/**`、`README*`、`docs/**`、`lmzj-docs/**`、
+- `AGENTS.md`、`CLAUDE.md`、`.claude/**`、`.trae/**`、`.cursor/**`、`README*`、`docs/**`、`lmzj-docs/**`、
   `skills/**`、`.github/workflows/**`、PR template、deploy script、production
   compose/manifest 和纯 process/lint 脚本变更属于 non-runtime，不得构建或 push 生产镜像。
 
@@ -144,6 +144,17 @@ missing` 或 `unresolved`，不得报告“部署成功”。
 3. 手动触发 `deploy-production.yml`，输入上一版完整 SHA。
 4. 验证 `/healthz`、`/readyz` 和公网 UI。
 5. 在 Issue 或发布记录中记录回滚证据。
+
+## AI 短期分支清理
+
+PR 合并、release source 同步、证据记录完成后，AI 必须清理自己创建的已合并本地工作分支：
+
+- 本地已合并分支必须用安全删除清理。
+- 远端 PR 分支默认删除；如果 GitHub 已自动删除，记录 already gone。
+- 不得删除 `main`、`dev`、`release/*`、`hotfix/*`、`upstream/*`、未合并分支、仍有关联
+  open PR 的分支、归属不清分支或人类明确要求保留的分支。
+- 如果项目开启 GitHub `Automatically delete head branches`，agent 仍需清理本地分支
+  并记录远端 already gone。
 
 ## Secret 管理
 

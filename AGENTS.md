@@ -84,7 +84,14 @@ Issue
 - PR body 必须使用 `Refs #<issue>`。
 - PR body 不得使用 `Closes`、`Fixes`、`Resolves`。
 - PR body 必须包含摘要、验证、部署影响、回滚方案和上游冲突风险。
-- Issue 在生产部署、验证和回滚准备完成前保持 open。
+- Issue 在生产部署、验证和回滚准备完成前保持 open；证据齐全后 AI 可按人类明确指令关闭 Issue。
+
+## AI 短期分支清理
+
+- PR 合并、release source 同步、证据记录完成后，AI 必须清理自己创建的已合并本地工作分支。
+- 远端 PR 分支默认删除；如果 GitHub 已自动删除，记录 already gone。
+- 不得删除 `main`、`dev`、`release/*`、`hotfix/*`、`upstream/*`、未合并分支、仍有关联
+  open PR 的分支、归属不清分支或人类明确要求保留的分支。
 
 ## 构建和部署规则
 
@@ -105,7 +112,7 @@ Issue
   secrets、volumes、ports、health checks 和生产路径。
 - 长耗时 workflow 中断、会话恢复或上下文丢失后，必须重新查询 run final conclusion、
   job logs 和 health check 证据；缺少证据时只能标记为 `unresolved`。
-- `AGENTS.md`、`CLAUDE.md`、`.trae/**`、`README*`、`docs/**`、`lmzj-docs/**`、
+- `AGENTS.md`、`CLAUDE.md`、`.claude/**`、`.trae/**`、`.cursor/**`、`README*`、`docs/**`、`lmzj-docs/**`、
   `skills/**`、`.github/workflows/**`、PR template、deploy script、production
   compose/manifest 和纯 process/lint 脚本变更属于 non-runtime，不得构建或 push 生产镜像。
 
