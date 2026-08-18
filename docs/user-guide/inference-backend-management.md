@@ -20,10 +20,12 @@ GPUStack supports three types of inference backends:
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------- |
 | Name                          | Inference backend name                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | Yes      |
 | Health Check Path             | Health check path used to verify the backend is up and responding. Default: /v1/models (OpenAI-compatible).                                                                                                                                                                                                                                                                                                                                                                                      | No       |
-| Default Execution Command     | Container startup command/args. For example (vLLM): `vllm serve {{model_path}} --port {{port}} --served-model-name {{model_name}} --host {{worker_ip}}`. The placeholders `{{model_path}}`, `{{model_name}}`, `{{port}}`, `{{worker_ip}}`, and `{{VAR_NAME}}` (for environment variables) are automatically substituted when the deployment is scheduled to a worker; after placeholder substitution, arguments are split using POSIX-style. Quote values with spaces and avoid shell operators. | No       |
+| Default Execution Command     | Container startup command/args. For example (vLLM): `vllm serve {{model_path}} --port {{port}} --served-model-name {{model_name}} --host {{worker_ip}}`. The placeholders `{{model_path}}`, `{{model_name}}`, `{{port}}`, `{{worker_ip}}`, `{{gpu_count}}`, `{{gpu_ids}}`, and `{{VAR_NAME}}` (for environment variables) are automatically substituted when the deployment is scheduled to a worker; after placeholder substitution, arguments are split using POSIX-style. `{{gpu_count}}` and `{{gpu_ids}}` reflect the GPUs assigned on the single scheduled worker (custom backends do not support multi-worker inference). Quote values with spaces and avoid shell operators. | No       |
 | Default Entrypoint            | Container entrypoint override. If set, it replaces the image entrypoint for this backend. Arguments are split using POSIX-style.                                                                                                                                                                                                                                                                                                                                                                 | No       |
 | Default Environment Variables | Environment variables to set for all versions of this backend. Can be referenced in commands using `{{VAR_NAME}}` syntax. Version-specific environment variables take precedence.                                                                                                                                                                                                                                                                                                                | No       |
 | Default Backend Parameters    | Pre-populate the Advanced Backend Parameters section during deployment; you can adjust them before launching                                                                                                                                                                                                                                                                                                                                                                                     | No       |
+| Flag Format                   | Controls how each `--key value` pair is rendered when assembling the backend's launch command: `Space Separated (--key value)` or `Equal Sign (--key=value)`. Leave empty to disable normalization (parameters are kept exactly as entered). Multi-value options always stay space-separated. See [Flag Format](#flag-format).                                                                                                                                                                       | No       |
+| Common Backend Parameters     | A list of commonly used parameters for this backend, shown as suggestions in the `Backend Parameters` input during deployment for quick entry. Unlike `Default Backend Parameters`, these are only offered for quick selection and are not pre-filled when the deployment form is opened. Does not affect runtime behavior.                                                                                                                                                                                                                                                     | No       |
 | Description                   | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | No       |
 | Version Configs               | Configure available versions of this backend                                                                                                                                                                                                                                                                                                                                                                                                                                                     | Yes      |
 | Default Version               | Preselected during deployment. If you don't choose a version, its image is used                                                                                                                                                                                                                                                                                                                                                                                                                  | No       |
@@ -71,6 +73,39 @@ Version Configs parameter description:
 | Entrypoint                       | Version-specific container entrypoint override. If omitted, `Default Entrypoint` is used. Arguments are split using POSIX-style.                                               | No       |
 | Execution Command                | Version-specific startup command. If omitted, the Default Execution Command is used. Parsing and splitting rules are identical to `Default Execution Command`.                 | No       |
 
+## Flag Format
+
+`Flag Format` controls how GPUStack renders each `--key value` pair when assembling the backend's launch command. It is configured at the backend level, applies to all model deployments that use this backend, and takes effect when the worker assembles the container launch command.
+
+Available values:
+
+- `Space Separated (--key value)`: separated by a space, rendered as `--key value`.
+- `Equal Sign (--key=value)`: joined by `=`, rendered as `--key=value`.
+- Empty (default): no normalization; parameters are kept exactly as entered in `Backend Parameters`.
+
+Use this field to enforce a consistent parameter style when an inference engine's command-line parser accepts only one of the two forms, without rewriting each parameter manually.
+
+**Example:**
+
+With the backend's `Flag Format` set to `Equal Sign (--key=value)`, a deployment using this backend with the following `Backend Parameters`:
+
+```bash
+--tensor-parallel-size 2 --max-model-len 8192 --lora-modules a=/path1 b=/path2
+```
+
+is normalized into the launch command as:
+
+```bash
+vllm serve Qwen/Qwen3.5-0.8B --tensor-parallel-size=2 --max-model-len=8192 --lora-modules a=/path1 b=/path2
+```
+
+`--tensor-parallel-size` and `--max-model-len` are converted to equal-sign form, while `--lora-modules` keeps the space-separated form because it carries multiple values.
+
+!!! note
+
+    - **Multi-value options** (e.g., `--lora-modules`) always stay space-separated regardless of the selected format. Converting them to `--key=value` form changes argparse semantics, since subsequent values typically overwrite previous ones.
+    - **Single-dash short options** (e.g., llama.cpp's `-n`, `-ngl`, and `-m`) are preserved verbatim, not coerced into double-dash forms like `--n`.
+
 ## Add Custom Inference Backend
 
 1. Click the "Add Backend" button in the top-right corner.
@@ -80,7 +115,7 @@ Version Configs parameter description:
 
 There are two ways to add a custom inference backend:
 
-- Through the UI form: Navigate to the **Resources > Inference Backends** page and click the **Add Custom Inference Backend** button.
+- Through the UI form: Navigate to the **Model Service > Inference Backends** page and click the **Add Custom Inference Backend** button.
 - Through YAML configuration: Import a YAML file containing the backend configuration.
 
 ### Enable Community Inference Backend
@@ -116,6 +151,8 @@ These are essentially custom backends with a "community" source label, allowing 
 !!! note
 
     vLLM has changed the entrypoint of its Docker image since v0.11.1. Therefore, when adding a custom version for vLLM v0.11.1 or later, you must specify the `Override Image Entrypoint` and `Execution Command` field; otherwise, the model will fail to start. If you use newer versions of `gpustack/runner` images, you don't need to set the `Execution Command` field.
+
+    For backends that supply the executable through `Override Image Entrypoint` (such as vLLM and SGLang), the `Execution Command` must contain arguments only. Do not put the executable (e.g. `vllm serve` or `python -m vllm ...`) in the `Execution Command`, otherwise it would be appended after the entrypoint and produce a duplicated prefix like `vllm serve python -m vllm ...`.
 
 ### Example: Add a Custom Version to the Built-in SGLang Inference Backend
 

@@ -10,6 +10,7 @@ from gpustack.policies.base import (
     Allocated,
 )
 from gpustack.scheduler.calculator import calculate_local_model_weight_size
+from gpustack.schemas.model_files import ModelFileStateEnum
 from gpustack.schemas.models import (
     ModelInstance,
     Model,
@@ -17,12 +18,15 @@ from gpustack.schemas.models import (
     SourceEnum,
     is_llm_model,
 )
-from gpustack.schemas.model_files import ModelFileStateEnum
 from gpustack.schemas.workers import Worker, GPUDevicesStatus, GPUDeviceStatus
 from pydantic import BaseModel
 
 from gpustack.server.services import ModelFileService
 from gpustack.utils.hub import get_model_weight_size, get_diffusion_model_weight_size
+from gpustack.utils.lora_model_source import (
+    lora_entry_to_model_source,
+    normalized_lora_list,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +42,53 @@ class WorkerGPUInfo(BaseModel):
     allocatable_vram: int  # in bytes
 
 
-def get_worker_allocatable_resource(  # noqa: C901
+def compute_worker_allocated(
+    all_model_instances: List[ModelInstance],
+    worker_id: int,
+    gpu_type: Optional[str] = None,
+) -> Allocated:
+    """Aggregate (ram, {gpu_index: vram}) for ``worker_id`` from current
+    ModelInstance assignments — main worker + distributed subordinates.
+
+    The single source of truth for "what's scheduled on this worker", used
+    by the scheduler (via :func:`get_worker_allocatable_resource`), the
+    workers REST API, and the worker-side collector. Mirrors the K8s
+    scheduler pattern of deriving Allocated from current workload→node
+    bindings rather than from anything the node self-reports.
+
+    For the main worker, both ram and per-GPU vram are counted. For
+    distributed subordinate workers, only vram is counted — the rpc-server
+    side doesn't consume the model's RAM.
+    """
+    allocated = Allocated(ram=0, vram={})
+
+    def add_vram(claim):
+        for gpu_index, vram in (claim.vram or {}).items():
+            allocated.vram[gpu_index] = allocated.vram.get(gpu_index, 0) + vram
+
+    for mi in all_model_instances:
+        if mi.worker_id == worker_id and (
+            gpu_type is None or mi.gpu_type is None or mi.gpu_type == gpu_type
+        ):
+            claim = mi.computed_resource_claim
+            if claim is not None:
+                allocated.ram += claim.ram or 0
+                if mi.gpu_indexes:
+                    add_vram(claim)
+
+        if mi.distributed_servers and mi.distributed_servers.subordinate_workers:
+            for sw in mi.distributed_servers.subordinate_workers:
+                if sw.worker_id != worker_id:
+                    continue
+                if sw.computed_resource_claim and (
+                    gpu_type is None or mi.gpu_type == gpu_type
+                ):
+                    add_vram(sw.computed_resource_claim)
+
+    return allocated
+
+
+def get_worker_allocatable_resource(
     all_model_instances: List[ModelInstance],
     worker: Worker,
     gpu_type: Optional[str] = None,
@@ -47,43 +97,9 @@ def get_worker_allocatable_resource(  # noqa: C901
     Get the worker with the latest allocatable resources, if gpu_type is provided, only consider the GPUs of that type.
     """
 
-    def update_allocated_vram(allocated, resource_claim):
-        for gpu_index, vram in resource_claim.vram.items():
-            allocated.vram[gpu_index] = allocated.vram.get(gpu_index, 0) + vram
-
     is_unified_memory = worker.status.memory.is_unified_memory
     model_instances = get_worker_model_instances(all_model_instances, worker)
-    allocated = Allocated(ram=0, vram={})
-
-    for model_instance in model_instances:
-        # Handle resource allocation for main worker
-        if model_instance.worker_id == worker.id and (
-            gpu_type is None
-            or model_instance.gpu_type is None
-            or model_instance.gpu_type == gpu_type
-        ):
-            allocated.ram += model_instance.computed_resource_claim.ram or 0
-            if model_instance.gpu_indexes:
-                update_allocated_vram(allocated, model_instance.computed_resource_claim)
-
-        # Handle resource allocation for subordinate workers
-        if (
-            model_instance.distributed_servers
-            and model_instance.distributed_servers.subordinate_workers
-        ):
-            for (
-                subordinate_worker
-            ) in model_instance.distributed_servers.subordinate_workers:
-                if subordinate_worker.worker_id != worker.id:
-                    continue
-
-                if subordinate_worker.computed_resource_claim and (
-                    gpu_type is None or model_instance.gpu_type == gpu_type
-                ):
-                    # rpc server only consider the vram
-                    update_allocated_vram(
-                        allocated, subordinate_worker.computed_resource_claim
-                    )
+    allocated = compute_worker_allocated(model_instances, worker.id, gpu_type)
 
     allocatable = Allocatable(ram=0, vram={})
     if worker.status.gpu_devices:
@@ -253,6 +269,21 @@ def get_vram_claim_from_model_env(model: Model) -> Optional[int]:
     return None
 
 
+def should_skip_gpu_count_check(model: Model) -> bool:
+    """
+    Whether to bypass the world-size-vs-selected-gpu-count check (GPUSTACK_SKIP_GPU_COUNT_CHECK).
+    Only honored when GPUs are manually selected; auto-scheduling is unaffected.
+    """
+    if not (model.gpu_selector and model.gpu_selector.gpu_ids):
+        return False
+    if not model.env:
+        return False
+    value = model.env.get("GPUSTACK_SKIP_GPU_COUNT_CHECK")
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 async def _get_cached_model_size(
     session: Optional[AsyncSession],
     model: Model,
@@ -278,6 +309,76 @@ async def _get_cached_model_size(
             return mf.size
 
     return None
+
+
+async def estimate_lora_weights_bytes(
+    model: Model,
+    token: Optional[str],
+    workers: Optional[List[Worker]],
+    session: Optional[AsyncSession],
+) -> int:
+    total = 0
+    for entry in normalized_lora_list(model):
+        try:
+            src = lora_entry_to_model_source(entry)
+        except ValueError:
+            continue
+        cached_used = False
+        if session:
+            mfs = await ModelFileService(session).get_by_source_index(
+                src.model_source_index
+            )
+            for mf in mfs or []:
+                if mf.state == ModelFileStateEnum.READY and mf.size:
+                    total += mf.size
+                    cached_used = True
+                    break
+        if cached_used:
+            continue
+        try:
+            if src.source in (
+                SourceEnum.HUGGING_FACE,
+                SourceEnum.MODEL_SCOPE,
+            ):
+                lm = Model(
+                    name=model.name,
+                    source=src.source,
+                    huggingface_repo_id=src.huggingface_repo_id,
+                    huggingface_filename=src.huggingface_filename,
+                    model_scope_model_id=src.model_scope_model_id,
+                    model_scope_file_path=src.model_scope_file_path,
+                    local_path=src.local_path,
+                    categories=model.categories or [],
+                    meta={},
+                    replicas=1,
+                    ready_replicas=0,
+                    cluster_id=model.cluster_id,
+                    access_policy=model.access_policy,
+                )
+                w = await asyncio.wait_for(
+                    asyncio.to_thread(get_model_weight_size, lm, token),
+                    timeout=15,
+                )
+                total += int(w or 0)
+            elif (
+                src.source == SourceEnum.LOCAL_PATH
+                and workers
+                and model.source == SourceEnum.LOCAL_PATH
+            ):
+                if not src.local_path:
+                    continue
+                w = await get_local_model_weight_size(
+                    src.local_path, workers, is_diffusion=False
+                )
+                total += int(w or 0)
+        except Exception as e:
+            logger.warning(
+                "Cannot estimate LoRA weight size for model %s entry %s: %s",
+                model.name,
+                entry,
+                e,
+            )
+    return total
 
 
 async def estimate_model_vram(
@@ -357,7 +458,21 @@ async def estimate_model_vram(
     # For non-LLM models like embedding, set a smaller overhead
     framework_overhead = 2 * 1024**3 if is_llm_model(model) else 512 * 1024**2
 
-    return int(weight_size * activation_overhead_factor) + framework_overhead
+    lora_extra = 0
+    if model.lora_list:
+        try:
+            lora_extra = await estimate_lora_weights_bytes(
+                model, token, workers, session
+            )
+        except Exception as e:
+            logger.warning(
+                "LoRA VRAM estimation skipped for model %s: %s", model.name, e
+            )
+
+    return (
+        int((weight_size + lora_extra) * activation_overhead_factor)
+        + framework_overhead
+    )
 
 
 async def estimate_diffusion_model_vram(

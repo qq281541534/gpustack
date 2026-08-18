@@ -26,7 +26,7 @@ Claude Code is an agentic coding tool from Anthropic. Since model deployments on
 
 ## Create an API Key
 
-1. Hover over the user avatar and navigate to the **API Keys** page, then click **Add API Key**.
+1. Navigate to the **Access Control** > **API Keys** page, then click **Add API Key**.
 
 2. Enter a name, then click **Save**.
 
@@ -67,7 +67,7 @@ Install [CC-Switch](https://github.com/farion1231/cc-switch) following its docum
 
 2. Verify that the configuration is correct by using the `/status` command.
 
-3. Ask Claude to create a Flappy Bird game:
+3. Try a sample task, for example, ask Claude Code to create a Flappy Bird game:
 
    ```
    Write a Flappy Bird game.

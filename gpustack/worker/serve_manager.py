@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 import contextlib
 from datetime import datetime, timezone
 import multiprocessing
@@ -21,6 +22,7 @@ from gpustack_runtime.deployer import (
 )
 from gpustack_runtime.deployer.__utils__ import compare_versions
 
+from gpustack import envs
 from gpustack.api.exceptions import NotFoundException
 from gpustack.config.config import Config
 from gpustack.config import registration
@@ -39,6 +41,7 @@ from gpustack.utils.command import find_int_parameter
 from gpustack.utils.process import terminate_process_tree, add_signal_handlers
 from gpustack.worker.backends.ascend_mindie import AscendMindIEServer
 from gpustack.worker.backends.sglang import SGLangServer
+from gpustack.utils.command import resolve_executor_backend
 from gpustack.worker.backends.vllm import VLLMServer
 from gpustack.worker.backends.vox_box import VoxBoxServer
 from gpustack.worker.backends.custom import CustomServer
@@ -63,11 +66,14 @@ from gpustack.schemas.models import (
 from gpustack.server.bus import Event, EventType
 from gpustack.worker.inference_backend_manager import InferenceBackendManager
 
-
 logger = logging.getLogger(__name__)
 
 # Inference health check error message
 _INFERENCE_HEALTH_CHECK_FAILED_MESSAGE = "Inference health check failed."
+
+# One health-check cycle (+2s margin) to let a container return after a stream
+# EOF; beyond that gpustack marks it ERROR and takes over recovery.
+LOG_RECONNECT_GRACE_SECONDS = envs.MODEL_INSTANCE_HEALTH_CHECK_INTERVAL + 2
 
 # Global lock for port assignment to avoid pickle serialization issues
 _port_lock = threading.Lock()
@@ -170,6 +176,11 @@ class ServeManager:
         # Track last health check time per model instance
         self._last_health_check_time: Dict[int, float] = {}
 
+        # Timestamp of the last authoritative (uncached) DB reconciliation in
+        # the state sync, for the optional periodic backstop. Starts "now" so
+        # the first forced reconciliation is one full period in, not immediate.
+        self._last_state_reconcile_time: float = time.time()
+
         os.makedirs(self._serve_log_dir, exist_ok=True)
 
     def record_successful_inference(self, instance_id: int):
@@ -241,10 +252,6 @@ class ServeManager:
         - If everything is fine, update the model instance state to RUNNING.
         """
 
-        # Get all model instances assigned to this worker.
-        #
-        # FIXME(thxCode): This may cause performance issues when there are many model instances in the system.
-        #                 A mechanism is needed to improve efficiency here.
         # Snapshot local state BEFORE the list call. Reversing this order
         # races with CREATED events and reaps freshly-assigned instances.
         local_assigned_ids = {
@@ -253,23 +260,65 @@ class ServeManager:
             if mi.get_deployment_metadata(self._worker_id) is not None
         }
 
-        model_instances_page = self._clientset.model_instances.list(use_cache=False)
-        page_items = model_instances_page.items or []
-
-        # An empty response is more likely a transient list failure than a
-        # genuine "server has no instances" — skip the reap pass to avoid
-        # tearing down live workloads on a single bad page.
-        if not page_items:
-            return
-
-        # Reap entries the server no longer reports — watch streams can drop
-        # DELETED events on disconnect.
-        authoritative_ids: Set[int] = {
+        # Read from the watch-backed cache. It holds the full set, so the
+        # common (nothing-to-reap) path stays O(1) with no server/DB round
+        # trip and scales independently of worker count — a direct per-worker
+        # poll here is one SELECT over model_instances per worker every few
+        # seconds, which does not scale to hundreds of workers.
+        response = self._clientset.model_instances.list()
+        all_items = response.items or []
+        reap_ids = local_assigned_ids - {
             mi.id
-            for mi in page_items
+            for mi in all_items
             if mi.get_deployment_metadata(self._worker_id) is not None
         }
-        for stale_id in local_assigned_ids - authoritative_ids:
+
+        # Optional periodic reconciliation against DB truth even when the cache
+        # reports nothing reapable. The cache and local serving state are both
+        # fed by the same awatch stream, so a ghost re-seeded into the cache
+        # sits in both and `local - cache` never flags it; an independent DB
+        # read is the only thing that catches that. Disabled by default (the
+        # server-side cached_all fix plus reconnect-driven reaping cover the
+        # realistic cases); opt in via the
+        # GPUSTACK_MODEL_INSTANCE_STATE_RECONCILE_INTERVAL env var when a
+        # coordinator may drop DELETEDs on a live stream.
+        reconcile_interval = envs.MODEL_INSTANCE_STATE_RECONCILE_INTERVAL
+        now = time.time()
+        force_authoritative = (
+            reconcile_interval > 0
+            and now - self._last_state_reconcile_time >= reconcile_interval
+        )
+
+        # Reaping tears down live workloads, so it must act on an authoritative
+        # snapshot. The cache is not one at every instant: awatch clears it and
+        # flips _watch_started before the replay snapshot arrives, so a read
+        # during a reconnect window can see an empty-but-"authoritative" cache
+        # and surface healthy instances as stale. So confirm reap candidates
+        # against a fresh, unpaginated, uncached fetch — this only touches the
+        # DB when something looks reapable or on the periodic reconciliation.
+        if reap_ids or force_authoritative:
+            response = self._clientset.model_instances.list(
+                params={"page": -1},
+                use_cache=False,
+            )
+            # Any successful authoritative fetch counts as a reconciliation —
+            # whether triggered by the timer or by a reap candidate — so reset
+            # the timer here (list() raises on API failure, so a failed fetch
+            # doesn't advance it and the next tick retries). Skipped when the
+            # backstop is disabled to keep the timestamp meaningless-but-inert.
+            if reconcile_interval > 0:
+                self._last_state_reconcile_time = now
+            all_items = response.items or []
+            reap_ids = local_assigned_ids - {
+                mi.id
+                for mi in all_items
+                if mi.get_deployment_metadata(self._worker_id) is not None
+            }
+
+        # An empty authoritative result is legitimate (user stopped every
+        # model); list() raises on API failure rather than returning empty, so
+        # local_assigned_ids - ∅ correctly reaps everything still tracked.
+        for stale_id in reap_ids:
             stale = self._model_instance_by_instance_id.get(stale_id)
             if stale is None:
                 continue
@@ -278,12 +327,19 @@ class ServeManager:
                 f"server no longer reports it assigned to this worker."
             )
             try:
-                self._stop_model_instance(stale)
+                # Equivalent to a dropped DELETED event, so purge logs too —
+                # otherwise a reused id would inherit this instance's stale logs.
+                self._stop_model_instance(stale, delete_logs=True)
             except Exception as e:
                 logger.warning(f"Failed to reap stale model instance {stale.name}: {e}")
 
+        if not all_items:
+            # Nothing left to sync; reap pass above already handled stale
+            # local state.
+            return
+
         model_instances: List[ModelInstance] = []
-        for model_instance in page_items:
+        for model_instance in all_items:
             # if the model instance is assigned to this worker, it must be scheduled.
             # But we don't need to sync the scheduled model when it is not initialized yet.
             if (
@@ -382,7 +438,9 @@ class ServeManager:
                 model = self._refresh_model(model_instance)
 
             backend = get_backend(model)
-            health_check_path = self._get_health_check_path(backend)
+            health_check_path = self._get_health_check_path(
+                backend, model.owner_principal_id
+            )
             if model.env and 'GPUSTACK_MODEL_HEALTH_CHECK_PATH' in model.env:
                 # NOTE: There is no known use case for now. Keep this in case the built-in backends
                 # introduce breaking changes and the default health check path no longer works.
@@ -662,7 +720,23 @@ class ServeManager:
                 # Reset failure count on success.
                 self._inference_health_check_failures.pop(model_instance.id, None)
 
-    def _handle_model_instance_event(self, event: Event):  # noqa: C901
+    def _handle_model_instance_event(self, event: Event):
+        """Handle a model instance event without ever crashing the watch stream.
+
+        The awatch callback runs inline in the watch loop, so any exception
+        that escapes here tears the stream down and forces a full reconnect
+        plus cache reload. Swallow and log (with traceback) instead; the next
+        event or the periodic state sync recovers the instance.
+        """
+        try:
+            self._dispatch_model_instance_event(event)
+        except Exception:
+            logger.exception(
+                f"Failed to handle {event.type} event for model instance "
+                f"{getattr(event, 'id', None)}"
+            )
+
+    def _dispatch_model_instance_event(self, event: Event):  # noqa: C901
         """
         Handle model instance events.
 
@@ -746,8 +820,15 @@ class ServeManager:
                     return
 
         if event.type == EventType.DELETED:
-            self._stop_model_instance(mi)
-            logger.trace(f"DELETED event: stopped deleted model instance {mi.name}.")
+            # Teardown is left to the periodic reap in sync_model_instances_state,
+            # which is the authoritative reconciler and must run anyway to catch
+            # DELETEDs missed during a watch disconnect. Tearing down here too
+            # would give a second concurrent caller racing the reap on
+            # delete_workload, so just let the reap reap it (within one tick).
+            logger.trace(
+                f"DELETED event for model instance {mi.name}; "
+                "teardown deferred to reap."
+            )
             return
 
         if event.type == EventType.UPDATED:
@@ -825,10 +906,14 @@ class ServeManager:
         stop_event: threading.Event,
         token: Optional[str] = None,
     ):
-        """Persist container logs to local file.
+        """Persist container logs to local file (runs in a separate thread).
 
-        This is a blocking operation that runs in a separate thread.
-        Retries indefinitely until container is created.
+        Reconnects on stream EOF while the workload is still alive, resuming by
+        skipping already-written history (matched by an anchor window of the
+        last lines written). A manual/runtime restart briefly looks terminated
+        at EOF, so it waits a grace window for the container to return before
+        giving up. Exits only if the container stays terminated for that whole
+        window or the thread is asked to stop.
 
         Args:
             workload_name: Name of the container workload
@@ -838,6 +923,10 @@ class ServeManager:
                 If None, logs from the default (index=0) container are fetched.
         """
         retry_count = 0
+        first_connect = True
+        # Anchor: a window of the last lines written. Matching a run of lines
+        # (not one) avoids false-matching a repeated line during replay.
+        anchor_window = deque(maxlen=5)
 
         while not stop_event.is_set():
             try:
@@ -849,18 +938,58 @@ class ServeManager:
                 )
 
                 if hasattr(log_stream, '__iter__'):
-                    with open(log_path, 'w', buffering=1, encoding='utf-8') as f:
+                    # On reconnect the runtime replays history from the start;
+                    # skip it until the anchor window matches.
+                    anchor = list(anchor_window)
+                    skip_until_anchor = not first_connect and bool(anchor)
+                    replayed = deque(maxlen=len(anchor)) if anchor else None
+                    received_lines = False
+                    with open(
+                        log_path,
+                        'w' if first_connect else 'a',
+                        buffering=1,
+                        encoding='utf-8',
+                    ) as f:
+                        first_connect = False
                         for line in log_stream:
+                            received_lines = True
                             if stop_event.is_set():
                                 break
 
                             if isinstance(line, bytes):
-                                f.write(line.decode('utf-8', errors='replace'))
+                                line = line.decode('utf-8', errors='replace')
                             else:
-                                f.write(str(line))
-                            f.flush()
+                                line = str(line)
 
-                break
+                            if skip_until_anchor:
+                                replayed.append(line)
+                                if list(replayed) == anchor:
+                                    skip_until_anchor = False
+                                continue
+
+                            f.write(line)
+                            f.flush()
+                            anchor_window.append(line)
+                    retry_count = 0
+
+                    # Anchor never matched -> rotated out; restart fresh. An
+                    # empty reconnect must NOT reset, or the next round reopens
+                    # in 'w' and truncates the saved log.
+                    if skip_until_anchor and received_lines:
+                        first_connect = True
+                        anchor_window.clear()
+
+                # A restart briefly looks terminated at EOF; wait for the
+                # container to return before giving up, so logs aren't dropped.
+                if stop_event.is_set() or not self._wait_for_container_recovery(
+                    workload_name, stop_event
+                ):
+                    break
+                logger.debug(
+                    f"Log stream for {workload_name} ended while workload still "
+                    f"running; reconnecting"
+                )
+                stop_event.wait(timeout=1)
 
             except Exception as e:
                 if stop_event.is_set():
@@ -873,6 +1002,40 @@ class ServeManager:
                 stop_event.wait(timeout=2)
 
         logger.debug(f"Log persistence thread for {workload_name} exiting")
+
+    def _container_still_running(self, workload_name: str) -> bool:
+        """Whether the workload is still alive (a dead stream should reconnect
+        rather than exit)."""
+        try:
+            workload = get_workload(workload_name)
+        except Exception:
+            return True  # transient query failure: reconnect, don't drop logs
+        return bool(workload) and workload.state in (
+            WorkloadStatusStateEnum.PENDING,
+            WorkloadStatusStateEnum.INITIALIZING,
+            WorkloadStatusStateEnum.RUNNING,
+        )
+
+    def _wait_for_container_recovery(
+        self,
+        workload_name: str,
+        stop_event: threading.Event,
+        grace_seconds: float = LOG_RECONNECT_GRACE_SECONDS,
+        poll_interval: float = 1.0,
+    ) -> bool:
+        """Poll until the workload is alive again (True -> reconnect) or the
+        grace window elapses / stop_event fires (False -> give up). A restart
+        momentarily looks terminated at EOF, which a single check can't tell
+        apart from a real termination.
+        """
+        attempts = max(1, int(grace_seconds / poll_interval))
+        for _ in range(attempts):
+            if stop_event.is_set():
+                return False
+            if self._container_still_running(workload_name):
+                return True
+            stop_event.wait(timeout=poll_interval)
+        return False
 
     def _discover_sidecar_logs(
         self,
@@ -1032,15 +1195,15 @@ class ServeManager:
                     )
 
     def _cleanup_old_logs(self, model_instance_id: int, current_restart_count: int):
-        """Remove serve log files except the current and previous restart_count.
+        """Keep serve logs for restart_count in {R, R-1}.
 
-        Keeps files for restart_count in {R, R-1} where R is current_restart_count;
-        when R is 0, only R is kept.
-
-        Args:
-            model_instance_id: Model instance ID
-            current_restart_count: Restart count for the upcoming run (same as log path).
+        R==0 is a fresh lifecycle start, so all existing files are purged (any
+        present belong to a previous owner of a reused id).
         """
+        if current_restart_count == 0:
+            self._purge_instance_logs(model_instance_id)
+            return
+
         try:
             log_dir = Path(self._serve_log_dir)
 
@@ -1110,6 +1273,21 @@ class ServeManager:
             except Exception as e:
                 logger.warning(f"Failed to delete {log_type} log file {f}: {e}")
 
+    def _purge_instance_logs(self, model_instance_id: int):
+        """Delete all serve logs (main/container/sidecar) for a model instance id."""
+        try:
+            log_dir = Path(self._serve_log_dir)
+            for f in log_dir.glob(f"{model_instance_id}.*.log"):
+                try:
+                    f.unlink()
+                    logger.info(f"Deleted serve log file: {f}")
+                except Exception as e:
+                    logger.warning(f"Failed to delete serve log file {f}: {e}")
+        except Exception as e:
+            logger.error(
+                f"Failed to purge logs for model instance {model_instance_id}: {e}"
+            )
+
     def _start_model_instance(self, mi: ModelInstance):  # noqa: C901
         """
         Start model instance through a subprocess.
@@ -1169,7 +1347,9 @@ class ServeManager:
                     log_file_path,
                     self._config,
                     self._worker_id,
-                    self._inference_backend_manager.get_backend_by_name(backend),
+                    self._inference_backend_manager.get_backend_by_name(
+                        backend, model.owner_principal_id
+                    ),
                     fallback_registry,
                 ),
             )
@@ -1273,31 +1453,59 @@ class ServeManager:
             mi.ports = [mi.port]
             unavailable_ports.add(mi.port)
 
-            # Additional ports for distributed servers
+            # Additional ports for distributed servers (mp path allocates all):
+            #   ports[0]: HTTP API (always)
+            #   ports[1]: --data-parallel-rpc-port (DP coordinator ZMQ)
+            #   ports[2]: --master-port (PyTorch distributed TCP store)
+            #   ports[3]: env VLLM_PORT
+            #   ports[-1]: connecting port (= VLLM_DP_MASTER_PORT for dp_only/nested)
+            # Ray path: only ports[1] (DP RPC), when user dp > 1.
             if mi.distributed_servers and mi.distributed_servers.subordinate_workers:
-                # RPC port for DP communication in vLLM backend
-                if backend == BackendEnum.VLLM:
-                    dps = find_int_parameter(
-                        model.backend_parameters,
-                        ["data-parallel-size", "dp"],
-                    )
-                    if dps and dps > 1:
-                        dp_connecting_port = network.get_free_port(
-                            port_range=self._config.service_port_range,
-                            unavailable_ports=unavailable_ports,
-                            host=mi.worker_ip,
-                        )
-                        mi.ports.append(dp_connecting_port)
-                        unavailable_ports.add(dp_connecting_port)
-
-                # Connecting port for subordinate workers communication
+                # Allocate first so we can fence off the 10-port band vLLM reserves
+                # around VLLM_DP_MASTER_PORT (= connecting port), keeping the cross
+                # ports (incl. VLLM_PORT) outside it.
                 connecting_port = network.get_free_port(
                     port_range=self._config.service_port_range,
                     unavailable_ports=unavailable_ports,
                     host=mi.worker_ip,
                 )
-                mi.ports.append(connecting_port)
                 unavailable_ports.add(connecting_port)
+
+                cross_ports: List[int] = []
+                if backend == BackendEnum.VLLM:
+                    executor_backend = resolve_executor_backend(
+                        model.backend_parameters, model.backend_version
+                    )
+                    if executor_backend == "mp":
+                        # DP RPC + PyTorch master + VLLM_PORT. Clamp the band to
+                        # service_port_range; out-of-range ports would inflate
+                        # get_free_port's exhaustion count.
+                        _, end_port = network.parse_port_range(
+                            self._config.service_port_range
+                        )
+                        unavailable_ports |= set(
+                            range(
+                                connecting_port, min(connecting_port + 10, end_port + 1)
+                            )
+                        )
+                        cross_port_count = 3
+                    else:
+                        dps = find_int_parameter(
+                            model.backend_parameters,
+                            ["data-parallel-size", "dp"],
+                        )
+                        cross_port_count = 1 if dps and dps > 1 else 0
+                    for _ in range(cross_port_count):
+                        cross_port = network.get_free_port(
+                            port_range=self._config.service_port_range,
+                            unavailable_ports=unavailable_ports,
+                            host=mi.worker_ip,
+                        )
+                        cross_ports.append(cross_port)
+                        unavailable_ports.add(cross_port)
+
+                mi.ports.extend(cross_ports)
+                mi.ports.append(connecting_port)
 
             self._assigned_ports[mi.id] = set(mi.ports)
 
@@ -1355,7 +1563,10 @@ class ServeManager:
             )
 
     def _stop_model_instance(
-        self, mi: ModelInstance, clear_restart_backoff: bool = True
+        self,
+        mi: ModelInstance,
+        clear_restart_backoff: bool = True,
+        delete_logs: bool = False,
     ):
         """
         Stop model instance and clean up.
@@ -1363,12 +1574,18 @@ class ServeManager:
         Args:
             mi: The model instance to stop.
             clear_restart_backoff: Whether to clear transient restart backoff state.
+            delete_logs: Whether to remove the instance's serve log files. Only set
+                on permanent teardown (DELETED); a restart must keep them so the
+                log viewer can still show the previous run.
         """
 
         logger.debug(f"Stopping model instance {mi.name or mi.id}")
 
         # Stop container log persistence thread
         self._stop_container_log_persistence(mi.id)
+
+        if delete_logs:
+            self._purge_instance_logs(mi.id)
 
         # Teardown provisioning process if still alive.
         if self._is_provisioning(mi):
@@ -1480,16 +1697,22 @@ class ServeManager:
                 return process.is_alive()
         return False
 
-    def _get_health_check_path(self, backend: str) -> Optional[str]:
+    def _get_health_check_path(
+        self, backend: str, owner_principal_id: Optional[int] = None
+    ) -> Optional[str]:
         """
         Get health check path for the given backend.
 
         Args:
             backend: The backend name.
+            owner_principal_id: Owner of the model being served, used to
+                resolve an Org-scoped backend row over the Platform one.
         Returns:
             The health check path if exists, else None.
         """
-        inference_backend = self._inference_backend_manager.get_backend_by_name(backend)
+        inference_backend = self._inference_backend_manager.get_backend_by_name(
+            backend, owner_principal_id
+        )
 
         return inference_backend.health_check_path if inference_backend else None
 

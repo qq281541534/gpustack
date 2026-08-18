@@ -1,93 +1,198 @@
 from contextlib import asynccontextmanager
+from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from starlette.responses import StreamingResponse
 
-from gpustack import gpu_instances
-from gpustack.api.exceptions import InternalServerErrorException, ForbiddenException
-from gpustack.api.tenant import bypass_tenant_filter
+from gpustack.api.exceptions import (
+    AlreadyExistsException,
+    InternalServerErrorException,
+    NotFoundException,
+)
+from gpustack.api.tenant import (
+    bypass_tenant_filter,
+    TenantContext,
+    assert_org_owned_writable,
+    validate_owner_principal,
+)
+from gpustack.gpu_instances import validate_k8s_object_name
 
 from gpustack.schemas import (
     GPUInstanceSSHPublicKey,
     GPUInstanceSSHPublicKeyUpdate,
     GPUInstanceSSHPublicKeyPublic,
+    GPUInstanceSSHPublicKeyListParams,
+    GPUInstanceSSHPublicKeysPublic,
+    GPUInstanceSSHPublicKeyCreate,
 )
-from gpustack.schemas.principals import PLATFORM_PRINCIPAL_ID
+from gpustack.schemas.principals import platform_principal_id
+from gpustack.server.db import async_session
 from gpustack.server.deps import SessionDep, TenantContextDep
 
 router = APIRouter()
 
 
-@router.get("/data", response_model=GPUInstanceSSHPublicKeyPublic)
-async def get_gpu_instance_ssh_public_key_data(
-    session: SessionDep,
+@router.get("", response_model=GPUInstanceSSHPublicKeysPublic)
+async def get_gpu_instance_ssh_public_keys(
     ctx: TenantContextDep,
+    params: GPUInstanceSSHPublicKeyListParams = Depends(),
+    search: Optional[str] = None,
 ):
-    if not bypass_tenant_filter(ctx) and not ctx.has_org_context:
-        raise ForbiddenException(
-            message="Organization context is required to get GPU instance SSH public key",
+    owner_principal_id = ctx.current_principal_id or platform_principal_id()
+    if bypass_tenant_filter(ctx):
+        owner_principal_id = None
+
+    fields: dict = {}
+    if owner_principal_id is not None:
+        fields["owner_principal_id"] = owner_principal_id
+
+    fuzzy_fields: dict = {}
+    if search:
+        fuzzy_fields["name"] = search
+
+    if params.watch:
+        return StreamingResponse(
+            GPUInstanceSSHPublicKey.streaming(
+                fields=fields,
+                fuzzy_fields=fuzzy_fields,
+            ),
+            media_type="text/event-stream",
         )
 
-    owner_principal_id = ctx.current_principal_id or PLATFORM_PRINCIPAL_ID
-    name = gpu_instances.SSH_PUBLIC_KEY_NAME
+    async with async_session() as session:
+        return await GPUInstanceSSHPublicKey.paginated_by_query(
+            session=session,
+            fields=fields,
+            fuzzy_fields=fuzzy_fields,
+            order_by=params.order_by,
+            page=params.page,
+            per_page=params.perPage,
+        )
 
-    ret = await GPUInstanceSSHPublicKey.one_by_fields(
+
+@router.get("/{id}", response_model=GPUInstanceSSHPublicKeyPublic)
+async def get_gpu_instance_ssh_public_key(
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+):
+    return ensure_visible(
+        await GPUInstanceSSHPublicKey.one_by_id(
+            session=session,
+            id=id,
+        ),
+        ctx,
+    )
+
+
+@router.post("", response_model=GPUInstanceSSHPublicKeyPublic)
+async def create_gpu_instance_ssh_public_key(
+    session: SessionDep,
+    ctx: TenantContextDep,
+    create_obj: GPUInstanceSSHPublicKeyCreate,
+):
+    if create_obj.owner_principal_id is None:
+        create_obj.owner_principal_id = (
+            ctx.current_principal_id or platform_principal_id()
+        )
+    validate_owner_principal(
+        create_obj.owner_principal_id,
+        ctx,
+        resource_label="GPU instance SSH public key",
+        allow_member=True,
+    )
+
+    _validate_create_obj(create_obj)
+
+    existed = await GPUInstanceSSHPublicKey.exist_by_fields(
         session=session,
         fields={
-            "owner_principal_id": owner_principal_id,
-            "name": name,
+            "owner_principal_id": create_obj.owner_principal_id,
+            "name": create_obj.name,
         },
     )
-    if ret is None:
-        # Return a dummy record with empty data if not found.
-        ret = GPUInstanceSSHPublicKeyPublic(
-            name=name,
+    if existed:
+        raise AlreadyExistsException(
+            message=(f"SSH public key with name '{create_obj.name}' already exists."),
         )
 
-    return ret
+    source: dict = create_obj.model_dump()
+    source["creator_id"] = ctx.user.id
+    async with handle_error(
+        message="Failed to create GPU instance SSH public key",
+    ):
+        return await GPUInstanceSSHPublicKey.create(
+            session=session,
+            source=source,
+        )
 
 
-@router.put("/data", response_model=GPUInstanceSSHPublicKeyPublic)
-async def update_gpu_instance_ssh_public_key_data(
+@router.put("/{id}", response_model=GPUInstanceSSHPublicKeyPublic)
+async def update_gpu_instance_ssh_public_key(
     session: SessionDep,
     ctx: TenantContextDep,
+    id: int,
     update_obj: GPUInstanceSSHPublicKeyUpdate,
 ):
-    if not bypass_tenant_filter(ctx) and not ctx.has_org_context:
-        raise ForbiddenException(
-            message="Organization context is required to update GPU instance SSH public key",
-        )
-
-    owner_principal_id = ctx.current_principal_id or PLATFORM_PRINCIPAL_ID
-    name = gpu_instances.SSH_PUBLIC_KEY_NAME
-
-    if update_obj.name != name:
-        raise ForbiddenException(
-            message="Invalid name for GPU instance SSH public key",
-        )
-    update_obj.owner_principal_id = owner_principal_id
-
-    ret = await GPUInstanceSSHPublicKey.one_by_fields(
-        session=session,
-        fields={
-            "owner_principal_id": owner_principal_id,
-            "name": name,
-        },
+    ret = ensure_writable(
+        await GPUInstanceSSHPublicKey.one_by_id(
+            session=session,
+            id=id,
+        ),
+        ctx,
     )
 
     async with handle_error(
         message="Failed to update GPU instance SSH public key",
     ):
-        if ret is None:
-            return await GPUInstanceSSHPublicKey.create(
-                session=session,
-                source=update_obj,
-            )
-
         await ret.update(
             session=session,
             source=update_obj,
         )
         return ret
+
+
+@router.delete("/{id}")
+async def delete_gpu_instance_ssh_public_key(
+    session: SessionDep,
+    ctx: TenantContextDep,
+    id: int,
+):
+    ret = ensure_writable(
+        await GPUInstanceSSHPublicKey.one_by_id(
+            session=session,
+            id=id,
+        ),
+        ctx,
+    )
+
+    async with handle_error(
+        message="Failed to delete GPU instance SSH public key",
+    ):
+        await ret.delete(
+            session=session,
+        )
+
+
+def ensure_visible(obj, ctx: TenantContext):
+    if obj and is_visible(obj, ctx):
+        return obj
+    raise NotFoundException(message="GPU instance SSH public key not found")
+
+
+def ensure_writable(obj, ctx: TenantContext):
+    if obj is None:
+        raise NotFoundException(message="GPU instance SSH public key not found")
+    assert_org_owned_writable(
+        ctx, obj, resource_label="GPU instance SSH public key", allow_member=True
+    )
+    return obj
+
+
+def is_visible(obj, ctx: TenantContext) -> bool:
+    if bypass_tenant_filter(ctx):
+        return True
+    return ctx.current_principal_id == obj.owner_principal_id
 
 
 @asynccontextmanager
@@ -98,3 +203,7 @@ async def handle_error(message: str):
         raise InternalServerErrorException(
             message=message,
         ) from e
+
+
+def _validate_create_obj(create_obj: GPUInstanceSSHPublicKeyCreate):
+    validate_k8s_object_name(create_obj.name)

@@ -33,6 +33,9 @@ class ModelFileBase(SQLModel, ModelSource):
     worker_id: Optional[int] = None
     cleanup_on_delete: Optional[bool] = None
 
+    is_lora: bool = Field(default=False, nullable=False)
+    base_model: Optional[str] = Field(default=None, nullable=True)
+
     size: Optional[int] = Field(sa_column=Column(BigInteger), default=None)
     download_progress: Optional[float] = None
     resolved_paths: List[str] = Field(sa_column=Column(JSON), default=[])
@@ -93,6 +96,12 @@ class ModelFilePublic(
     ModelFileBase,
 ):
     id: int
+    # The owning Org, denormalized from worker → cluster on create.
+    # Lives on the row but is intentionally absent from ModelFileBase
+    # (and therefore from Create / Update payloads) since clients
+    # must not smuggle their own tenant override. Surfaced here so
+    # list / get responses can render which Org owns the file.
+    owner_principal_id: Optional[int] = None
     created_at: datetime
     updated_at: datetime
 

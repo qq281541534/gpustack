@@ -1,16 +1,16 @@
 import asyncio
-from typing import Dict, List, Optional, Tuple
+import json
+from typing import List, Optional, Tuple
 import aiohttp
 from fastapi import APIRouter, Request, status, HTTPException
 from fastapi.responses import PlainTextResponse, StreamingResponse, RedirectResponse
 from urllib.parse import urlencode
-from sqlalchemy.orm import selectinload
 
 from gpustack.api.responses import StreamingResponseWithStatusCode
 from gpustack import envs
 from gpustack.server.services import ModelInstanceService
 from gpustack.server.worker_request import request_to_worker, stream_to_worker
-from gpustack.utils.network import use_proxy_env_for_url
+from gpustack.utils.command import resolve_executor_backend
 from gpustack.worker.logs import LogOptionsDep
 from gpustack.api.exceptions import (
     InternalServerErrorException,
@@ -21,6 +21,8 @@ from gpustack.schemas.clusters import Cluster
 from gpustack.api.tenant import (
     bypass_tenant_filter,
     assert_resource_visible,
+    cluster_scoped_system,
+    scoped_cluster_row_visible,
     tenant_list_conditions,
 )
 from gpustack.server.db import async_session
@@ -45,36 +47,47 @@ from gpustack.utils.grafana import resolve_grafana_base_url
 router = APIRouter()
 
 
-# Subordinate-worker display names, keyed by BackendEnum values.
-_SUBORDINATE_DISPLAY_NAMES: Dict[str, str] = {
-    BackendEnum.VLLM: "ray-worker",
-}
+def _is_vllm_ray_subordinate(model_instance: ModelInstance) -> bool:
+    """Whether a vLLM subordinate node is part of the Ray sidecar path.
+
+    Native multi-node (mp) subordinates — regardless of dp_only/mp_only/nested
+    shape — fall through to ``sub-vllm`` because the log viewer doesn't need
+    that level of granularity.
+    """
+    if model_instance.backend != BackendEnum.VLLM:
+        return False
+    model = model_instance.model
+    backend_parameters = model.backend_parameters if model else None
+    backend_version = model.backend_version if model else None
+    return resolve_executor_backend(backend_parameters, backend_version) == "ray"
 
 
-def _default_display_name(backend: Optional[str], is_main_worker: bool) -> str:
+def _default_display_name(model_instance: ModelInstance, is_main_worker: bool) -> str:
     """Resolve the UI display name for the internal 'default' container."""
+    backend = model_instance.backend
+    backend_name = backend.value if hasattr(backend, "value") else backend
     if is_main_worker:
-        return backend or "default"
-    if backend and backend in _SUBORDINATE_DISPLAY_NAMES:
-        return _SUBORDINATE_DISPLAY_NAMES[backend]
+        return backend_name or "default"
+    if _is_vllm_ray_subordinate(model_instance):
+        return "ray-worker"
     # Generic subordinate: "sub-<backend>" or just "subordinate".
-    return f"sub-{backend}" if backend else "subordinate"
+    return f"sub-{backend_name}" if backend_name else "subordinate"
 
 
 def _map_container_display_name(
-    internal_name: str, backend: Optional[str], is_main_worker: bool
+    internal_name: str, model_instance: ModelInstance, is_main_worker: bool
 ) -> str:
     """Forward-map an internal container name to its UI display name."""
     if internal_name != "default":
         return internal_name
-    return _default_display_name(backend, is_main_worker)
+    return _default_display_name(model_instance, is_main_worker)
 
 
 def _unmap_container_display_name(
-    display_name: str, backend: Optional[str], is_main_worker: bool
+    display_name: str, model_instance: ModelInstance, is_main_worker: bool
 ) -> str:
     """Reverse-map a UI display name back to the internal container name."""
-    if display_name == _default_display_name(backend, is_main_worker):
+    if display_name == _default_display_name(model_instance, is_main_worker):
         return "default"
     return display_name
 
@@ -86,9 +99,13 @@ async def get_model_instances(
     id: Optional[int] = None,
     model_id: Optional[int] = None,
     worker_id: Optional[int] = None,
+    cluster_id: Optional[int] = None,
     state: Optional[str] = None,
+    search: Optional[str] = None,
 ):
     fields = {}
+    search = search.strip() if search else None
+    fuzzy_fields = {"name": search} if search else {}
     if id:
         fields["id"] = id
 
@@ -98,10 +115,13 @@ async def get_model_instances(
     if worker_id:
         fields["worker_id"] = worker_id
 
+    if cluster_id:
+        fields["cluster_id"] = cluster_id
+
     if state:
         fields["state"] = state
 
-    # System users (workers, cluster service accounts) and admin in
+    # System principals (workers, cluster service accounts) and admin in
     # "All" mode must see every Org's instances regardless of their
     # ``principal_id`` — otherwise a worker's awatch stream
     # would silently filter out instances scheduled to it on clusters
@@ -110,8 +130,19 @@ async def get_model_instances(
         fields["owner_principal_id"] = ctx.current_principal_id
 
     if params.watch:
+        # Cluster-bound service accounts (worker / cluster bootstrap)
+        # only stream instances of their own cluster.
+        filter_func = (
+            (lambda data: scoped_cluster_row_visible(ctx, data))
+            if cluster_scoped_system(ctx)
+            else None
+        )
         return StreamingResponse(
-            ModelInstance.streaming(fields=fields),
+            ModelInstance.streaming(
+                fields=fields,
+                fuzzy_fields=fuzzy_fields,
+                filter_func=filter_func,
+            ),
             media_type="text/event-stream",
         )
 
@@ -120,6 +151,7 @@ async def get_model_instances(
         return await ModelInstance.paginated_by_query(
             session=session,
             fields=fields,
+            fuzzy_fields=fuzzy_fields,
             extra_conditions=extra_conditions,
             page=params.page,
             per_page=params.perPage,
@@ -176,12 +208,16 @@ async def get_model_instance_dashboard(
     return RedirectResponse(url=dashboard_url, status_code=302)
 
 
-async def fetch_model_instance(session, id):
-    model_instance = await ModelInstance.one_by_id(
-        session, id, options=[selectinload(ModelInstance.model_files)]
+async def fetch_model_instance(session, ctx, id):
+    model_instance = await ModelInstance.one_by_id_with_model_files(session, id)
+    # Check visibility before the worker-assignment check so a missing
+    # instance and a cross-tenant instance return the same "not found"
+    # response instead of a distinguishable "not assigned to a worker" one.
+    assert_resource_visible(
+        ctx,
+        model_instance,
+        not_found_message="Model instance not found",
     )
-    if not model_instance:
-        raise NotFoundException(message="Model instance not found")
     if not model_instance.worker_id:
         raise NotFoundException(message="Model instance not assigned to a worker")
     return model_instance
@@ -197,55 +233,60 @@ async def fetch_worker(session, worker_id):
 @router.get("/{id}/logs")
 async def get_serving_logs(  # noqa: C901
     request: Request,
-    session: SessionDep,
+    ctx: TenantContextDep,
     id: int,
     log_options: LogOptionsDep,
     worker_id: Optional[int] = None,
     container_name: Optional[str] = None,
 ):
-    model_instance = await fetch_model_instance(session, id)
+    # Inline session released after the initial lookups so a long-lived
+    # follow-log stream doesn't hold a database connection for its duration.
+    async with async_session() as session:
+        model_instance = await fetch_model_instance(session, ctx, id)
 
-    # Reverse-map: convert UI display name back to internal container name.
-    if container_name:
-        is_main = (worker_id or model_instance.worker_id) == model_instance.worker_id
-        container_name = _unmap_container_display_name(
-            container_name, model_instance.backend, is_main
-        )
+        # Reverse-map: convert UI display name back to internal container name.
+        if container_name:
+            is_main = (
+                worker_id or model_instance.worker_id
+            ) == model_instance.worker_id
+            container_name = _unmap_container_display_name(
+                container_name, model_instance, is_main
+            )
 
-    # Build valid worker IDs (main worker + subordinate workers for distributed instances)
-    valid_worker_ids = {model_instance.worker_id}
-    if (
-        model_instance.distributed_servers
-        and model_instance.distributed_servers.subordinate_workers
-    ):
-        valid_worker_ids.update(
-            sw.worker_id
-            for sw in model_instance.distributed_servers.subordinate_workers
-        )
+        # Build valid worker IDs (main worker + subordinate workers for distributed instances)
+        valid_worker_ids = {model_instance.worker_id}
+        if (
+            model_instance.distributed_servers
+            and model_instance.distributed_servers.subordinate_workers
+        ):
+            valid_worker_ids.update(
+                sw.worker_id
+                for sw in model_instance.distributed_servers.subordinate_workers
+            )
 
-    # Determine target worker ID
-    target_worker_id = worker_id or model_instance.worker_id
-    if target_worker_id not in valid_worker_ids:
-        raise NotFoundException(
-            message=f"Worker {target_worker_id} not found for model instance {id}"
-        )
+        # Determine target worker ID
+        target_worker_id = worker_id or model_instance.worker_id
+        if target_worker_id not in valid_worker_ids:
+            raise NotFoundException(
+                message=f"Worker {target_worker_id} not found for model instance {id}"
+            )
 
-    worker = await fetch_worker(session, target_worker_id)
+        worker = await fetch_worker(session, target_worker_id)
 
-    params = {
-        "tail": log_options.tail,
-        "follow": log_options.follow,
-        "model_instance_name": model_instance.name,
-        "previous": log_options.previous,
-    }
-    if container_name:
-        params["container_name"] = container_name
-    if (
-        model_instance.state != ModelInstanceStateEnum.RUNNING
-        and model_instance.model_files
-        and model_instance.model_files[0].state != ModelFileStateEnum.READY
-    ):
-        params["model_file_id"] = model_instance.model_files[0].id
+        params = {
+            "tail": log_options.tail,
+            "follow": log_options.follow,
+            "model_instance_name": model_instance.name,
+            "previous": log_options.previous,
+        }
+        if container_name:
+            params["container_name"] = container_name
+        if (
+            model_instance.state != ModelInstanceStateEnum.RUNNING
+            and model_instance.model_files
+            and model_instance.model_files[0].state != ModelFileStateEnum.READY
+        ):
+            params["model_file_id"] = model_instance.model_files[0].id
 
     timeout = aiohttp.ClientTimeout(total=envs.PROXY_TIMEOUT, sock_connect=5)
 
@@ -325,26 +366,26 @@ async def fetch_serve_log_options_from_worker(
     worker: Worker,
     model_instance_id: int,
 ) -> ServeLogOptionsResponse:
-    log_options_url = (
-        f"http://{worker.advertise_address}:{worker.port}/serveLogOptions"
-        f"/{model_instance_id}"
-    )
     timeout = aiohttp.ClientTimeout(total=envs.PROXY_TIMEOUT, sock_connect=5)
-    use_proxy_env = use_proxy_env_for_url(log_options_url)
-    client: aiohttp.ClientSession = (
-        request.app.state.http_client
-        if use_proxy_env
-        else request.app.state.http_client_no_proxy
-    )
     try:
-        async with client.get(log_options_url, timeout=timeout) as resp:
-            if resp.status != 200:
-                raise ValueError(
-                    f"HTTP {resp.status}: error fetching model instance log options"
-                )
-            data = await resp.json()
-    except ValueError:
-        raise
+        resp, body = await request_to_worker(
+            worker=worker,
+            method="GET",
+            path=f"serveLogOptions/{model_instance_id}",
+            proxy_client=request.app.state.http_client,
+            no_proxy_client=request.app.state.http_client_no_proxy,
+            timeout=timeout,
+        )
+    except Exception as e:
+        raise ValueError(str(e)) from e
+
+    if resp.status != 200:
+        raise ValueError(
+            f"HTTP {resp.status}: error fetching model instance log options"
+        )
+
+    try:
+        data = json.loads(body) if body else {}
     except Exception as e:
         raise ValueError(str(e)) from e
 
@@ -357,10 +398,11 @@ async def fetch_serve_log_options_from_worker(
 async def get_model_instance_log_options(
     request: Request,
     session: SessionDep,
+    ctx: TenantContextDep,
     id: int,
 ):
     """Return per-worker restart_count values that exist on disk for this model instance."""
-    model_instance = await fetch_model_instance(session, id)
+    model_instance = await fetch_model_instance(session, ctx, id)
     targets = await resolve_instance_log_worker_targets(session, model_instance)
 
     async def fetch_one(
@@ -403,7 +445,7 @@ async def get_model_instance_log_options(
         is_main = wo.worker_id == model_instance.worker_id
         for entry in wo.restarts:
             entry.containers = [
-                _map_container_display_name(c, model_instance.backend, is_main)
+                _map_container_display_name(c, model_instance, is_main)
                 for c in entry.containers
             ]
 

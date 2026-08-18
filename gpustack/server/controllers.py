@@ -5,7 +5,7 @@ import asyncio
 import yaml
 from importlib.resources import files
 from functools import partial
-from typing import Any, Dict, List, Tuple, Optional, Set
+from typing import Any, Dict, Iterable, List, Tuple, Optional, Set
 from pydantic import BaseModel
 from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -16,11 +16,6 @@ from gpustack.config.config import (
     Config,
     get_cluster_image_name,
 )
-from gpustack.gpu_instances import (
-    sync_ssh_public_key_to_clusters,
-    get_ssh_public_key,
-    sync_ssh_public_key_to_cluster,
-)
 from gpustack.policies.scorers.offload_layer_scorer import OffloadLayerScorer
 from gpustack.policies.scorers.placement_scorer import PlacementScorer, ScaleTypeEnum
 from gpustack.policies.scorers.score_chain import (
@@ -28,7 +23,6 @@ from gpustack.policies.scorers.score_chain import (
 )
 from gpustack.policies.base import ModelInstanceScore
 from gpustack.policies.scorers.status_scorer import StatusScorer
-from gpustack.schemas import GPUInstanceSSHPublicKey
 from gpustack.schemas.inference_backend import (
     InferenceBackend,
     get_built_in_backend,
@@ -46,18 +40,31 @@ from gpustack.schemas.model_routes import (
 )
 from gpustack.schemas.principals import (
     Principal,
-    PLATFORM_PRINCIPAL_ID,
+    PrincipalType,
+    platform_principal_id,
 )
 from gpustack.schemas.models import (
     BackendEnum,
     BackendSourceEnum,
+    LoraListEntry,
     ModelSource,
     Model,
     ModelInstance,
     ModelInstanceCreate,
     ModelInstanceStateEnum,
+    ModelInstanceSubordinateWorker,
     SourceEnum,
     get_backend,
+)
+from gpustack.schemas.links import (
+    ModelInstanceModelFileLink,
+    ModelInstanceDraftModelFileLink,
+)
+from gpustack.utils.lora_model_source import (
+    lora_entry_to_model_source,
+    lora_route_name_for,
+    normalized_lora_list,
+    model_base_descriptor,
 )
 from gpustack.schemas.config import (
     GatewayModeEnum,
@@ -81,7 +88,7 @@ from gpustack.schemas.clusters import (
 
 from gpustack.schemas.users import (
     User,
-    is_default_cluster_user,
+    is_default_cluster_principal,
 )
 from gpustack.server.bus import Event, EventType, event_bus
 from gpustack.server.cache import delete_cache_by_key
@@ -95,7 +102,9 @@ from gpustack.server.services import (
     WorkerService,
     ModelRouteService,
     collect_route_cache_names,
+    revoke_model_access_cache,
 )
+from gpustack.server.lora_model_routes import cleanup_orphan_lora_routes
 from gpustack.utils.model_instance_workers import get_model_instance_worker_match
 from gpustack.cloud_providers.common import (
     get_client_from_provider,
@@ -173,6 +182,10 @@ class ModelController:
             )
             worker_by_id = {worker.id: worker for worker in workers}
 
+        lora_route_names = [
+            lora_route_name_for(model.name, entry.lora_name)
+            for entry in normalized_lora_list(model)
+        ]
         await mcp_handler.ensure_model_mcp_bridge(
             event_type=event_type,
             model_id=model.id,
@@ -181,6 +194,7 @@ class ModelController:
             namespace=self._config.gateway_namespace,
             cluster_id=model.cluster_id,
             workers=worker_by_id,
+            lora_route_names=lora_route_names,
         )
 
     async def _reconcile(self, event: Event):
@@ -260,8 +274,23 @@ class ModelInstanceController:
                 if model_deleting:
                     return
 
+                should_cleanup_lora_routes = event.type == EventType.DELETED or (
+                    event.type == EventType.UPDATED
+                    and "state" in (event.changed_fields or {})
+                    and model_instance.state != ModelInstanceStateEnum.RUNNING
+                )
+                any_lora_route_deleted = False
+                if should_cleanup_lora_routes:
+                    any_lora_route_deleted = await cleanup_orphan_lora_routes(
+                        session, model
+                    )
+
                 await model.refresh(session)
-                await sync_ready_replicas(session, model)
+                replicas_updated = await sync_ready_replicas(session, model)
+                if any_lora_route_deleted and not replicas_updated:
+                    await session.commit()
+                if any_lora_route_deleted:
+                    await revoke_model_access_cache(session=session)
         except Exception as e:
             logger.error(
                 f"Failed to reconcile model instance {model_instance.name}: {e}"
@@ -284,7 +313,7 @@ async def sync_replicas(session: AsyncSession, model: Model):
     if len(instances) < model.replicas:
         for _ in range(model.replicas - len(instances)):
             name_prefix = ''.join(
-                random.choices(string.ascii_letters + string.digits, k=5)
+                random.choices(string.ascii_lowercase + string.digits, k=5)
             )
             instance = ModelInstanceCreate(
                 name=f"{model.name}-{name_prefix}",
@@ -299,7 +328,7 @@ async def sync_replicas(session: AsyncSession, model: Model):
                 state=ModelInstanceStateEnum.PENDING,
                 cluster_id=model.cluster_id,
                 # Inherit the parent Model's tenant binding — the schema
-                # default of PLATFORM_PRINCIPAL_ID would otherwise
+                # default of platform_principal_id() would otherwise
                 # land instances of a non-Default-Org Model in Default.
                 owner_principal_id=model.owner_principal_id,
                 draft_model_source=get_draft_model_source(model),
@@ -342,7 +371,12 @@ async def distribute_models_to_user(
     to_create_model_user_ids: Set[int] = set()
     if event.type == EventType.DELETED:
         users = await User.all_by_fields(
-            session, fields={"deleted_at": None, "is_admin": False}
+            session,
+            fields={
+                "kind": PrincipalType.USER,
+                "deleted_at": None,
+                "is_admin": False,
+            },
         )
         for user in users:
             to_delete_model_user_ids.add(user.id)
@@ -358,9 +392,13 @@ async def distribute_models_to_user(
         if len(changed_fields) > 0:
             users = await User.all_by_fields(
                 session,
-                fields={"deleted_at": None, "is_admin": False},
+                fields={
+                    "kind": PrincipalType.USER,
+                    "deleted_at": None,
+                    "is_admin": False,
+                },
                 extra_conditions=[
-                    User.principal_id.in_(
+                    User.id.in_(
                         select(ModelRoutePrincipalLink.principal_id).where(
                             ModelRoutePrincipalLink.route_id == model.id
                         )
@@ -372,9 +410,13 @@ async def distribute_models_to_user(
     if event.type == EventType.CREATED:
         users = await User.all_by_fields(
             session,
-            fields={"deleted_at": None, "is_admin": False},
+            fields={
+                "kind": PrincipalType.USER,
+                "deleted_at": None,
+                "is_admin": False,
+            },
             extra_conditions=[
-                User.principal_id.in_(
+                User.id.in_(
                     select(ModelRoutePrincipalLink.principal_id).where(
                         ModelRoutePrincipalLink.route_id == model.id
                     )
@@ -391,7 +433,11 @@ async def distribute_models_to_user(
     ]:
         for user_id in ids:
             my_model = MyModel(
-                pid=f"{model_id}:{user_id}",
+                # Match the view's pid layout (``route_id:user_id:via``).
+                # The publisher doesn't know the granting chain, so the
+                # via suffix is empty — same shape as the PUBLIC/AUTHED
+                # branch of ``non_admin_user_models``.
+                pid=f"{model_id}:{user_id}:",
                 user_id=user_id,
                 **model_dict,
             )
@@ -402,6 +448,157 @@ async def distribute_models_to_user(
             )
     if tasks:
         await asyncio.gather(*tasks)
+
+
+def _instance_model_files_complete(
+    instance: ModelInstance, model: Optional[Model]
+) -> bool:
+    """Check if all expected model files already exist and none need retry."""
+    worker_ids = _get_worker_ids_for_file_download(instance)
+    if not worker_ids:
+        return False
+
+    existing = instance.model_files or []
+    if any(f.state == ModelFileStateEnum.ERROR for f in existing):
+        return False
+
+    # Primary model files: each worker should have a non-LoRA file
+    primary_worker_ids = {f.worker_id for f in existing if not f.is_lora}
+    if not all(wid in primary_worker_ids for wid in worker_ids):
+        return False
+
+    # LoRA files: each LoRA entry × each worker should have a file
+    expected_lora_count = len(normalized_lora_list(model)) if model else 0
+    if expected_lora_count > 0:
+        lora_files = [f for f in existing if f.is_lora]
+        if len(lora_files) < expected_lora_count * len(worker_ids):
+            return False
+
+    # Draft model files
+    if instance.draft_model_source:
+        draft_files = instance.draft_model_files or []
+        if any(f.state == ModelFileStateEnum.ERROR for f in draft_files):
+            return False
+        draft_worker_ids = {f.worker_id for f in draft_files}
+        if not all(wid in draft_worker_ids for wid in worker_ids):
+            return False
+
+    return True
+
+
+async def _link_instance_primary_model_files(
+    session: AsyncSession, instance_id: int, files: List[ModelFile]
+):
+    """Insert missing instance↔model_file links; caller's session will flush/commit."""
+    for f in files:
+        if f.id is None:
+            continue
+        stmt = select(ModelInstanceModelFileLink).where(
+            ModelInstanceModelFileLink.model_instance_id == instance_id,
+            ModelInstanceModelFileLink.model_file_id == f.id,
+        )
+        if (await session.exec(stmt)).first() is None:
+            session.add(
+                ModelInstanceModelFileLink(
+                    model_instance_id=instance_id, model_file_id=f.id
+                )
+            )
+
+
+async def _link_instance_draft_model_files(
+    session: AsyncSession, instance_id: int, files: List[ModelFile]
+):
+    """Same as primary links but for draft-model file associations."""
+    for f in files:
+        if f.id is None:
+            continue
+        stmt = select(ModelInstanceDraftModelFileLink).where(
+            ModelInstanceDraftModelFileLink.model_instance_id == instance_id,
+            ModelInstanceDraftModelFileLink.model_file_id == f.id,
+        )
+        if (await session.exec(stmt)).first() is None:
+            session.add(
+                ModelInstanceDraftModelFileLink(
+                    model_instance_id=instance_id, model_file_id=f.id
+                )
+            )
+
+
+def _is_primary_instance_model_file(
+    file: ModelFile, instance: ModelInstance, is_draft_model: bool
+) -> bool:
+    if is_draft_model:
+        return False
+    if file.is_lora:
+        return False
+    return True
+
+
+async def get_or_create_lora_model_files_for_instance(
+    session: AsyncSession, instance: ModelInstance, model: Model
+) -> List[ModelFile]:
+    """Ensure ModelFile rows exist for model.lora_list on the instance's workers (same session as caller)."""
+    entries = normalized_lora_list(model)
+    if not entries:
+        return []
+    worker_ids = _get_worker_ids_for_file_download(instance)
+    base_desc = model_base_descriptor(model)
+    worker_scopes = await _get_worker_tenant_scopes(session, worker_ids)
+    out: List[ModelFile] = []
+    seen_ids: Set[int] = set()
+
+    for entry in entries:
+        try:
+            lora_src = lora_entry_to_model_source(entry)
+        except ValueError as e:
+            logger.warning(
+                "Skip invalid LoRA entry %r for instance %s; ModelFile will not be created: %s",
+                entry.lora_name,
+                instance.name,
+                e,
+            )
+            continue
+        # Query once per entry, reuse across workers
+        existing_list = await ModelFileService(session).get_by_source_index(
+            lora_src.model_source_index
+        )
+        existing_list = existing_list or []
+        for worker_id in worker_ids:
+            hit = next((f for f in existing_list if f.worker_id == worker_id), None)
+            if hit:
+                if not hit.is_lora:
+                    hit.is_lora = True
+                if hit.base_model != base_desc:
+                    hit.base_model = base_desc
+                    await hit.update(session, auto_commit=False)
+                if hit.id is not None and hit.id not in seen_ids:
+                    out.append(hit)
+                    seen_ids.add(hit.id)
+            else:
+                cluster_id, owner_principal_id = worker_scopes.get(
+                    worker_id, (None, None)
+                )
+                nf = ModelFile(
+                    source=lora_src.source,
+                    huggingface_repo_id=lora_src.huggingface_repo_id,
+                    huggingface_filename=lora_src.huggingface_filename,
+                    model_scope_model_id=lora_src.model_scope_model_id,
+                    model_scope_file_path=lora_src.model_scope_file_path,
+                    local_path=lora_src.local_path,
+                    is_lora=True,
+                    base_model=base_desc,
+                    state=ModelFileStateEnum.DOWNLOADING,
+                    worker_id=worker_id,
+                    source_index=lora_src.model_source_index,
+                    cluster_id=cluster_id,
+                    owner_principal_id=owner_principal_id,
+                )
+                created = await ModelFile.create(session, nf, auto_commit=False)
+                mf = created or nf
+                if mf.id is not None and mf.id not in seen_ids:
+                    out.append(mf)
+                    seen_ids.add(mf.id)
+    return out
 
 
 async def ensure_instance_model_file(session: AsyncSession, instance: ModelInstance):
@@ -417,13 +614,18 @@ async def ensure_instance_model_file(session: AsyncSession, instance: ModelInsta
         instance.id,
         options=[
             selectinload(ModelInstance.model_files),
+            selectinload(ModelInstance.draft_model_files),
         ],
     )
     if not instance:
         return
 
-    if len(instance.model_files) > 0:
-        await sync_instance_files_state(session, instance, instance.model_files)
+    model = await Model.one_by_id(session, instance.model_id)
+
+    # Early-return: skip expensive get_or_create queries when all files are ready
+    if _instance_model_files_complete(instance, model):
+        all_files = list(instance.model_files) + list(instance.draft_model_files)
+        await sync_instance_files_state(session, instance, all_files)
         return
 
     retry_model_files = []
@@ -433,7 +635,13 @@ async def ensure_instance_model_file(session: AsyncSession, instance: ModelInsta
         draft_model_files = await get_or_create_model_files_for_instance(
             session, instance, is_draft_model=True
         )
-    for model_file in model_files + draft_model_files:
+    lora_model_files: List[ModelFile] = []
+    if model:
+        lora_model_files = await get_or_create_lora_model_files_for_instance(
+            session, instance, model
+        )
+
+    for model_file in model_files + draft_model_files + lora_model_files:
         if model_file.state == ModelFileStateEnum.ERROR:
             # Retry the download
             retry_model_files.append(model_file.readable_source)
@@ -443,16 +651,28 @@ async def ensure_instance_model_file(session: AsyncSession, instance: ModelInsta
             model_file.state_message = ""
             await model_file.update(session, auto_commit=False)
 
+    await _link_instance_primary_model_files(
+        session, instance.id, model_files + lora_model_files
+    )
+    await _link_instance_draft_model_files(session, instance.id, draft_model_files)
+    # Commit file creation, retry resets, and instance <--> file links in one
+    # transaction.  ModelFile events are published by the after_commit hook,
+    # so ModelFileController._reconcile will only see these files after the
+    # links already exist — preventing a race where reconcile queries
+    # file.instances before the links are committed.
+    await session.commit()
+
     if retry_model_files:
-        await session.commit()
         logger.info(
             f"Retrying download for model files {retry_model_files} for model instance {instance.name}"
         )
 
     instance = await ModelInstance.one_by_id(session, instance.id)
-    instance.model_files = model_files
-    instance.draft_model_files = draft_model_files
-    await sync_instance_files_state(session, instance, model_files + draft_model_files)
+    await sync_instance_files_state(
+        session,
+        instance,
+        model_files + draft_model_files + lora_model_files,
+    )
 
 
 async def get_or_create_model_files_for_instance(
@@ -480,8 +700,10 @@ async def get_or_create_model_files_for_instance(
     model_source = instance
     if is_draft_model:
         model_source = instance.draft_model_source
+    worker_scopes = await _get_worker_tenant_scopes(session, missing_worker_ids)
     # Create model files for the missing worker IDs.
     for worker_id in missing_worker_ids:
+        cluster_id, owner_principal_id = worker_scopes.get(worker_id, (None, None))
         model_file = ModelFile(
             source=model_source.source,
             huggingface_repo_id=model_source.huggingface_repo_id,
@@ -492,8 +714,10 @@ async def get_or_create_model_files_for_instance(
             state=ModelFileStateEnum.DOWNLOADING,
             worker_id=worker_id,
             source_index=model_source.model_source_index,
+            cluster_id=cluster_id,
+            owner_principal_id=owner_principal_id,
         )
-        await ModelFile.create(session, model_file)
+        await ModelFile.create(session, model_file, auto_commit=False)
         logger.info(
             f"Created model file for model instance {instance.name} and worker {worker_id}"
         )
@@ -586,13 +810,15 @@ async def find_scale_down_candidates(
         return []
 
 
-async def sync_ready_replicas(session: AsyncSession, model: Model):
+async def sync_ready_replicas(session: AsyncSession, model: Model) -> bool:
     """
     Synchronize the ready replicas.
+
+    Returns True if the model row was updated (and the session was committed).
     """
 
     if model.deleted_at is not None:
-        return
+        return False
 
     instances = await ModelInstance.all_by_field(session, "model_id", model.id)
 
@@ -604,20 +830,23 @@ async def sync_ready_replicas(session: AsyncSession, model: Model):
     if model.ready_replicas != ready_replicas:
         model.ready_replicas = ready_replicas
         await ModelService(session).update(model)
+        return True
+    return False
 
 
 async def get_cluster_registry(
     session: AsyncSession, cluster_id: int
 ) -> Optional[McpBridgeRegistry]:
-    cluster_user = await User.one_by_field(
-        session=session,
-        field="cluster_id",
-        value=cluster_id,
-        options=[selectinload(User.cluster)],
-    )
-    if is_default_cluster_user(cluster_user):
+    # Resolve the cluster's SYSTEM principal via the inverse FK
+    # (``Cluster.system_principal_id``) — that link replaces the old
+    # ``User.cluster_id`` lookup after the FK direction was inverted.
+    cluster = await Cluster.one_by_id(session, cluster_id)
+    if cluster is None or cluster.system_principal_id is None:
         return None
-    cluster_registry = mcp_handler.cluster_registry(cluster_user.cluster)
+    cluster_principal = await Principal.one_by_id(session, cluster.system_principal_id)
+    if cluster_principal is None or is_default_cluster_principal(cluster_principal):
+        return None
+    cluster_registry = mcp_handler.cluster_registry(cluster)
     if cluster_registry is None:
         return None
     return cluster_registry
@@ -681,7 +910,7 @@ async def sync_model_route_mapper(
     )
 
 
-async def ensure_route_generic_transformer_config(
+async def ensure_route_generic_proxy_router_config(
     cfg: Config,
     model_route: ModelRoute,
     effective_name: str,
@@ -689,30 +918,24 @@ async def ensure_route_generic_transformer_config(
     generic_proxy_enabled: bool,
 ):
     """
-    Reconcile the single HeaderRule that maps /model/proxy/<route_id>/... to this
-    route's x-higress-llm-model. When generic_proxy_enabled is False (generic proxy
-    disabled or route deleted), the rule is removed and other routes are untouched.
+    Reconcile the single aliasNameMapping entry that maps /model/proxy/<route_id>/...
+    to this route's effective model name. When ``generic_proxy_enabled`` is False
+    (generic proxy disabled or route deleted), the entry is removed and other
+    routes are untouched.
 
     ``effective_name`` is the fully-qualified model name including the
-    Org slug prefix (e.g. ``org1/qwen3-0.6b``) for non-platform Orgs;
+    Org name prefix (e.g. ``org1/qwen3-0.6b``) for non-platform Orgs;
     platform Org keeps the unprefixed ``model_route.name``.
     """
-    operating_path_pattern = mcp_handler.build_generic_route_path_pattern(
-        model_route.id
-    )
-    expected_header_rules: List[Dict[str, Any]] = []
-    if generic_proxy_enabled:
-        expected_header_rules.append(
-            mcp_handler.build_generic_route_header_rule(model_route.id, effective_name)
-        )
+    route_name = effective_name if generic_proxy_enabled else None
     await mcp_handler.ensure_wasm_plugin(
         api=extensions_api,
-        name=mcp_handler.gpustack_generic_route_transformer_name,
+        name=mcp_handler.gpustack_generic_proxy_router_name,
         namespace=cfg.gateway_namespace,
         spec_diff=partial(
-            mcp_handler.generic_route_transformer_diff_spec,
-            expected_header_rules=expected_header_rules,
-            operating_path_pattern=operating_path_pattern,
+            mcp_handler.generic_proxy_router_diff_spec,
+            route_id=model_route.id,
+            route_name=route_name,
         ),
     )
 
@@ -817,15 +1040,15 @@ async def sync_gateway(
         destinations, fallback_destinations = await calculate_destinations(
             session, model_route
         )
-    # Effective model name = `<org-slug>/<route.name>` for non-platform
+    # Effective model name = `<owner-name>/<route.name>` for non-platform
     # Orgs (so two Orgs can use the same `route.name` without colliding
     # in Higress's AI proxy match rules), unprefixed for the platform Org
     # (backward compatible for existing clients).
     route_owner = await Principal.one_by_id(session, model_route.owner_principal_id)
     effective_name = effective_route_name(
         model_route.name,
-        getattr(route_owner, "slug", None),
-        getattr(route_owner, "id", None) == PLATFORM_PRINCIPAL_ID,
+        getattr(route_owner, "name", None),
+        getattr(route_owner, "id", None) == platform_principal_id(),
     )
     ingress_name = mcp_handler.model_route_ingress_name(model_route.id)
     await sync_model_route_mapper(
@@ -876,9 +1099,9 @@ async def sync_gateway(
         namespace=cfg.get_namespace(),
         networking_istio_api=istio_networking_api,
     )
-    # Generic-route transformer: inject x-higress-llm-model when /model/proxy/<id>/
+    # Generic-proxy router: inject x-higress-llm-model when /model/proxy/<id>/
     # is hit, so the existing main ingress header matcher + fallback chain apply.
-    await ensure_route_generic_transformer_config(
+    await ensure_route_generic_proxy_router_config(
         cfg=cfg,
         model_route=model_route,
         effective_name=effective_name,
@@ -936,12 +1159,14 @@ async def calculate_destinations(
             model = await Model.one_by_id(session, target.model_id)
             if model is None:
                 continue
-            to_extend = await calculate_model_destinations(session, model)
+            to_extend = await calculate_model_destinations(
+                session, model, target.overridden_model_name
+            )
         elif target.provider_id is not None:
             to_extend = await provider_destinations(
                 session=session,
                 provider_id=target.provider_id,
-                provider_model_name=target.provider_model_name,
+                provider_model_name=target.overridden_model_name,
             )
         if to_extend is None or len(to_extend) == 0:
             # no valid destination found
@@ -984,14 +1209,25 @@ async def provider_destinations(
 async def calculate_model_destinations(
     session: AsyncSession,
     model: Model,
+    overridden_model_name: Optional[str] = None,
 ) -> mcp_handler.DestinationTupleList:
+    """Build destinations for a local-model target. LoRA child routes pass
+    ``overridden_model_name=<base>:<lora>`` so the gateway's modelMapping
+    becomes a self-map (skipped at sync_model_route_mapper), letting the
+    LoRA module name reach vLLM intact.
     """
-    return count dict for each registry
-    """
-    # find out is handling default cluster's model
+    downstream_model_name = overridden_model_name or model.name
+    # LoRA targets share the base model's instances; route them to a per-LoRA
+    # aliased service (same address, distinct name) registered in ensure_model_mcp_bridge
+    # so the gateway can weight and rewrite per LoRA instead of collapsing onto one.
+    registry_name_suffix = (
+        mcp_handler.lora_registry_name_suffix(overridden_model_name)
+        if overridden_model_name is not None and ":" in overridden_model_name
+        else None
+    )
     cluster_registry = await get_cluster_registry(session, model.cluster_id)
     if cluster_registry is not None:
-        return [(1, model.name, cluster_registry)]
+        return [(1, downstream_model_name, cluster_registry)]
 
     instances = await ModelInstance.all_by_field(session, "model_id", model.id)
     instances = [
@@ -1019,9 +1255,12 @@ async def calculate_model_destinations(
         ],
     )
     workers = {worker.id: worker for worker in worker_list}
-    registry_list = mcp_handler.model_instances_registry_list(instances, workers)
-
-    return registry_list
+    return mcp_handler.model_instances_registry_list(
+        instances,
+        workers,
+        downstream_model_name=downstream_model_name,
+        registry_name_suffix=registry_name_suffix,
+    )
 
 
 class WorkerController:
@@ -1410,6 +1649,8 @@ class InferenceBackendController:
             "description",
             "icon",
             "default_env",
+            "parameter_format",
+            "common_parameters",
         ]
         backend_data = {k: config[k] for k in allowed_keys if k in config}
 
@@ -1589,17 +1830,190 @@ def _is_draft_model_file(file: ModelFile, instance: ModelInstance) -> bool:
     return False
 
 
+def _aggregate_instance_download_progress(
+    instance: ModelInstance,
+    current_file: ModelFile,
+    override_progress: Optional[float] = None,
+    override_state: Optional[ModelFileStateEnum] = None,
+) -> Optional[float]:
+    """
+    Average progress over the main worker's not-yet-READY files. Subordinate
+    files are excluded: instance.download_progress is the main worker's bar (the
+    UI shows subordinate progress separately). 100.0 if all READY, None if none.
+    override_* = a transition not yet persisted to the DB row.
+    """
+    # Main worker only; subordinate progress is tracked per-worker elsewhere.
+    files = [f for f in instance.model_files or [] if f.worker_id == instance.worker_id]
+    if not files:
+        return None
+    active_values: List[float] = []
+    for f in files:
+        if current_file.id is not None and f.id == current_file.id:
+            p = (
+                override_progress
+                if override_progress is not None
+                else current_file.download_progress
+            )
+            s = override_state if override_state is not None else current_file.state
+        else:
+            p = f.download_progress
+            s = f.state
+        if s == ModelFileStateEnum.READY:
+            continue
+        active_values.append(float(p) if p is not None else 0.0)
+    if not active_values:
+        return 100.0
+    return sum(active_values) / len(active_values)
+
+
+def _refresh_instance_download_progress(
+    instance: ModelInstance, file: ModelFile, *, file_ready: bool = False
+) -> bool:
+    """Re-aggregate per-file progress into instance.download_progress (the
+    overall bar). `file_ready` treats `file` as 100%/READY so it drops out of
+    the active set and the bar can reach 100. Returns True if it changed."""
+    if instance.download_progress == 100:
+        return False
+    if file_ready:
+        aggregate = _aggregate_instance_download_progress(
+            instance,
+            file,
+            override_progress=100.0,
+            override_state=ModelFileStateEnum.READY,
+        )
+    else:
+        aggregate = _aggregate_instance_download_progress(instance, file)
+    if aggregate is not None and aggregate != instance.download_progress:
+        instance.download_progress = aggregate
+        return True
+    return False
+
+
+def _first_resolved_path(
+    files: Optional[List[ModelFile]], *, exclude_lora: bool = False
+) -> Optional[str]:
+    """Return the first resolved path among `files`, skipping LoRA files when
+    `exclude_lora` is set. None if no file carries a resolved path."""
+    for file in files or []:
+        if exclude_lora and file.is_lora:
+            continue
+        if file.resolved_paths:
+            return file.resolved_paths[0]
+    return None
+
+
+async def _promote_to_starting_if_complete(
+    session: AsyncSession, instance: ModelInstance
+) -> bool:
+    """When all files are ready, attach the LoRA mount list, backfill the
+    resolved paths, and move to STARTING. Returns True if promoted."""
+    loaded = await ModelInstance.one_by_id_with_model_files(session, instance.id)
+    if not _download_completed(loaded):
+        return False
+    # Promotion is the single choke point into STARTING, so backfill the paths
+    # here: the subordinate path never sets them and concurrent events may carry
+    # a None snapshot, which crashes the worker on Path(None).
+    if not instance.resolved_path:
+        instance.resolved_path = _first_resolved_path(
+            loaded.model_files, exclude_lora=True
+        )
+    if instance.draft_model_source and not instance.draft_model_resolved_path:
+        instance.draft_model_resolved_path = _first_resolved_path(
+            loaded.draft_model_files
+        )
+    mounted, lora_skipped = await _build_mounted_loras_payload(session, instance)
+    if mounted is not None:
+        instance.mounted_loras = mounted
+    instance.state = ModelInstanceStateEnum.STARTING
+    instance.state_message = "; ".join(lora_skipped) if lora_skipped else ""
+    return True
+
+
+def _sync_main_worker_downloading(
+    instance: ModelInstance, file: ModelFile, is_draft_model: bool
+) -> bool:
+    """Handle a main-worker file's DOWNLOADING event. Returns need_update."""
+    # First file to start: flip to DOWNLOADING and seed the bar. Draft seeds 0
+    # (tracked separately); primary/LoRA seeds the active-file aggregate.
+    if instance.state == ModelInstanceStateEnum.INITIALIZING:
+        instance.state = ModelInstanceStateEnum.DOWNLOADING
+        instance.state_message = ""
+        if is_draft_model:
+            instance.download_progress = 0
+        else:
+            aggregate = _aggregate_instance_download_progress(instance, file)
+            instance.download_progress = aggregate if aggregate is not None else 0
+        return True
+
+    if instance.state != ModelInstanceStateEnum.DOWNLOADING:
+        return False
+
+    if is_draft_model:
+        if (
+            file.download_progress != instance.draft_model_download_progress
+            and instance.draft_model_download_progress != 100
+        ):
+            instance.draft_model_download_progress = file.download_progress
+            return True
+        return False
+
+    # Primary/LoRA file: feed the aggregate bar.
+    return _refresh_instance_download_progress(instance, file)
+
+
+async def _sync_main_worker_ready(
+    session: AsyncSession,
+    instance: ModelInstance,
+    file: ModelFile,
+    is_draft_model: bool,
+) -> bool:
+    """Handle a main-worker file's READY event. Returns need_update."""
+    need_update = False
+
+    if is_draft_model:
+        if (
+            instance.draft_model_download_progress != 100
+            or not instance.draft_model_resolved_path
+        ):
+            instance.draft_model_download_progress = 100
+            if file.resolved_paths:
+                instance.draft_model_resolved_path = file.resolved_paths[0]
+            need_update = True
+    else:
+        # Only the primary file owns resolved_path; LoRA files use mounted_loras.
+        if (
+            _is_primary_instance_model_file(file, instance, is_draft_model)
+            and not instance.resolved_path
+        ):
+            if file.resolved_paths:
+                instance.resolved_path = file.resolved_paths[0]
+            need_update = True
+        if _refresh_instance_download_progress(instance, file, file_ready=True):
+            need_update = True
+
+    if await _promote_to_starting_if_complete(session, instance):
+        need_update = True
+    elif instance.state == ModelInstanceStateEnum.INITIALIZING:
+        # Some but not all files done.
+        instance.state = ModelInstanceStateEnum.DOWNLOADING
+        instance.state_message = ""
+        need_update = True
+
+    return need_update
+
+
 async def sync_main_worker_model_file_state(
     session: AsyncSession,
     file: ModelFile,
     instance: ModelInstance,
     is_draft_model: bool = False,
 ):
-    """
-    Sync the model file state to the related model instance.
-    """
+    """Sync a main-worker model file's state onto its model instance."""
 
-    if instance.state == ModelInstanceStateEnum.ERROR:
+    # Re-load (with model_files) to avoid identity-map conflicts with a detached
+    # instance from the caller, and to let progress aggregation read sibling rows.
+    instance = await ModelInstance.one_by_id_with_model_files(session, instance.id)
+    if not instance or instance.state == ModelInstanceStateEnum.ERROR:
         return
 
     logger.trace(
@@ -1608,66 +2022,15 @@ async def sync_main_worker_model_file_state(
     )
 
     need_update = False
-
-    # Downloading
     if file.state == ModelFileStateEnum.DOWNLOADING:
-        if instance.state == ModelInstanceStateEnum.INITIALIZING:
-            # Download started
-            instance.state = ModelInstanceStateEnum.DOWNLOADING
-            instance.download_progress = 0
-            instance.state_message = ""
-            need_update = True
-        elif instance.state == ModelInstanceStateEnum.DOWNLOADING:
-            # Update download progress
-            if (
-                is_draft_model
-                and file.download_progress != instance.draft_model_download_progress
-                and instance.draft_model_download_progress != 100
-            ):
-                # For the draft model file
-                instance.draft_model_download_progress = file.download_progress
-                need_update = True
-            elif (
-                file.download_progress != instance.download_progress
-                and instance.download_progress != 100
-            ):
-                # For the main model file
-                instance.download_progress = file.download_progress
-                need_update = True
-
-    # Download completed
-    elif file.state == ModelFileStateEnum.READY and (
-        instance.state == ModelInstanceStateEnum.DOWNLOADING
-        or instance.state == ModelInstanceStateEnum.INITIALIZING
+        need_update = _sync_main_worker_downloading(instance, file, is_draft_model)
+    elif file.state == ModelFileStateEnum.READY and instance.state in (
+        ModelInstanceStateEnum.DOWNLOADING,
+        ModelInstanceStateEnum.INITIALIZING,
     ):
-        if is_draft_model and (
-            instance.draft_model_download_progress != 100
-            or not instance.draft_model_resolved_path
-        ):
-            # Download completed for the draft model file
-            instance.draft_model_download_progress = 100
-            instance.draft_model_resolved_path = file.resolved_paths[0]
-            need_update = True
-        elif not is_draft_model and (
-            instance.download_progress != 100 or not instance.resolved_path
-        ):
-            # Download completed for the main model file
-            instance.download_progress = 100
-            instance.resolved_path = file.resolved_paths[0]
-            need_update = True
-
-        if model_instance_download_completed(instance):
-            # All files are downloaded
-            instance.state = ModelInstanceStateEnum.STARTING
-            instance.state_message = ""
-            need_update = True
-        elif instance.state == ModelInstanceStateEnum.INITIALIZING:
-            # one but not all files downloaded, turn to DOWNLOADING state
-            instance.state = ModelInstanceStateEnum.DOWNLOADING
-            instance.state_message = ""
-            need_update = True
-
-    # Download error
+        need_update = await _sync_main_worker_ready(
+            session, instance, file, is_draft_model
+        )
     elif file.state == ModelFileStateEnum.ERROR:
         instance.state = ModelInstanceStateEnum.ERROR
         instance.state_message = file.state_message
@@ -1677,14 +2040,53 @@ async def sync_main_worker_model_file_state(
         await ModelInstanceService(session).update(instance)
 
 
-async def sync_distributed_model_file_state(  # noqa: C901
+async def _sync_subordinate_worker(
+    session: AsyncSession,
+    instance: ModelInstance,
+    subordinate: ModelInstanceSubordinateWorker,
+    file: ModelFile,
+) -> bool:
+    """
+    Sync one subordinate worker's file state. subordinate.download_progress is
+    display-only (completion is decided by ModelFile state, not this field).
+    Returns need_update.
+    """
+    if file.state == ModelFileStateEnum.DOWNLOADING:
+        if file.download_progress == subordinate.download_progress:
+            return False
+        subordinate.download_progress = file.download_progress
+        return True
+
+    if file.state == ModelFileStateEnum.READY:
+        # progress may already be 100 from the final DOWNLOADING report, so a
+        # READY event must still re-check completion — gating on the progress
+        # value would skip the STARTING transition and stick at 100%.
+        need_update = subordinate.download_progress != 100
+        subordinate.download_progress = 100
+        if instance.state in (
+            ModelInstanceStateEnum.DOWNLOADING,
+            ModelInstanceStateEnum.INITIALIZING,
+        ):
+            if await _promote_to_starting_if_complete(session, instance):
+                need_update = True
+        return need_update
+
+    if file.state == ModelFileStateEnum.ERROR:
+        instance.state = ModelInstanceStateEnum.ERROR
+        instance.state_message = file.state_message
+        return True
+
+    return False
+
+
+async def sync_distributed_model_file_state(
     session: AsyncSession, file: ModelFile, instance: ModelInstance
 ):
-    """
-    Sync the model file state to the related model instance.
-    """
+    """Sync a subordinate-worker model file's state onto its model instance."""
 
-    if instance.state == ModelInstanceStateEnum.ERROR:
+    # Re-load to avoid identity-map conflicts with a detached caller instance.
+    instance = await ModelInstance.one_by_id(session, instance.id)
+    if not instance or instance.state == ModelInstanceStateEnum.ERROR:
         return
 
     if (
@@ -1693,55 +2095,104 @@ async def sync_distributed_model_file_state(  # noqa: C901
     ):
         return
 
+    subordinate = next(
+        (
+            item
+            for item in instance.distributed_servers.subordinate_workers or []
+            if item.worker_id == file.worker_id
+        ),
+        None,
+    )
+    if subordinate is None:
+        return
+
     logger.trace(
         f"Syncing distributed model file {file.id} with model instance {instance.name}, file state: {file.state}, "
         f"progress: {file.download_progress}, message: {file.state_message}, instance state: {instance.state}"
     )
 
-    need_update = False
-
-    for item in instance.distributed_servers.subordinate_workers or []:
-        if item.worker_id == file.worker_id:
-            if (
-                file.state == ModelFileStateEnum.DOWNLOADING
-                and file.download_progress != item.download_progress
-            ):
-                item.download_progress = file.download_progress
-                need_update = True
-            elif (
-                file.state == ModelFileStateEnum.READY and item.download_progress != 100
-            ):
-                item.download_progress = 100
-                if model_instance_download_completed(instance):
-                    # All files are downloaded
-                    instance.state = ModelInstanceStateEnum.STARTING
-                    instance.state_message = ""
-                need_update = True
-            elif file.state == ModelFileStateEnum.ERROR:
-                instance.state = ModelInstanceStateEnum.ERROR
-                instance.state_message = file.state_message
-                need_update = True
-
-    if need_update:
+    if await _sync_subordinate_worker(session, instance, subordinate, file):
         flag_modified(instance, "distributed_servers")
         await ModelInstanceService(session).update(instance)
 
 
-def model_instance_download_completed(instance: ModelInstance):
-    if instance.download_progress != 100:
+async def _build_mounted_loras_payload(
+    session: AsyncSession, instance: ModelInstance
+) -> Tuple[Optional[List[LoraListEntry]], List[str]]:
+    """
+    Build LoraListEntry list for Model.lora_list entries whose LoRA ModelFile
+    is READY on this instance. Used once when transitioning to STARTING.
+
+    Returns (mounted_loras, skip_messages). skip_messages collects per-entry
+    reasons for any LoRA that could not be resolved (invalid source config),
+    so callers can surface them via instance.state_message.
+    """
+    model = await Model.one_by_id(session, instance.model_id)
+    if not model:
+        return None, []
+    entries = normalized_lora_list(model)
+    if not entries:
+        return [], []
+    inst = await ModelInstance.one_by_id_with_model_files(session, instance.id)
+    if not inst:
+        return None, []
+    out: List[LoraListEntry] = []
+    skipped: List[str] = []
+    for entry in entries:
+        try:
+            src = lora_entry_to_model_source(entry)
+        except ValueError as e:
+            msg = f"LoRA {entry.lora_name!r} skipped: {e}"
+            logger.warning("%s (instance=%s, entry=%s)", msg, instance.name, entry)
+            skipped.append(msg)
+            continue
+        for f in inst.model_files or []:
+            if not getattr(f, "is_lora", False):
+                continue
+            if f.model_source_index != src.model_source_index:
+                continue
+            if f.state != ModelFileStateEnum.READY or not f.resolved_paths:
+                continue
+            out.append(
+                LoraListEntry(
+                    lora_name=lora_route_name_for(model.name, entry.lora_name),
+                    lora_repo_name=entry.lora_repo_name,
+                    source=entry.source,
+                    huggingface_filename=entry.huggingface_filename,
+                    model_scope_file_path=entry.model_scope_file_path,
+                    local_path=entry.local_path,
+                    path=f.resolved_paths[0],
+                    model_file_id=f.id,
+                )
+            )
+            break
+    return out, skipped
+
+
+def _download_completed(instance: Optional[ModelInstance]) -> bool:
+    """True when every ModelFile (primary, LoRA, draft) is READY. Pure check over
+    an already-loaded instance — the caller owns the single eager load."""
+    if instance is None:
         return False
 
-    if instance.draft_model_source and instance.draft_model_download_progress != 100:
+    if not instance.model_files and not instance.draft_model_source:
         return False
 
-    if (
-        instance.distributed_servers
-        and instance.distributed_servers.download_model_files
-    ):
-        for subworker in instance.distributed_servers.subordinate_workers or []:
-            if subworker.download_progress != 100:
+    for model_file in instance.model_files or []:
+        if model_file.state != ModelFileStateEnum.READY:
+            return False
+
+    if instance.draft_model_source:
+        draft_files = instance.draft_model_files or []
+        if not draft_files:
+            return False
+        for draft_file in draft_files:
+            if draft_file.state != ModelFileStateEnum.READY:
                 return False
 
+    # Subordinate files are in instance.model_files (checked above) — the single
+    # source of truth. The old subordinate_workers progress check raced with the
+    # distributed sync path and could stick at DOWNLOADING after all hit 100%.
     return True
 
 
@@ -1767,6 +2218,30 @@ def _get_worker_ids_for_file_download(
         ]
 
     return worker_ids
+
+
+async def _get_worker_tenant_scopes(
+    session: AsyncSession, worker_ids: Iterable[int]
+) -> Dict[int, Tuple[Optional[int], Optional[int]]]:
+    """Resolve ``(cluster_id, owner_principal_id)`` for each worker so newly
+    created ModelFiles inherit the same tenant scope as their host worker —
+    matching the route-side derivation in ``routes/model_files.create_model_file``.
+    Without this, ModelFiles created by the controller come back with NULL
+    tenant columns and are invisible to org principals."""
+    scopes: Dict[int, Tuple[Optional[int], Optional[int]]] = {}
+    unique_worker_ids = {wid for wid in worker_ids if wid is not None}
+    if not unique_worker_ids:
+        return scopes
+    workers = await Worker.all_by_fields(
+        session,
+        extra_conditions=[Worker.id.in_(unique_worker_ids)],
+    )
+    for worker in workers:
+        scopes[worker.id] = (
+            worker.cluster_id,
+            getattr(worker, "owner_principal_id", None),
+        )
+    return scopes
 
 
 async def new_workers_from_pool(
@@ -1804,6 +2279,10 @@ async def new_workers_from_pool(
             cluster=pool.cluster,
             worker_pool=pool,
             provider=pool.cluster.provider,
+            # Denormalize from cluster so tenant_list_conditions can match
+            # without joining clusters. Mirrors the worker registration
+            # path in routes/workers.update_worker_data.
+            owner_principal_id=pool.cluster.owner_principal_id,
             name=f"pool-{pool.id}-"
             + ''.join(random.choices(string.ascii_lowercase + string.digits, k=8)),
             labels={
@@ -1913,7 +2392,10 @@ class WorkerProvisioningController:
         user_data = await client.construct_user_data(
             server_url=worker.cluster.server_url or cfg.server_external_url,
             token=worker.cluster.registration_token,
-            image_name=get_cluster_image_name(worker.cluster.worker_config),
+            image_name=get_cluster_image_name(
+                worker.cluster.worker_config,
+                worker.cluster.system_default_container_registry,
+            ),
             os_image=worker.worker_pool.os_image,
             secret_configs=secret_configs,
             worker_name=worker.name,
@@ -2176,7 +2658,6 @@ class ClusterController:
         Reconcile the cluster state.
         """
         await self._sync_cluster_state(event)
-        await self._ensure_gpu_instance_ssh_public_key(event)
         if self._disable_gateway:
             return
         await self._ensure_worker_mcp_bridge(event)
@@ -2226,44 +2707,6 @@ class ClusterController:
         except Exception as e:
             logger.error(f"Failed to ensure MCPBridge for cluster {cluster.name}: {e}")
             raise
-
-    async def _ensure_gpu_instance_ssh_public_key(self, event: Event):
-        """
-        Ensure the corresponding GPUStack Operator InstanceSSHPublicKey resource is synced.
-        """
-        cluster: Cluster = event.data
-        if cluster.provider != ClusterProvider.Kubernetes:
-            return
-        owner_principal_id = cluster.owner_principal_id
-
-        async with async_session() as session:
-            cluster = await Cluster.one_by_id(
-                session,
-                cluster.id,
-                options=[selectinload(Cluster.cluster_workers)],
-            )
-            if cluster is None or cluster.ready_workers == 0:
-                return
-
-            ssh_public_key = await get_ssh_public_key(
-                session=session,
-                owner_principal_id=owner_principal_id,
-            )
-            principal = await Principal.one_by_id(session, owner_principal_id)
-
-        if principal is None:
-            logger.error(
-                f"Owner principal (id: {owner_principal_id}) of cluster "
-                f"{cluster.name}(id: {cluster.id}) not found"
-            )
-            return
-
-        await sync_ssh_public_key_to_cluster(
-            ssh_public_key=ssh_public_key,
-            server_api_port=self._cfg.api_port,
-            cluster_id=cluster.id,
-            cluster_owner_principal_slug=principal.slug,
-        )
 
 
 async def notify_model_route_target(session: AsyncSession, model: Model, event: Event):
@@ -2323,8 +2766,7 @@ async def sync_categories_and_meta(session: AsyncSession, model: Model, event: E
         return
     routes = model.model_routes
     for route in routes:
-        # created_by_model default to false if not set
-        if not route.created_by_model:
+        if route.created_model_id is None:
             continue
         if route.categories != model.categories or route.meta != model.meta:
             await ModelRouteService(session).update(
@@ -2363,8 +2805,11 @@ class ModelProviderController:
         registry_to_remove = (
             provider_registry is None or event.type == EventType.DELETED
         )
-        to_delete_prefix = (
-            f"{mcp_handler.provider_id_prefix}{model_provider.id}"
+        # Match by exact name (not prefix) so that deleting provider id "1" does
+        # not also drop other providers whose id shares that numeric prefix
+        # (e.g. "provider-10", "provider-11").
+        to_delete_names = (
+            [mcp_handler.provider_registry_name(model_provider.id)]
             if registry_to_remove
             else None
         )
@@ -2372,8 +2817,10 @@ class ModelProviderController:
 
         provider_proxy = mcp_handler.provider_proxy(model_provider)
         proxy_to_remove = provider_proxy is None or event.type == EventType.DELETED
-        to_delete_proxy_prefix = (
-            f"proxy-{model_provider.id}" if proxy_to_remove else None
+        to_delete_proxy_names = (
+            [mcp_handler.provider_proxy_name(model_provider.id)]
+            if proxy_to_remove
+            else None
         )
         desired_proxies = [] if proxy_to_remove else [provider_proxy]
 
@@ -2384,8 +2831,8 @@ class ModelProviderController:
                 mcp_bridge_name=mcp_handler.default_mcp_bridge_name,
                 desired_registries=desired_registries,
                 desired_proxies=desired_proxies,
-                to_delete_prefix=to_delete_prefix,
-                to_delete_proxies_prefix=to_delete_proxy_prefix,
+                to_delete_names=to_delete_names,
+                to_delete_proxies_names=to_delete_proxy_names,
             )
         except Exception as e:
             logger.error(
@@ -2521,7 +2968,7 @@ class ModelRouteTargetController:
             "state",
             "provider_id",
             "model_id",
-            "provider_model_name",
+            "overridden_model_name",
             "model",
         ]
         should_notify = event.type == EventType.DELETED
@@ -2598,7 +3045,7 @@ class ModelRouteTargetController:
         if (
             not orphan_route
             or orphan_route.deleted_at is not None
-            or not orphan_route.created_by_model
+            or orphan_route.created_model_id is None
         ):
             # The route is already deleted or not created by model, no need to transfer.
             # returns true to trigger parent notification and state sync to update the route state if needed.
@@ -2606,7 +3053,7 @@ class ModelRouteTargetController:
         try:
             route_service = ModelRouteService(session=session)
             await route_service.update(
-                orphan_route, source={"created_by_model": False}, auto_commit=True
+                orphan_route, source={"created_model_id": None}, auto_commit=True
             )
         except Exception as e:
             logger.error(f"Failed to transfer model route {orphan_route.id}: {e}")
@@ -2629,7 +3076,7 @@ class ModelRouteTargetController:
                     )
                     for name in names:
                         await delete_cache_by_key(
-                            route_service.get_model_ids_by_model_route_name, name
+                            route_service.resolve_route_targets, name
                         )
                         await delete_cache_by_key(
                             route_service.get_model_auth_info_by_name, name
@@ -2693,7 +3140,7 @@ class ModelRouteController:
             ]
         )
         model_route_service = ModelRouteService(session=session)
-        if target_total == 0 and model_route.created_by_model:
+        if target_total == 0 and model_route.created_model_id is not None:
             await model_route_service.delete(model_route, auto_commit=True)
             return True
 
@@ -2729,62 +3176,3 @@ class ModelRouteController:
                     istio_networking_api=self._networking_istio_api,
                 )
             await distribute_models_to_user(session, model_route, event)
-
-
-class GPUInstanceSSHPublicKeyController:
-    def __init__(self, cfg: Config):
-        self._cfg = cfg
-        self._k8s_config = get_async_k8s_config(cfg=cfg)
-
-    async def start(self):
-        async for event in GPUInstanceSSHPublicKey.subscribe(
-            source="gpu_instance_ssh_public_key_controller"
-        ):
-            try:
-                await self._reconcile(event)
-            except Exception:
-                logger.exception("Failed to reconcile gpu instance ssh public key")
-
-    async def _reconcile(self, event: Event):
-        """
-        Reconcile the gpu instance ssh public key.
-        """
-        if event.type == EventType.DELETED:
-            return
-
-        ret: GPUInstanceSSHPublicKey = event.data
-        if ret is None or ret.spec is None or ret.spec.data is None:
-            return
-        owner_principal_id = ret.owner_principal_id
-
-        async with async_session() as session:
-            clusters = await Cluster.all_by_fields(
-                session=session,
-                fields={
-                    "provider": ClusterProvider.Kubernetes,
-                    "state": ClusterStateEnum.READY,
-                    "owner_principal_id": owner_principal_id,
-                    "deleted_at": None,
-                },
-                options=[selectinload(Cluster.cluster_workers)],
-            )
-            principal = await Principal.one_by_id(session, owner_principal_id)
-
-            ssh_public_key = ret.spec.data
-            cluster_ids = [
-                cluster.id for cluster in clusters if cluster.ready_workers > 0
-            ]
-
-        if principal is None:
-            logger.error(
-                f"Owner principal (id: {owner_principal_id}) of gpu instance ssh "
-                f"public key not found"
-            )
-            return
-
-        await sync_ssh_public_key_to_clusters(
-            ssh_public_key=ssh_public_key,
-            server_api_port=self._cfg.api_port,
-            cluster_ids=cluster_ids,
-            cluster_owner_principal_slug=principal.slug,
-        )

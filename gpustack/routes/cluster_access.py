@@ -27,7 +27,6 @@ from gpustack.api.tenant import assert_cluster_visible, assert_cluster_writable
 from gpustack.schemas.cluster_access import ClusterAccess, ClusterAccessPublic
 from gpustack.schemas.clusters import Cluster
 from gpustack.schemas.principals import Principal, PrincipalType
-from gpustack.schemas.users import User
 from gpustack.server.deps import SessionDep, TenantContextDep
 
 router = APIRouter()
@@ -62,12 +61,10 @@ async def _validate_principal(
                 f"not a {principal_type.value}"
             )
         )
-    if target.kind == PrincipalType.USER:
-        # Disallow granting access to system users (workers etc.). They
-        # already bypass cluster_access via ``is_system``.
-        user = await User.one_by_field(session, "principal_id", principal_id)
-        if user is None or user.is_system or user.deleted_at is not None:
-            raise InvalidException(message=f"User principal {principal_id} not found")
+    # System principals (kind=SYSTEM) bypass cluster_access entirely
+    # via :func:`bypass_tenant_filter`; the API surface here is
+    # constrained to USER / GROUP / ORG kinds so SYSTEM never reaches
+    # this validator.
     return target
 
 
@@ -89,18 +86,19 @@ async def _resolve_principal_views(
     for r in rows:
         p: Optional[Principal] = principal_by_id.get(r.principal_id)
         kind = p.kind if p else PrincipalType.USER
-        # GROUP principals expose their owning ORG via parent_principal_id
-        # so the UI can render quota slots; USER and ORG return None.
-        parent = p.parent_principal_id if p and p.kind == PrincipalType.GROUP else None
-        # ORG principals' "parent" for display purposes is themselves.
-        if p and p.kind == PrincipalType.ORG:
-            parent = p.id
+        # ORG principals' "parent" for display purposes is themselves;
+        # GROUPs are now peer-level (may join zero or more Orgs via
+        # membership rows) so they have no single parent to surface
+        # here — UI quota slots for a Group should be resolved
+        # separately from the Group's Org-memberships if needed.
+        parent = p.id if p and p.kind == PrincipalType.ORG else None
         out.append(
             ClusterAccessPublic(
                 cluster_id=r.cluster_id,
                 principal_id=r.principal_id,
                 principal_type=kind,
                 principal_name=p.name if p else None,
+                principal_display_name=p.display_name if p else None,
                 principal_parent_id=parent,
                 granted_by=r.granted_by,
                 created_at=r.created_at,

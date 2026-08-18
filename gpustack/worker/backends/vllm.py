@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from gpustack_runtime.deployer import (
@@ -26,22 +27,114 @@ from gpustack.schemas.models import (
 )
 from gpustack.utils import network
 from gpustack.utils.command import (
+    ExecutorBackend,
     find_parameter,
     find_bool_parameter,
     find_int_parameter,
     extend_args_no_exist,
     format_backend_parameters,
+    resolve_executor_backend,
 )
 from gpustack.utils.envs import sanitize_env
 from gpustack.utils.unit import byte_to_gib
+from gpustack.utils.vllm_topology import (
+    MultinodeShape,
+    MultinodeUserParallelism,
+    parse_user_parallelism,
+    validate_multinode_topology,
+)
 from gpustack.worker.backends.base import (
     InferenceServer,
     is_ascend_310p,
     is_ascend,
     cal_distributed_parallelism_arguments,
+    read_lora_max_rank,
 )
 
 logger = logging.getLogger(__name__)
+
+# vLLM only accepts a fixed set of values for --max-lora-rank; a rank in between
+# must be rounded up to the next allowed value.
+_VLLM_LORA_RANK_CHOICES = (8, 16, 32, 64, 128, 256, 320, 512)
+
+
+def _round_up_vllm_lora_rank(rank: int) -> int:
+    for choice in _VLLM_LORA_RANK_CHOICES:
+        if rank <= choice:
+            return choice
+    return rank  # Beyond the known set: pass through and let vLLM validate it.
+
+
+def extend_vllm_mounted_lora_arguments(
+    arguments: List[str],
+    mounted_loras: Optional[list],
+    base_model_name: str,
+    backend_parameters: Optional[List[str]],
+) -> None:
+    """
+    Inject vLLM LoRA flags from model instance mounted_loras.
+
+    Skips when the user already set --lora-modules in backend_parameters.
+
+    vLLM expects adapters via --lora-modules {json} ... where each JSON object
+    contains name, path, and base_model_name.
+    """
+    if not mounted_loras:
+        return
+    if find_parameter(backend_parameters or [], ["lora-modules", "lora_modules"]):
+        return
+
+    modules = []
+    for m in mounted_loras:
+        if not m.lora_name or not m.path:
+            continue
+        modules.append(
+            {
+                # m.lora_name is the fully-qualified "<base>:<lora>" id; passed
+                # through so the engine registers under the same name clients send.
+                "name": m.lora_name,
+                "path": m.path,
+                "base_model_name": base_model_name,
+            }
+        )
+    if not modules:
+        return
+
+    extend_args_no_exist(arguments, "--enable-lora")
+    extend_args_no_exist(arguments, ("--max-loras", str(len(modules))))
+    if not any(
+        a == "--lora-modules" or a.startswith("--lora-modules=") for a in arguments
+    ):
+        arguments.append("--lora-modules")
+        for m in modules:
+            arguments.append(json.dumps(m))
+
+    if not find_parameter(backend_parameters or [], ["max-lora-rank", "max_lora_rank"]):
+        max_rank = read_lora_max_rank([m["path"] for m in modules])
+        if max_rank:
+            extend_args_no_exist(
+                arguments,
+                ("--max-lora-rank", str(_round_up_vllm_lora_rank(max_rank))),
+            )
+
+
+@dataclass
+class _VLLMArgsContext:
+    """
+    Derived inputs shared by every `_build_*_arguments` step.
+
+    Computed once per `_build_command_args` invocation so individual builders
+    stay side-effect-free and don't re-evaluate the same predicates.
+    """
+
+    port: int
+    is_distributed: bool
+    executor_backend: ExecutorBackend
+    topology: Optional["MultinodeTopology"]
+    is_omni: bool
+    is_audio: bool
+    entrypoint: Optional[List[str]]
+    deployment_metadata: Optional[ModelInstanceDeploymentMetadata]
 
 
 class VLLMServer(InferenceServer):
@@ -66,6 +159,7 @@ class VLLMServer(InferenceServer):
 
         env = self._get_configured_env(
             is_distributed=deployment_metadata.distributed,
+            deployment_metadata=deployment_metadata,
         )
 
         # Resolve image first so that backend_version is populated before
@@ -74,11 +168,13 @@ class VLLMServer(InferenceServer):
         if not image:
             raise ValueError("Failed to get vLLM backend image")
 
-        command = None
+        command = ["vllm", "serve"]
         if self.inference_backend:
-            command = self.inference_backend.get_container_entrypoint(
+            entrypoint = self.inference_backend.get_container_entrypoint(
                 self._model.backend_version
             )
+            if entrypoint:
+                command = entrypoint
 
         command_script = self._get_serving_command_script(env)
 
@@ -86,6 +182,7 @@ class VLLMServer(InferenceServer):
             port=self._get_serving_port(),
             is_distributed=deployment_metadata.distributed,
             entrypoint=command,
+            deployment_metadata=deployment_metadata,
         )
 
         try:
@@ -116,11 +213,9 @@ class VLLMServer(InferenceServer):
         env: Dict[str, str],
         image: str,
     ):
-        # Command script will override the given command,
-        # so we need to prepend command to command args.
-        if command_script and command:
-            command_args = command + command_args
-            command = None
+        command, command_args = self._override_entrypoint(
+            command, command_args, command_script
+        )
 
         resources = self._get_configured_resources()
 
@@ -156,26 +251,33 @@ class VLLMServer(InferenceServer):
             ports=ports,
         )
 
-        # Adjust run container for distributed follower.
-        if deployment_metadata.distributed_follower:
+        executor_backend = resolve_executor_backend(
+            self._model.backend_parameters, self._model.backend_version
+        )
+
+        # Adjust run container for distributed follower (Ray path only).
+        # For MP multi-node followers, --headless and topology args injected
+        # by _build_command_args, so no command swap is needed.
+        if deployment_metadata.distributed_follower and executor_backend == "ray":
             ray_command, ray_command_args, ray_ports = self._build_ray_configuration(
                 is_leader=False,
             )
-
-            # Command script will override the given command,
-            # so we need to prepend command to command args.
-            if command_script:
-                ray_command_args = ray_command + ray_command_args
-                ray_command = None
+            ray_command, ray_command_args = self._override_entrypoint(
+                ray_command,
+                ray_command_args,
+                command_script,
+            )
 
             run_container.execution.command = ray_command
             # run_container.execution.command_script = command_script # already set
             run_container.execution.args = ray_command_args
             run_container.ports = ray_ports
 
-        # Create sidecar container for distributed leader.
+        # Create sidecar container for distributed leader (Ray path only).
+        # Headless leader runs vLLM directly with DP coordination args; no
+        # ray-head sidecar is required.
         sidecar_container = None
-        if deployment_metadata.distributed_leader:
+        if deployment_metadata.distributed_leader and executor_backend == "ray":
             run_container.mounts.append(
                 ContainerMount(
                     path="/tmp",
@@ -186,12 +288,11 @@ class VLLMServer(InferenceServer):
             ray_command, ray_command_args, ray_ports = self._build_ray_configuration(
                 is_leader=True,
             )
-
-            # Command script will override the given command,
-            # so we need to prepend command to command args.
-            if command_script:
-                ray_command_args = ray_command + ray_command_args
-                ray_command = None
+            ray_command, ray_command_args = self._override_entrypoint(
+                ray_command,
+                ray_command_args,
+                command_script,
+            )
 
             # Copy envs and override RAY_LOG_TO_STDERR for the sidecar
             # so Ray head logs go to stderr (captured by container log stream),
@@ -230,7 +331,7 @@ class VLLMServer(InferenceServer):
         logger.info(
             f"With image: {image}, "
             f"command: [{' '.join(command) if command else ''}], "
-            f"arguments: [{' '.join(command_args)}], "
+            f"arguments: [{' '.join(command_args) if command_args else ''}], "
             f"ports: [{','.join([str(port.internal) for port in ports])}], "
             f"envs(inconsistent input items mean unchangeable):{os.linesep}"
             f"{os.linesep.join(f'{k}={v}' for k, v in sorted(sanitize_env(env).items()))}"
@@ -252,7 +353,11 @@ class VLLMServer(InferenceServer):
 
         logger.info(f"Created vLLM container workload: {deployment_metadata.name}")
 
-    def _get_configured_env(self, is_distributed: bool) -> Dict[str, str]:
+    def _get_configured_env(
+        self,
+        is_distributed: bool,
+        deployment_metadata: Optional[ModelInstanceDeploymentMetadata] = None,
+    ) -> Dict[str, str]:
         """
         Get environment variables for vLLM service
         """
@@ -280,7 +385,7 @@ class VLLMServer(InferenceServer):
 
         # Apply distributed environment variables
         if is_distributed:
-            self._set_distributed_env(env)
+            self._set_distributed_env(env, deployment_metadata)
 
         # Apply Ascend-specific environment variables
         if is_ascend(self._get_selected_gpu_devices()):
@@ -330,23 +435,60 @@ class VLLMServer(InferenceServer):
             ram_size = int(vram_claim * extended_kv_cache.ram_ratio)
             env["LMCACHE_MAX_LOCAL_CPU_SIZE"] = str(byte_to_gib(ram_size))
 
-    def _set_distributed_env(self, env: Dict[str, str]):
+    def _resolve_multinode_shape(
+        self,
+        deployment_metadata: ModelInstanceDeploymentMetadata,
+    ) -> Optional[str]:
+        """Best-effort shape lookup, swallowing inference errors. ``None`` if
+        the topology cannot be derived (e.g. user-arg contradictions); the
+        actual failure will surface from the command builder where it can be
+        attributed to a specific instance."""
+        try:
+            return cal_multinode_topology(
+                self._model_instance,
+                deployment_metadata,
+                parse_user_parallelism(self._model.backend_parameters),
+            ).shape
+        except ValueError:
+            return None
+
+    def _set_distributed_env(
+        self,
+        env: Dict[str, str],
+        deployment_metadata: Optional[ModelInstanceDeploymentMetadata] = None,
+    ):
         """
         Set up environment variables for distributed execution.
         """
         # Configure Internal communication IP and port.
         # see https://docs.vllm.ai/en/stable/configuration/env_vars.html.
         env["VLLM_HOST_IP"] = self._worker.ip
-        # During distributed setup,
-        # we must get more than one port here,
-        # so we use ports[-1] for distributed initialization.
-        env["VLLM_PORT"] = str(self._model_instance.ports[-1])
 
-        # Disable Ray logging to stderr by default,
-        # see https://github.com/gpustack/gpustack/issues/4158#issuecomment-3809213348.
-        env["RAY_LOG_TO_STDERR"] = env.pop("RAY_LOG_TO_STDERR", "0")
-        # To reduce verbosity, set Ray backend log level to warning by default.
-        env["RAY_BACKEND_LOG_LEVEL"] = env.pop("RAY_BACKEND_LOG_LEVEL", "warning")
+        ports = self._model_instance.ports or []
+        executor_backend = resolve_executor_backend(
+            self._model.backend_parameters, self._model.backend_version
+        )
+        if executor_backend == "mp":
+            # VLLM_DP_MASTER_PORT belongs to the DP coordinator path
+            # (vllm-project/vllm#42585). mp_only has dp=1 and no DP master,
+            # so injecting it would bind a port for nobody to use.
+            shape = (
+                self._resolve_multinode_shape(deployment_metadata)
+                if deployment_metadata is not None
+                else None
+            )
+            if shape in ("dp_only", "nested") and ports:
+                env["VLLM_DP_MASTER_PORT"] = str(ports[-1])
+            # Pin vLLM's internal init port to a reserved one so get_open_port()
+            # can't grab a kernel-stealable ephemeral port (#5657). Needs the
+            # runner patch that makes get_open_port() honor VLLM_PORT.
+            if len(ports) > 3:
+                env["VLLM_PORT"] = str(ports[3])
+        else:
+            if ports:
+                env["VLLM_PORT"] = str(ports[-1])
+            env["RAY_LOG_TO_STDERR"] = env.pop("RAY_LOG_TO_STDERR", "0")
+            env["RAY_BACKEND_LOG_LEVEL"] = env.pop("RAY_BACKEND_LOG_LEVEL", "warning")
 
         if is_ascend(self._get_selected_gpu_devices()):
             # See https://vllm-ascend.readthedocs.io/en/latest/tutorials/multi-node_dsv3.2.html.
@@ -453,6 +595,7 @@ class VLLMServer(InferenceServer):
         port: int,
         is_distributed: bool,
         entrypoint: Optional[List[str]] = None,
+        deployment_metadata: Optional[ModelInstanceDeploymentMetadata] = None,
     ) -> Tuple[List[str], List[str]]:
         """
         Build vLLM command arguments for container execution.
@@ -463,128 +606,243 @@ class VLLMServer(InferenceServer):
             added by GPUStack, excluding the entrypoint/model path and
             user-specified backend parameters.
         """
-        arguments = [
-            "vllm",
-            "serve",
-            self._model_path,
-        ]
+        ctx = self._make_args_context(
+            port, is_distributed, entrypoint, deployment_metadata
+        )
 
-        # Allow version-specific command override if configured (before appending extra args)
+        arguments: List[str] = [self._model_path]
         arguments = self.build_versioned_command_args(arguments)
 
-        # Omni modalities
-        omni_enabled = find_bool_parameter(
-            self._model.backend_parameters,
-            ["omni"],
-        )
-        is_omni = is_omni_model(self._model)
-        if is_omni and not omni_enabled:
-            arguments.extend(
-                [
-                    "--omni",
-                ]
-            )
-
-        is_audio = is_audio_model(self._model)
-
-        if not is_omni and not is_audio:
-
-            specified_max_model_len = find_parameter(
+        arguments.extend(self._build_omni_arguments(ctx))
+        arguments.extend(self._build_max_model_len_arguments(ctx))
+        arguments.extend(
+            get_auto_parallelism_arguments(
                 self._model.backend_parameters,
-                ["max-model-len"],
+                self._model_instance,
+                ctx.is_distributed,
+                ctx.deployment_metadata,
+                self._model.backend_version,
             )
-            if specified_max_model_len is None:
-                derived_max_model_len = self._derive_max_model_len()
-                if derived_max_model_len and derived_max_model_len > 8192:
-                    arguments.extend(["--max-model-len", "8192"])
+        )
+        arguments.extend(self._get_speculative_arguments())
+        arguments.extend(
+            get_access_log_arguments(
+                self._model.backend_parameters, self._model.backend_version
+            )
+        )
+        arguments.extend(
+            get_cache_report_arguments(
+                self._model.backend_parameters, self._model.backend_version
+            )
+        )
+        arguments.extend(self._build_ray_distributed_arguments(ctx))
+        arguments.extend(self._build_mp_multinode_arguments(ctx))
+        arguments.extend(self._build_extended_kv_cache_arguments(ctx))
+        arguments.extend(self._build_ascend_310p_arguments(ctx))
 
-        auto_parallelism_arguments = get_auto_parallelism_arguments(
+        extend_vllm_mounted_lora_arguments(
+            arguments,
+            self._model_instance.mounted_loras,
+            self._model.name,
             self._model.backend_parameters,
-            self._model_instance,
-            is_distributed,
         )
-        arguments.extend(auto_parallelism_arguments)
-
-        # Add speculative config arguments if needed
-        speculative_config_arguments = self._get_speculative_arguments()
-        arguments.extend(speculative_config_arguments)
-
-        # Suppress high-frequency /metrics access logs by default.
-        access_log_arguments = get_access_log_arguments(
-            self._model.backend_parameters, self._model.backend_version
-        )
-        arguments.extend(access_log_arguments)
-
-        # Expose prefix-cache hits as cached_tokens in OpenAI usage.
-        cache_report_arguments = get_cache_report_arguments(
-            self._model.backend_parameters, self._model.backend_version
-        )
-        arguments.extend(cache_report_arguments)
-
-        if is_distributed:
-            arguments.extend(["--distributed-executor-backend", "ray"])
-            dps = find_int_parameter(
-                self._model.backend_parameters, ["data-parallel-size", "dp"]
-            )
-            if dps and dps > 1:
-                # Prefer to use Ray backend for data parallelism if DP size is specified.
-                dpb = find_parameter(
-                    self._model.backend_parameters, ["data-parallel-backend", "dpb"]
-                )
-                if dpb is None:
-                    arguments.extend(["--data-parallel-backend", "ray"])
-                # Specify a port for DP RPC communication,
-                # we must get more than one port here, see gpustack/worker/serve_manager.py,
-                # so we use ports[1] for DP RPC communication.
-                arguments.extend(
-                    ["--data-parallel-rpc-port", str(self._model_instance.ports[1])]
-                )
-
-        if self._model.extended_kv_cache and self._model.extended_kv_cache.enabled:
-            vendor, _, _ = self._get_device_info()
-            if vendor in {
-                manufacturer_to_backend(ManufacturerEnum.NVIDIA),
-                manufacturer_to_backend(ManufacturerEnum.AMD),
-            }:
-                arguments.extend(
-                    [
-                        "--kv-transfer-config",
-                        '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}',
-                    ]
-                )
-            else:
-                logger.warning(
-                    "Extended KV cache for vLLM is only supported on NVIDIA and AMD GPUs. Skipping LMCache configuration."
-                )
-
-        # For Ascend 310P, we need to enforce eager execution and default dtype to float16
-        if is_ascend_310p(self._get_selected_gpu_devices()):
-            arguments.extend(
-                [
-                    "--enforce-eager",
-                    "--dtype",
-                    "float16",
-                ]
-            )
 
         # Inject user-defined backend parameters
         user_backend_parameters = self._flatten_backend_param()
         arguments.extend(user_backend_parameters)
 
-        # Append immutable arguments to ensure proper operation for accessing.
-        # Only add if not already present in arguments.
         extend_args_no_exist(
             arguments,
             ("--host", self._worker.ip),
-            ("--port", str(port)),
+            ("--port", str(ctx.port)),
             ("--served-model-name", self._model_instance.model_name),
         )
 
         injected = self._get_injected_backend_parameters(
             arguments, user_backend_parameters, entrypoint
         )
-
         return arguments, injected
+
+    def _make_args_context(
+        self,
+        port: int,
+        is_distributed: bool,
+        entrypoint: Optional[List[str]],
+        deployment_metadata: Optional[ModelInstanceDeploymentMetadata],
+    ) -> _VLLMArgsContext:
+        executor_backend = resolve_executor_backend(
+            self._model.backend_parameters, self._model.backend_version
+        )
+        topology: Optional[MultinodeTopology] = None
+        if (
+            is_distributed
+            and executor_backend == "mp"
+            and deployment_metadata is not None
+        ):
+            topology = cal_multinode_topology(
+                self._model_instance,
+                deployment_metadata,
+                parse_user_parallelism(self._model.backend_parameters),
+            )
+        return _VLLMArgsContext(
+            port=port,
+            is_distributed=is_distributed,
+            executor_backend=executor_backend,
+            topology=topology,
+            is_omni=is_omni_model(self._model),
+            is_audio=is_audio_model(self._model),
+            entrypoint=entrypoint,
+            deployment_metadata=deployment_metadata,
+        )
+
+    def _build_omni_arguments(self, ctx: _VLLMArgsContext) -> List[str]:
+        if not ctx.is_omni:
+            return []
+        if find_bool_parameter(self._model.backend_parameters, ["omni"]):
+            return []
+        return ["--omni"]
+
+    def _build_max_model_len_arguments(self, ctx: _VLLMArgsContext) -> List[str]:
+        if ctx.is_omni or ctx.is_audio:
+            return []
+        if (
+            find_parameter(self._model.backend_parameters, ["max-model-len"])
+            is not None
+        ):
+            return []
+        derived_max_model_len = self._derive_max_model_len()
+        if derived_max_model_len and derived_max_model_len > 8192:
+            return ["--max-model-len", "8192"]
+        return []
+
+    def _build_ray_distributed_arguments(self, ctx: _VLLMArgsContext) -> List[str]:
+        """
+        Ray sidecar path only: force --distributed-executor-backend ray and
+        default DP backend to ray when user-specified DP > 1.
+        """
+        if not ctx.is_distributed or ctx.executor_backend != "ray":
+            return []
+
+        arguments: List[str] = ["--distributed-executor-backend", "ray"]
+        dps = find_int_parameter(
+            self._model.backend_parameters, ["data-parallel-size", "dp"]
+        )
+        if dps and dps > 1:
+            dpb = find_parameter(
+                self._model.backend_parameters, ["data-parallel-backend", "dpb"]
+            )
+            if dpb is None:
+                arguments.extend(["--data-parallel-backend", "ray"])
+            # ports[1] is reserved for DP RPC, see gpustack/worker/serve_manager.py.
+            arguments.extend(
+                ["--data-parallel-rpc-port", str(self._model_instance.ports[1])]
+            )
+        return arguments
+
+    def _build_mp_multinode_arguments(
+        self,
+        ctx: _VLLMArgsContext,
+    ) -> List[str]:
+        """
+        MP multi-node (non-Ray) path. Dispatches to one of three parameter
+        shapes based on the resolved topology:
+
+        - ``dp_only``  → ``--data-parallel-*`` only; vLLM treats every node as
+          a DP engine head (no PP/TP spans nodes).
+        - ``mp_only``  → ``--nnodes`` + ``--node-rank`` only; a single DP rank
+          is spread across all nodes for cross-node TP/PP.
+        - ``nested``   → both sets; vLLM derives node role internally via
+          ``node_rank % nnodes_within_dp``.
+
+        Followers also carry ``--headless`` to skip the API server. The leader
+        always exposes the HTTP API (handled by --host/--port elsewhere).
+        Exception: under ``--data-parallel-hybrid-lb`` every DP engine serves
+        its own API, so ``--headless`` is not injected.
+        """
+        if (
+            not ctx.is_distributed
+            or ctx.executor_backend != "mp"
+            or ctx.topology is None
+        ):
+            return []
+
+        topology = ctx.topology
+        leader_ip = self._model_instance.worker_ip
+        arguments: List[str] = []
+        if (
+            find_parameter(
+                self._model.backend_parameters, ["distributed-executor-backend"]
+            )
+            is None
+        ):
+            arguments.extend(["--distributed-executor-backend", "mp"])
+
+        # serve_manager._assign_ports reserves ports[1] for the DP RPC
+        # endpoint (ZMQ) and ports[2] for the PyTorch master endpoint
+        # (TCPStore). The two channels use different protocols and can't
+        # share one port, so each shape consumes the subset it needs.
+        dp_rpc_port = str(self._model_instance.ports[1])
+        master_port = str(self._model_instance.ports[2])
+        if topology.shape == "dp_only":
+            extend_args_no_exist(
+                arguments,
+                ("--data-parallel-start-rank", str(topology.start_rank)),
+                ("--data-parallel-address", leader_ip),
+                ("--data-parallel-rpc-port", dp_rpc_port),
+            )
+        elif topology.shape == "mp_only":
+            extend_args_no_exist(
+                arguments,
+                ("--nnodes", str(topology.nnodes)),
+                ("--node-rank", str(topology.node_rank)),
+                ("--master-addr", leader_ip),
+                ("--master-port", master_port),
+            )
+        else:  # nested
+            extend_args_no_exist(
+                arguments,
+                ("--nnodes", str(topology.nnodes)),
+                ("--node-rank", str(topology.node_rank)),
+                ("--master-addr", leader_ip),
+                ("--master-port", master_port),
+                ("--data-parallel-address", leader_ip),
+                ("--data-parallel-rpc-port", dp_rpc_port),
+            )
+
+        # Hybrid-LB requires every DP engine (leader and followers alike) to
+        # run its own API server, so skip the headless injection when the user
+        # opts into it.
+        hybrid_lb = find_bool_parameter(
+            self._model.backend_parameters, ["data-parallel-hybrid-lb"]
+        )
+        if topology.is_follower and not hybrid_lb:
+            extend_args_no_exist(arguments, "--headless")
+        return arguments
+
+    def _build_extended_kv_cache_arguments(self, ctx: _VLLMArgsContext) -> List[str]:
+        extended = self._model.extended_kv_cache
+        if not (extended and extended.enabled):
+            return []
+
+        vendor, _, _ = self._get_device_info()
+        if vendor not in {
+            manufacturer_to_backend(ManufacturerEnum.NVIDIA),
+            manufacturer_to_backend(ManufacturerEnum.AMD),
+        }:
+            logger.warning(
+                "Extended KV cache for vLLM is only supported on NVIDIA and AMD GPUs. Skipping LMCache configuration."
+            )
+            return []
+
+        return [
+            "--kv-transfer-config",
+            '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}',
+        ]
+
+    def _build_ascend_310p_arguments(self, ctx: _VLLMArgsContext) -> List[str]:
+        if not is_ascend_310p(self._get_selected_gpu_devices()):
+            return []
+        return ["--enforce-eager", "--dtype", "float16"]
 
     def _build_ray_configuration(
         self,
@@ -679,11 +937,126 @@ class VLLMServer(InferenceServer):
         return command, arguments, ports
 
 
+@dataclass
+class MultinodeTopology:
+    """Resolved multi-node deployment topology from one node's perspective.
+
+    Fields:
+      - ``shape``: which set of vLLM arguments to emit (see
+        :py:meth:`VLLMServer._build_mp_multinode_arguments`).
+      - ``tp`` / ``pp``: cluster-wide, identical on every node.
+      - ``dp``: total DP rank count across the whole cluster.
+      - ``dpl``: ``--data-parallel-size-local`` value to emit on this node.
+        In ``dp_only`` shape this may differ per node (heterogeneous clusters);
+        in ``mp_only`` / ``nested`` it is always 1.
+      - ``nnodes`` / ``node_rank``: physical cluster size and this node's
+        position in it (0 = leader).
+      - ``start_rank``: ``--data-parallel-start-rank`` to emit in ``dp_only``.
+        In other shapes vLLM derives DP rank internally from
+        ``node_rank % nnodes_within_dp``; we still surface the implied value
+        for diagnostics.
+      - ``is_follower``: whether this node should carry ``--headless``.
+    """
+
+    shape: MultinodeShape
+    tp: int
+    pp: int
+    dp: int
+    dpl: int
+    nnodes: int
+    node_rank: int
+    start_rank: int
+    is_follower: bool
+
+
+def cal_multinode_topology(
+    model_instance: ModelInstance,
+    deployment_metadata: ModelInstanceDeploymentMetadata,
+    user: Optional[MultinodeUserParallelism] = None,
+) -> MultinodeTopology:
+    """Translate user-supplied parallelism hints + physical topology into the
+    vLLM parameter shape this node should emit.
+
+    Delegates cluster-level validation and shape inference to
+    :func:`validate_multinode_topology`, then layers on the node-perspective
+    fields (``my_idx`` / ``start_rank`` / ``is_follower``).
+    """
+    g_main = len(model_instance.gpu_indexes) if model_instance.gpu_indexes else 1
+    subordinate = (
+        model_instance.distributed_servers.subordinate_workers
+        if model_instance.distributed_servers
+        and model_instance.distributed_servers.subordinate_workers
+        else []
+    )
+    gpu_per_node = [g_main] + [len(s.gpu_indexes or []) for s in subordinate]
+    nnodes = len(gpu_per_node)
+
+    # This node's physical rank.
+    if deployment_metadata.distributed_follower:
+        my_idx = (deployment_metadata.distributed_follower_index or 0) + 1
+        is_follower = True
+    else:
+        my_idx = 0
+        is_follower = False
+    if my_idx >= nnodes:
+        raise ValueError(
+            f"vLLM multi-node: follower index {my_idx} out of bounds "
+            f"(cluster has {nnodes} workers)."
+        )
+
+    validated = validate_multinode_topology(gpu_per_node, user)
+
+    if validated.shape == "dp_only":
+        start_rank = sum(validated.dpl_per_node[:my_idx])
+    else:
+        # mp_only / nested: vLLM derives DP rank from node_rank // nnodes_within_dp.
+        start_rank = my_idx // validated.nnodes_within_dp
+
+    return MultinodeTopology(
+        shape=validated.shape,
+        tp=validated.tp,
+        pp=validated.pp,
+        dp=validated.dp,
+        dpl=validated.dpl_per_node[my_idx],
+        nnodes=nnodes,
+        node_rank=my_idx,
+        start_rank=start_rank,
+        is_follower=is_follower,
+    )
+
+
 def get_auto_parallelism_arguments(
     backend_parameters: List[str],
     model_instance: ModelInstance,
     is_distributed: bool,
+    deployment_metadata: Optional[ModelInstanceDeploymentMetadata] = None,
+    backend_version: Optional[str] = None,
 ) -> List[str]:
+    if (
+        is_distributed
+        and deployment_metadata is not None
+        and resolve_executor_backend(backend_parameters, backend_version) == "mp"
+    ):
+        # MP multi-node: derive shape-specific defaults for tp/pp/dp/dpl
+        # so the cluster works out-of-the-box; subordinate workers receive
+        # the same backend_parameters, so any non-None field acts as a hard
+        # cluster-wide constraint.
+        user = parse_user_parallelism(backend_parameters)
+        topology = cal_multinode_topology(model_instance, deployment_metadata, user)
+        derived: List[str] = []
+        if user.tp is None:
+            derived.extend(["--tensor-parallel-size", str(topology.tp)])
+        if user.pp is None and topology.pp > 1:
+            derived.extend(["--pipeline-parallel-size", str(topology.pp)])
+        # dp/dpl are only meaningful when the shape actually emits them
+        # (dp_only and nested). mp_only operates with dp=1, dpl=1 implicit.
+        if topology.shape in ("dp_only", "nested"):
+            if user.dp is None:
+                derived.extend(["--data-parallel-size", str(topology.dp)])
+            if user.dpl is None:
+                derived.extend(["--data-parallel-size-local", str(topology.dpl)])
+        return derived
+
     parallelism = find_parameter(
         backend_parameters,
         [
@@ -700,7 +1073,7 @@ def get_auto_parallelism_arguments(
         return []
 
     if is_distributed:
-        # distributed across multiple workers
+        # distributed across multiple workers (Ray sidecar path)
         (tp, pp) = cal_distributed_parallelism_arguments(model_instance)
         return [
             "--tensor-parallel-size",

@@ -6,7 +6,6 @@ from gpustack.routes import (
     api_keys,
     auth,
     cluster_access,
-    cluster_quotas,
     config,
     dashboard,
     debug,
@@ -20,7 +19,6 @@ from gpustack.routes import (
     model_evaluations,
     model_files,
     model_instances,
-    model_route_principals,
     model_sets,
     organization_members,
     organizations,
@@ -33,6 +31,7 @@ from gpustack.routes import (
     openai,
     workers,
     usage,
+    resource_usage,
     cloud_credentials,
     worker_pools,
     clusters,
@@ -44,17 +43,23 @@ from gpustack.routes import (
     model_routes,
     grafana,
     prometheus,
+    gpu_instance_persistent_volume_types,
+    gpu_instance_persistent_volumes,
+    gpu_instance_types,
+    gpu_instances,
 )
 
 from gpustack.api.exceptions import error_responses, openai_api_error_responses
 from gpustack.api.auth import (
     get_admin_user,
     get_current_user,
-    get_cluster_user,
-    get_worker_user,
+    get_cluster_principal,
+    get_worker_principal,
     management_scope,
     inference_scope,
 )
+from gpustack.api.tenant import require_org_role
+from gpustack.schemas.principals import OrgRole
 from gpustack.websocket_proxy.message_server import router as message_server_router
 from gpustack.routes.gateway_metrics import router as gateway_metrics_router
 
@@ -62,6 +67,11 @@ from gpustack_higress_plugins.server import router as higress_plugins_router
 
 versioned_prefix = "/v2"
 
+# Org-owner gate for management surfaces (Models / Model Routes /
+# Model Providers / Benchmarks / Model Files). Platform admin and
+# SYSTEM principals (worker / cluster callbacks reaching shared
+# routers) bypass via ``require_org_role`` itself.
+_org_owner_only = [Depends(require_org_role(OrgRole.OWNER))]
 
 # Toggle for surfacing extended API endpoints in the OpenAPI schema
 # and ``/docs``. Endpoints stay mounted regardless — only the public
@@ -88,7 +98,6 @@ management_router.include_router(
     include_in_schema=False,
 )
 
-
 # authed routes
 
 v1_base_router = APIRouter(dependencies=[Depends(get_current_user)])
@@ -96,6 +105,7 @@ v1_base_router.include_router(users.me_router, prefix="/users", tags=["Users"])
 v1_base_router.include_router(users.directory_router, tags=["Users"])
 v1_base_router.include_router(api_keys.router, prefix="/api-keys", tags=["API Keys"])
 v1_base_router.include_router(usage.router, prefix="/usage", tags=["Usage"])
+v1_base_router.include_router(resource_usage.router, prefix="/usage", tags=["Usage"])
 v1_base_router.include_router(
     me_orgs.router,
     prefix="/users/me",
@@ -152,23 +162,51 @@ cluster_client_router.add_api_route(
 )
 
 model_routers = [
-    {"router": models.router, "prefix": "/models", "tags": ["Models"]},
+    {
+        "router": models.router,
+        "prefix": "/models",
+        "tags": ["Models"],
+        "dependencies": _org_owner_only,
+    },
     {
         "router": model_instances.router,
         "prefix": "/model-instances",
         "tags": ["Model Instances"],
+        "dependencies": _org_owner_only,
     },
-    {"router": model_files.router, "prefix": "/model-files", "tags": ["Model Files"]},
-    {"router": benchmarks.router, "prefix": "/benchmarks", "tags": ["Benchmarks"]},
+    {
+        "router": model_files.router,
+        "prefix": "/model-files",
+        "tags": ["Model Files"],
+        "dependencies": _org_owner_only,
+    },
+    {
+        "router": benchmarks.router,
+        "prefix": "/benchmarks",
+        "tags": ["Benchmarks"],
+        "dependencies": _org_owner_only,
+    },
     {
         "router": benchmark_profiles.router,
         "prefix": "/benchmark-profiles",
         "tags": ["Benchmark Profiles"],
+        "dependencies": _org_owner_only,
     },
     {
         "router": model_routes.target_router,
         "prefix": "/model-route-targets",
         "tags": ["Model Route Targets"],
+        "dependencies": _org_owner_only,
+    },
+    {
+        "router": gpu_instance_persistent_volume_types.router,
+        "prefix": "/gpu-instance-persistent-volume-types",
+        "tags": ["GPU Instance Persistent Volume Types"],
+    },
+    {
+        "router": gpu_instance_persistent_volumes.router,
+        "prefix": "/gpu-instance-persistent-volumes",
+        "tags": ["GPU Instance Persistent Volumes"],
     },
     {
         "router": gpu_instance_ssh_public_keys.router,
@@ -179,6 +217,16 @@ model_routers = [
         "router": gpu_instance_templates.router,
         "prefix": "/gpu-instance-templates",
         "tags": ["GPU Instance Templates"],
+    },
+    {
+        "router": gpu_instance_types.router,
+        "prefix": "/gpu-instance-types",
+        "tags": ["GPU Instance Types"],
+    },
+    {
+        "router": gpu_instances.router,
+        "prefix": "/gpu-instances",
+        "tags": ["GPU Instances"],
     },
 ]
 # worker client have full access to model and model instances
@@ -222,22 +270,19 @@ tenant_routers = model_routers + [
         "router": model_provider.router,
         "prefix": "/model-providers",
         "tags": ["Model Providers"],
+        "dependencies": _org_owner_only,
     },
     {
         "router": model_routes.router,
         "prefix": "/model-routes",
         "tags": ["Model Routes"],
-    },
-    {
-        "router": model_route_principals.router,
-        "prefix": "/model-routes",
-        "tags": ["Model Route Principals"],
-        "include_in_schema": _EXTENDED_API_IN_SCHEMA,
+        "dependencies": _org_owner_only,
     },
     {
         "router": model_evaluations.router,
         "prefix": "/model-evaluations",
         "tags": ["Model Evaluations"],
+        "dependencies": _org_owner_only,
     },
     # Read-only platform catalogs (no tenant data) — every logged-in user
     # needs them to deploy models, including Org owners/managers.
@@ -249,22 +294,13 @@ tenant_routers = model_routers + [
     },
     # Inference backends are platform-wide (admin curates) but every Org
     # owner/manager needs to read them to pick a backend at deploy time.
-    # Worker / cluster system users also reach this through v1_base_router
-    # since `get_current_user` accepts ``is_system=True`` callers.
+    # Worker / cluster system principals also reach this through
+    # v1_base_router since `get_current_user` accepts ``kind=SYSTEM``
+    # callers.
     {
         "router": inference_backend.router,
         "prefix": "/inference-backends",
         "tags": ["Inference Backend"],
-    },
-    # Per-cluster quota rows for the cluster-detail Quotas tab. GET
-    # visible to anyone who can see the cluster (platform admin OR a
-    # member of one of its accessible Orgs); PUT gates inside the
-    # handler to platform admin OR cluster owner Org owner
-    # (`assert_cluster_writable`).
-    {
-        "router": cluster_quotas.router,
-        "tags": ["Cluster Quotas"],
-        "include_in_schema": _EXTENDED_API_IN_SCHEMA,
     },
     # Dashboard sub-routes gate themselves inside the handler. The
     # per-cluster ``GET /dashboard?cluster_id=X`` accepts anyone who
@@ -315,19 +351,20 @@ for admin_router in admin_routers:
 # v1_base_router and worker_client_router register overlapping endpoints
 # (e.g. /v2/models, /v2/workers) — putting v1_base_router first means
 # regular user requests resolve through ``get_current_user`` (which also
-# accepts worker / cluster system users), and only routes that are unique
-# to the worker / cluster client paths fall through to those routers.
+# accepts worker / cluster system principals), and only routes that
+# are unique to the worker / cluster client paths fall through to
+# those routers.
 management_router.include_router(
     v1_base_router, dependencies=[Depends(get_current_user)], prefix=versioned_prefix
 )
 management_router.include_router(
     worker_client_router,
-    dependencies=[Depends(get_worker_user)],
+    dependencies=[Depends(get_worker_principal)],
     prefix=versioned_prefix,
 )
 management_router.include_router(
     cluster_client_router,
-    dependencies=[Depends(get_cluster_user)],
+    dependencies=[Depends(get_cluster_principal)],
     prefix=versioned_prefix,
 )
 management_router.include_router(

@@ -1,8 +1,8 @@
 from enum import Enum
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from gpustack import __benchmark_runner_version__, __operator_version__
+from gpustack import __benchmark_runner_version__
 
 
 class GatewayModeEnum(str, Enum):
@@ -59,14 +59,13 @@ class PredefinedConfig(SensitivePredefinedConfig):
     benchmark_image_repo: str = (
         f"gpustack/benchmark-runner:{__benchmark_runner_version__}"
     )
-    operator_image: str = f"gpustack/gpustack-operator:{__operator_version__}"
     gateway_mode: GatewayModeEnum = GatewayModeEnum.auto
     gateway_kubeconfig: Optional[str] = None
     gateway_namespace: str = "higress-system"
     service_discovery_name: Optional[str] = None
-    namespace: str = "gpustack-system"
 
     # Worker options
+    worker_ifname: Optional[str] = None
     disable_worker_metrics: bool = False
     worker_port: int = 10150
     worker_metrics_port: int = 10151
@@ -75,6 +74,26 @@ class PredefinedConfig(SensitivePredefinedConfig):
     benchmark_max_duration_seconds: Optional[int] = None
     system_reserved: Optional[dict] = None
     pipx_path: Optional[str] = None
+
+    @field_validator("system_reserved", mode="before")
+    @classmethod
+    def _validate_system_reserved(cls, v):
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError("system_reserved must be a dict")
+        for key in ("ram", "vram", "memory", "gpu_memory"):
+            if key not in v or v[key] is None:
+                continue
+            raw = v[key]
+            if isinstance(raw, bool) or not isinstance(raw, int):
+                raise ValueError(
+                    f"system_reserved.{key} must be a non-negative integer (GiB), got {raw!r}"
+                )
+            if raw < 0:
+                raise ValueError(f"system_reserved.{key} must be non-negative")
+        return v
+
     tools_download_base_url: Optional[str] = None
     enable_hf_transfer: bool = False  # Deprecated
     enable_hf_xet: bool = False  # Deprecated
@@ -93,10 +112,8 @@ class PredefinedConfigNoDefaults(PredefinedConfig):
     benchmark_max_duration_seconds: Optional[int] = None
     image_repo: Optional[str] = None
     benchmark_image_repo: Optional[str] = None
-    operator_image: Optional[str] = None
     gateway_mode: Optional[str] = None
     gateway_namespace: Optional[str] = None
-    namespace: Optional[str] = None
 
 
 def parse_base_model_to_env_vars(

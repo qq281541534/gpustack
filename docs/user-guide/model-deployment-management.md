@@ -214,6 +214,27 @@ For full list of supported parameters, please refer to the [Inference Backends](
 
 Environment variables used when running the model. These variables are passed to the backend process at startup.
 
+### LoRA Adapters
+
+LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning method that adapts a base model to a specific domain by loading small adapter files instead of retraining the full weights. GPUStack lets you mount multiple LoRA adapters on a single deployed base LLM and automatically creates one Model Route per adapter.
+
+!!! note
+
+    LoRA is supported only on the `vLLM`, `SGLang`, and `Ascend MindIE` backends. The `LoRA Adapters` configuration is ignored on other backends.
+
+Expand the `Advanced` section on the deployment form, locate `LoRA Adapters`, and add adapters one by one:
+
+- Pick an adapter from the dropdown. The list supports search. If your adapter is not shown, first confirm on `Hugging Face` or `ModelScope` that the model actually provides one, then paste its repository ID into the search box to select it.
+- `LoRA name`: Enter the bare adapter name, for example `alpaca`.
+
+After deployment, GPUStack automatically creates a Model Route for each LoRA adapter, named `<base-model-name>:<adapter-name>`. To switch adapters, set the `model` field of the OpenAI-compatible API to the corresponding route name. All adapters share the same GPU instance. GPUStack injects backend startup arguments such as `--enable-lora` automatically, so you usually do not need to repeat them under `Backend Parameters`.
+
+!!! note
+
+    After you change the LoRA configuration of a deployed model, the corresponding instances must be restarted before the new configuration takes effect.
+
+For the full end-to-end workflow, including invocation examples and per-backend compatibility details, see the [Serving Models with LoRA Adapters](../tutorials/serving-with-lora-adapters.md) tutorial.
+
 ### Allow CPU Offloading
 
 !!! note

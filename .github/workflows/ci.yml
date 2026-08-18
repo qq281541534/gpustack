@@ -16,6 +16,9 @@ on:
       - "**.jpg"
       - "**.gif"
 
+permissions:
+  contents: write # create GitHub releases via softprops/action-gh-release
+
 jobs:
   linux-build:
     # Disabled in fork: upstream CI not applicable to our custom build workflow

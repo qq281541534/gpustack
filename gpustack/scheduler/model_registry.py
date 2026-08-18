@@ -1,5 +1,7 @@
-# Synced with https://github.com/vllm-project/vllm/blob/v0.17.1/vllm/model_executor/models/registry.py
+# Synced with https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/model_executor/models/registry.py
 # Update these when the builtin vLLM is updated
+# NOTE: entries are only added/renamed here, never removed, so that older vLLM
+# versions and other backends (SGLang, Ascend MindIE) keep recognizing them.
 # List of supported model architectures for the default version of the vLLM backend
 # TODO version-aware support list
 from typing import List
@@ -88,12 +90,14 @@ _TEXT_GENERATION_MODELS = [
     "LongcatFlashForCausalLM",
     "MambaForCausalLM",
     "Mamba2ForCausalLM",
+    "MellumForCausalLM",
     "MiniCPMForCausalLM",
     "MiniCPM3ForCausalLM",
     "MiniMaxForCausalLM",
     "MiniMaxText01ForCausalLM",
     "MiniMaxM1ForCausalLM",
     "MiniMaxM2ForCausalLM",
+    "MiniMaxM3SparseForCausalLM",
     "MistralForCausalLM",
     "MixtralForCausalLM",
     "MotifForCausalLM",
@@ -140,6 +144,27 @@ _TEXT_GENERATION_MODELS = [
     "TeleFLMForCausalLM",
     "XverseForCausalLM",
     "Zamba2ForCausalLM",
+    "AfmoeForCausalLM",
+    "Cohere2MoeForCausalLM",
+    "DeepseekV4ForCausalLM",
+    "Gemma4ForCausalLM",
+    "HCXVisionV2ForCausalLM",
+    "HrmTextForCausalLM",
+    "HYV3ForCausalLM",
+    "HyperCLOVAXForCausalLM",
+    "Jais2ForCausalLM",
+    "LagunaForCausalLM",
+    "MiMoV2ForCausalLM",
+    "Ministral3ForCausalLM",
+    "MistralLarge3ForCausalLM",
+    "OlmoHybridForCausalLM",
+    "Param2MoEForCausalLM",
+    "Plamo3ForCausalLM",
+    "Rnj1ForCausalLM",
+    "SarvamMLAForCausalLM",
+    "SarvamMoEForCausalLM",
+    "TeleChatForCausalLM",
+    "TeleChat3ForCausalLM",
     # [Encoder-decoder]
     "BartModel",
     "BartForConditionalGeneration",
@@ -200,6 +225,11 @@ _EMBEDDING_MODELS = [
     "LlamaNemotronVLModel",
     "PrithviGeoSpatialMAE",
     "Terratorch",
+    "ErnieModel",
+    "JinaEmbeddingsV5Model",
+    "ColBERTLfm2Model",
+    "ColPaliForRetrieval",
+    "ColQwen3_5",
 ]
 
 _CROSS_ENCODER_MODELS = [
@@ -213,6 +243,11 @@ _CROSS_ENCODER_MODELS = [
     "JinaVLForRanking",
     "LlamaBidirectionalForSequenceClassification",
     "LlamaNemotronVLForSequenceClassification",
+    "ErnieForTokenClassification",
+    "ErnieForSequenceClassification",
+    "Qwen3ASRForcedAlignerForTokenClassification",
+    "OpenAIPrivacyFilterForTokenClassification",
+    "JinaForRanking",
 ]
 
 _MULTIMODAL_MODELS = [
@@ -225,9 +260,11 @@ _MULTIMODAL_MODELS = [
     "Blip2ForConditionalGeneration",
     "ChameleonForConditionalGeneration",
     "Cohere2VisionForConditionalGeneration",
+    "Cosmos3ForConditionalGeneration",
     "DeepseekVLV2ForCausalLM",
     "DeepseekOCRForCausalLM",
     "DeepseekOCR2ForCausalLM",
+    "UnlimitedOCRForCausalLM",
     "DotsOCRForCausalLM",
     "Eagle2_5_VLForConditionalGeneration",
     "Ernie4_5_VLMoeForConditionalGeneration",
@@ -264,9 +301,12 @@ _MULTIMODAL_MODELS = [
     "LlavaNextForConditionalGeneration",
     "LlavaNextVideoForConditionalGeneration",
     "LlavaOnevisionForConditionalGeneration",
+    "LlavaOnevision2ForConditionalGeneration",
     "MantisForConditionalGeneration",
     "MiDashengLMModel",
+    "MossAudioModel",
     "MiniMaxVL01ForConditionalGeneration",
+    "MiniMaxM3SparseForConditionalGeneration",
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
@@ -298,6 +338,7 @@ _MULTIMODAL_MODELS = [
     "UltravoxModel",
     "SkyworkR1VChatModel",
     "Step3VLForConditionalGeneration",
+    "Step3p7ForConditionalGeneration",
     "TarsierForConditionalGeneration",
     "Tarsier2ForConditionalGeneration",
     "VoxtralStreamingGeneration",
@@ -307,6 +348,27 @@ _MULTIMODAL_MODELS = [
     "Llama4ForConditionalGeneration",
     "SkyworkR1VChatModel",
     "NemotronParseForConditionalGeneration",
+    "BagelForConditionalGeneration",
+    "Cheers",
+    "CheersForConditionalGeneration",
+    "Exaone4_5_ForConditionalGeneration",
+    "Gemma4ForConditionalGeneration",
+    "Gemma4UnifiedForConditionalGeneration",
+    "DiffusionGemmaForBlockDiffusion",
+    "Granite4VisionForConditionalGeneration",
+    "Moondream3ForCausalLM",
+    "HfMoondream",
+    "InternS2PreviewForConditionalGeneration",
+    "MiMoV2OmniForCausalLM",
+    "MiniCPMV4_6ForConditionalGeneration",
+    "MoonshotKimiaForCausalLM",
+    "MossTranscribeDiarizeForConditionalGeneration",
+    "NemotronH_Nano_Omni_Reasoning_V3",
+    "NemotronH_Super_Omni_Reasoning_V3",
+    "OpenCUAForConditionalGeneration",
+    "OpenVLAForActionPrediction",
+    "Phi4ForCausalLMV",
+    "QianfanOCRForConditionalGeneration",
 ]
 
 _SPEECH_TO_TEXT_MODELS = [
@@ -315,11 +377,14 @@ _SPEECH_TO_TEXT_MODELS = [
     "FunAudioChatForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
     "GraniteSpeechForConditionalGeneration",
+    "GraniteSpeechPlusForConditionalGeneration",
     "Qwen3ASRForConditionalGeneration",
     "Qwen3ASRRealtimeGeneration",
     "VoxtralForConditionalGeneration",
     "VoxtralRealtimeGeneration",
     "WhisperForConditionalGeneration",
+    "CohereAsrForConditionalGeneration",
+    "FireRedLIDForConditionalGeneration",
 ]
 
 _TEXT_TO_SPEECH_MODELS = [

@@ -8,12 +8,12 @@ from sqlmodel import select
 
 from gpustack.api.exceptions import (
     AlreadyExistsException,
-    ForbiddenException,
     InternalServerErrorException,
     InvalidException,
     NotFoundException,
 )
 from gpustack.security import API_KEY_PREFIX, get_secret_hash, get_key_pair
+from gpustack.server.db import async_session
 from gpustack.server.deps import SessionDep, TenantContextDep
 from gpustack.schemas.api_keys import (
     ApiKey,
@@ -23,6 +23,7 @@ from gpustack.schemas.api_keys import (
     ApiKeysPublic,
     ApiKeyUpdate,
 )
+from gpustack.schemas.principals import OrgRole, PrincipalType
 from gpustack.schemas.users import User
 from gpustack.server.services import APIKeyService
 from gpustack.utils.api_keys import get_masked_api_key_value
@@ -31,15 +32,16 @@ router = APIRouter()
 
 
 def _is_system_owned(api_key: ApiKey) -> bool:
-    """API keys whose user is system-owned (workers, cluster sync, etc.).
+    """API keys whose owner is a SYSTEM principal (workers, cluster
+    sync, etc.).
 
-    Filters by ``user.is_system`` rather than the api_key name because
-    not every system-managed key follows the ``system/`` naming scheme
-    (``Legacy Cluster Token``, ``Default Cluster Token``, …). Requires
-    ``selectinload(ApiKey.user)`` on the query feeding this so the
-    relationship is hydrated before access.
+    Filters by the owner's ``kind`` rather than the api_key name
+    because not every system-managed key follows the ``system/``
+    naming scheme (``Legacy Cluster Token``, ``Default Cluster Token``,
+    …). Requires ``selectinload(ApiKey.user)`` on the query feeding
+    this so the relationship is hydrated before access.
     """
-    return bool(api_key.user and api_key.user.is_system)
+    return bool(api_key.user and api_key.user.kind == PrincipalType.SYSTEM)
 
 
 def _api_key_to_public(
@@ -53,6 +55,7 @@ def _api_key_to_public(
         user_name=user_name or api_key.user_name,
         value=value,
         masked_value=get_masked_api_key_value(api_key.access_key, api_key.is_custom),
+        owner_principal_id=api_key.owner_principal_id,
         created_at=api_key.created_at,
         updated_at=api_key.updated_at,
         expires_at=api_key.expires_at,
@@ -66,9 +69,44 @@ def _is_hidden_api_key(api_key: ApiKey) -> bool:
     return _is_system_owned(api_key)
 
 
+def _can_manage_org_api_keys(ctx) -> bool:
+    if ctx.user.is_admin:
+        return True
+    return ctx.current_principal_id is not None and ctx.org_role == OrgRole.OWNER
+
+
+def _api_key_list_fields(ctx, user_id: Optional[str]) -> dict:
+    """Build list filters for the caller's API key management scope.
+
+    Org owners manage all API keys in the current Org. Regular members only
+    manage their own keys in that Org. Platform admins keep the historical
+    cross-org behavior: no org context lists their own keys unless user_id is
+    supplied, with "*" meaning all users.
+    """
+    user = ctx.user
+    fields = {}
+    if ctx.current_principal_id is not None:
+        fields["owner_principal_id"] = ctx.current_principal_id
+
+    if _can_manage_org_api_keys(ctx):
+        if user_id is None:
+            if user.is_admin and ctx.current_principal_id is None:
+                fields["user_id"] = user.id
+            return fields
+        if user_id == "*":
+            return fields
+        try:
+            fields["user_id"] = int(user_id)
+        except ValueError:
+            raise InvalidException(message="user_id must be an integer or '*'")
+        return fields
+
+    fields["user_id"] = user.id
+    return fields
+
+
 @router.get("", response_model=ApiKeysPublic)
 async def get_api_keys(
-    session: SessionDep,
     ctx: TenantContextDep,
     params: ApiKeyListParams = Depends(),
     user_id: Optional[str] = Query(
@@ -76,20 +114,7 @@ async def get_api_keys(
     ),
     search: str = None,
 ):
-    user = ctx.user
-    fields = {"user_id": user.id}
-    if user.is_admin and user_id is not None:
-        if user_id == "*":
-            fields = {}
-        else:
-            try:
-                fields = {"user_id": int(user_id)}
-            except ValueError:
-                raise InvalidException(message="user_id must be an integer or '*'")
-    # Tenant filter: scope keys to the current org context unless the platform
-    # admin is explicitly browsing across orgs (no header / no api key org).
-    if ctx.current_principal_id is not None:
-        fields["owner_principal_id"] = ctx.current_principal_id
+    fields = _api_key_list_fields(ctx, user_id)
 
     fuzzy_fields = {}
     if search:
@@ -97,11 +122,11 @@ async def get_api_keys(
 
     # Hide system-owned keys (workers, cluster sync, legacy/default
     # cluster tokens). The set isn't covered by a clean name prefix —
-    # entries like "Default Cluster Token" / "Legacy Cluster Token" exist
-    # alongside the "system/..." names — so we filter by the owning
-    # user's ``is_system`` flag, which catches every variant.
+    # entries like "Default Cluster Token" / "Legacy Cluster Token"
+    # exist alongside the "system/..." names — so we filter by the
+    # owning principal's kind, which catches every variant.
     extra_conditions = [
-        ApiKey.user_id.notin_(select(User.id).where(User.is_system.is_(True))),
+        ApiKey.user_id.notin_(select(User.id).where(User.kind == PrincipalType.SYSTEM)),
     ]
 
     if params.watch:
@@ -115,20 +140,21 @@ async def get_api_keys(
             media_type="text/event-stream",
         )
 
-    result = await ApiKey.paginated_by_query(
-        session=session,
-        fields=fields,
-        fuzzy_fields=fuzzy_fields,
-        extra_conditions=extra_conditions,
-        page=params.page,
-        per_page=params.perPage,
-        order_by=params.order_by,
-        options=[selectinload(ApiKey.user)],
-    )
+    async with async_session() as session:
+        result = await ApiKey.paginated_by_query(
+            session=session,
+            fields=fields,
+            fuzzy_fields=fuzzy_fields,
+            extra_conditions=extra_conditions,
+            page=params.page,
+            per_page=params.perPage,
+            order_by=params.order_by,
+            options=[selectinload(ApiKey.user)],
+        )
 
-    # Convert ApiKey to ApiKeyPublic
-    items = [_api_key_to_public(item) for item in result.items]
-    result.items = items
+        # Convert ApiKey to ApiKeyPublic
+        items = [_api_key_to_public(item) for item in result.items]
+        result.items = items
     return result
 
 
@@ -137,11 +163,15 @@ async def create_api_key(
     session: SessionDep, ctx: TenantContextDep, key_in: ApiKeyCreate
 ):
     user = ctx.user
-    target_org_id = ctx.target_principal_id_for_write()
-    if target_org_id is None:
-        raise ForbiddenException(
-            message="Organization context is required to create an API key"
-        )
+    # Admin "All" mode (no Org context) creates an untenant-pinned key:
+    # ``owner_principal_id`` stays NULL so ``_resolve_requested_principal_id``
+    # falls through to user-based resolution on each request and admin
+    # gets the same cross-principal ``bypass_tenant_filter`` reach as
+    # their cookie session. For every other caller — Org act-as, Org
+    # member, personal scope — ``current_principal_id`` is already
+    # non-NULL by ``_resolve_requested_principal_id`` design and pins
+    # the key to that principal.
+    target_org_id = ctx.current_principal_id
     fields = {
         "user_id": user.id,
         "owner_principal_id": target_org_id,
@@ -149,7 +179,9 @@ async def create_api_key(
     }
     existing = await ApiKey.one_by_fields(session, fields)
     if existing:
-        raise AlreadyExistsException(message=f"Api key {key_in.name} already exists")
+        raise AlreadyExistsException(
+            message=f"API key with name '{key_in.name}' already exists."
+        )
 
     if key_in.custom is None:
         access_key, secret_key = secrets.token_hex(8), secrets.token_hex(16)
@@ -196,12 +228,12 @@ async def create_api_key(
         if key_in.custom
         else f"{API_KEY_PREFIX}_{access_key}_{secret_key}"
     )
-    return _api_key_to_public(api_key, value=value, user_name=user.username)
+    return _api_key_to_public(api_key, value=value, user_name=user.name)
 
 
 def _api_key_in_scope(api_key: ApiKey, ctx) -> bool:
     """An api_key is in the caller's scope if the caller is its owner, or a
-    platform admin acting either across all orgs or in the key's org.
+    platform/org admin acting either across all orgs or in the key's org.
     """
     user = ctx.user
     if api_key.user_id == user.id and (
@@ -212,6 +244,12 @@ def _api_key_in_scope(api_key: ApiKey, ctx) -> bool:
     if user.is_admin and (
         ctx.current_principal_id is None
         or api_key.owner_principal_id == ctx.current_principal_id
+    ):
+        return True
+    if (
+        ctx.current_principal_id is not None
+        and ctx.org_role == OrgRole.OWNER
+        and api_key.owner_principal_id == ctx.current_principal_id
     ):
         return True
     return False
@@ -234,7 +272,7 @@ async def update_api_key(
     session: SessionDep, ctx: TenantContextDep, id: int, key_in: ApiKeyUpdate
 ):
     api_key = await ApiKey.one_by_id(session, id, options=[selectinload(ApiKey.user)])
-    user_name = api_key.user.username if api_key and api_key.user else None
+    user_name = api_key.user.name if api_key and api_key.user else None
     if not api_key or not _api_key_in_scope(api_key, ctx):
         raise NotFoundException(message="Api key not found")
     try:

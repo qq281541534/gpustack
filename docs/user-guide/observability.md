@@ -126,7 +126,7 @@ _(where `custom_metrics_config.json` is your new config file)_
 **Get default config:**
 
 ```bash
-curl -X POST http://<gpustack_server_host>:<gpustack_server_port>/v2/metrics/default-config
+curl http://<gpustack_server_host>:<gpustack_server_port>/v2/metrics/default-config
 ```
 
 > **Note**: The configuration should be provided in valid JSON format.
@@ -155,6 +155,7 @@ The following metrics are exposed by GPUStack and can be scraped by Prometheus. 
 | gpustack:time_per_output_token_seconds | Histogram | Time per generated token.                                                   |
 | gpustack:e2e_request_latency_seconds   | Histogram | End-to-end request latency.                                                 |
 | gpustack:request_success               | Counter   | Total number of successful requests.                                        |
+| gpustack:request_preemptions           | Counter   | Total number of preemptions from the engine.                                |
 
 These metrics are mapped from various runtime engines (vLLM, SGLang, MindIE) as defined in metrics_config.yaml.
 
@@ -198,14 +199,14 @@ These metrics are mapped from various runtime engines (vLLM, SGLang, MindIE) as 
 
 ### Event Bus Metrics
 
-| Metric Name                         | Type    | Description                                                       |
-| ----------------------------------- | ------- | ----------------------------------------------------------------- |
-| gpustack:bus_subscribers            | Gauge   | Active bus subscribers per topic.                                 |
-| gpustack:bus_queue_depth            | Gauge   | Per-subscriber queue depth at scrape time.                        |
-| gpustack:bus_queue_capacity         | Gauge   | Per-subscriber queue maxsize (see env knob below).                |
-| gpustack:bus_queue_full             | Gauge   | 1 if the queue is full at scrape time, 0 otherwise.               |
-| gpustack:bus_queue_saturation_ratio | Gauge   | `qsize / maxsize` in `[0, 1]`. Sustained > 0.8 ⇒ slow consumer.   |
-| gpustack:bus_subscriber_latest_keys | Gauge   | Ids pending coalesced UPDATED delivery (size of `latest_by_key`). |
-| gpustack:bus_events_total           | Counter | Cumulative event counts. Extra labels: `kind`, `event_type`.      |
+| Metric Name                         | Type    | Description                                                                                                      |
+| ----------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------- |
+| gpustack:bus_subscribers            | Gauge   | Active bus subscribers per `topic` + `source` (several may share `source=streaming`, one per open watch stream). |
+| gpustack:bus_queue_depth            | Gauge   | Max queue depth across subscribers sharing `topic`+`source`.                                                     |
+| gpustack:bus_queue_capacity         | Gauge   | Per-subscriber queue maxsize (see env knob below).                                                               |
+| gpustack:bus_queue_full             | Gauge   | 1 if any subscriber sharing `topic`+`source` has a full queue.                                                   |
+| gpustack:bus_queue_saturation_ratio | Gauge   | Max `qsize / maxsize` in `[0, 1]`. Sustained > 0.8 ⇒ slow consumer.                                              |
+| gpustack:bus_subscriber_latest_keys | Gauge   | Max ids pending coalesced UPDATED delivery (size of `latest_by_key`).                                            |
+| gpustack:bus_events_total           | Counter | Cumulative event counts summed across subscribers sharing `topic`+`source`. Extra labels: `kind`, `event_type`.  |
 
 > **Note**: All metrics are labeled with relevant identifiers (cluster, worker, model, instance, user) for fine-grained monitoring and filtering.

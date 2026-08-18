@@ -1,6 +1,6 @@
 import logging
 import math
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import RedirectResponse, StreamingResponse
 from urllib.parse import urlencode
@@ -8,12 +8,13 @@ from gpustack_runtime.detector import ManufacturerEnum
 from sqlalchemy.orm import selectinload
 from sqlmodel import and_, or_
 from sqlmodel.ext.asyncio.session import AsyncSession
-from enum import Enum
 
 from gpustack.api.exceptions import (
     AlreadyExistsException,
     InternalServerErrorException,
     BadRequestException,
+    ForbiddenException,
+    NotFoundException,
 )
 from gpustack.schemas.common import Pagination
 from gpustack.schemas.inference_backend import is_custom_backend
@@ -26,13 +27,23 @@ from gpustack.schemas.models import (
 from gpustack.schemas.clusters import Cluster
 from gpustack.schemas.workers import GPUDeviceStatus, Worker
 from gpustack.api.tenant import (
+    TenantContext,
     bypass_tenant_filter,
+    assert_cluster_visible,
     assert_resource_visible,
+    cluster_scoped_system,
+    scoped_cluster_row_visible,
     tenant_list_conditions,
 )
 from gpustack.server.db import async_session
-from gpustack.server.deps import ListParamsDep, SessionDep, TenantContextDep
+from gpustack.server.deps import (
+    CurrentUserDep,
+    ListParamsDep,
+    SessionDep,
+    TenantContextDep,
+)
 from gpustack.schemas.models import (
+    LoraListEntry,
     Model,
     ModelCreate,
     ModelSpecBase,
@@ -41,34 +52,64 @@ from gpustack.schemas.models import (
     ModelsPublic,
 )
 from gpustack.schemas.model_routes import (
+    AccessPolicyEnum,
     ModelRoute,
     ModelRouteTarget,
     TargetStateEnum,
 )
+from gpustack.schemas.links import ModelRoutePrincipalLink
+from gpustack.schemas.principals import platform_principal_id
 from gpustack.server.services import (
     ModelService,
     WorkerService,
     revoke_model_access_cache,
 )
+from gpustack.server.lora_adapters_discovery import list_adapters_for_base
+from gpustack.server.lora_model_routes import (
+    cleanup_orphan_lora_routes,
+    create_lora_model_routes,
+    is_lora_list_stale,
+)
 from gpustack.utils.command import find_parameter
 from gpustack.utils.convert import safe_int
 from gpustack.utils.gpu import parse_gpu_id
 from gpustack.routes.model_common import (
+    ModelStateFilterEnum,
     build_category_conditions,
     categories_filter,
+    state_stream_filter,
 )
 from gpustack.config.config import get_global_config
 from gpustack.utils.grafana import resolve_grafana_base_url
+from gpustack.utils.lora_model_source import lora_route_name_for
 
 router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
 
-class ModelStateFilterEnum(str, Enum):
-    READY = "ready"
-    NOT_READY = "not_ready"
-    STOPPED = "stopped"
+def _make_model_watch_filter(ctx, categories, state=None):
+    """Watch-stream visibility: cluster-bound service accounts only see
+    their own cluster's models; everyone keeps the categories and state
+    filters. Predicates are pre-built so inactive filters cost nothing on
+    the per-event hot path."""
+    predicates = []
+    if cluster_scoped_system(ctx):
+        predicates.append(lambda data: scoped_cluster_row_visible(ctx, data))
+    if state is not None:
+        predicates.append(
+            lambda data: state_stream_filter(data, state, "ready_replicas", "replicas")
+        )
+    if categories:
+        predicates.append(lambda data: categories_filter(data, categories))
+
+    def _visible(data) -> bool:
+        for p in predicates:
+            if not p(data):
+                return False
+        return True
+
+    return _visible
 
 
 @router.get("", response_model=ModelsPublic)
@@ -98,9 +139,9 @@ async def get_models(
     # Streaming uses field-equality only; scope by current org so non-admin
     # users never see cross-org rows via the live stream. Admin without an
     # explicit org context keeps the unfiltered cross-org stream. System
-    # users (workers / cluster accounts) bypass — they need the cross-org
-    # view to handle instances scheduled to them on clusters outside their
-    # default Org.
+    # users (workers / cluster accounts) bypass owner scoping — they serve
+    # every Org's models — but cluster-bound service accounts are narrowed
+    # to their own cluster's rows below.
     if ctx.current_principal_id is not None and not bypass_tenant_filter(ctx):
         fields["owner_principal_id"] = ctx.current_principal_id
 
@@ -109,7 +150,7 @@ async def get_models(
             Model.streaming(
                 fields=fields,
                 fuzzy_fields=fuzzy_fields,
-                filter_func=lambda data: categories_filter(data, categories),
+                filter_func=_make_model_watch_filter(ctx, categories, state),
             ),
             media_type="text/event-stream",
         )
@@ -154,13 +195,43 @@ async def get_models(
         )
 
 
+@router.get("/adapters", response_model=Dict[str, Any])
+async def get_model_adapters(
+    session: SessionDep,
+    user: CurrentUserDep,
+    base: str = Query(
+        ...,
+        description=(
+            "Base model repo id (e.g. Qwen/Qwen3-8B) for HF/ModelScope adapter discovery; "
+            "also used to match local cached LoRAs."
+        ),
+    ),
+    q: Optional[str] = Query(
+        None,
+        description="Optional keyword (Hugging Face search, ModelScope Search).",
+    ),
+    limit: int = Query(
+        40,
+        ge=1,
+        le=200,
+        description="Max adapter entries per remote source (HF and ModelScope).",
+    ),
+):
+    _ = user
+    return await list_adapters_for_base(session, base, q=q, limit=limit)
+
+
 @router.get("/{id}", response_model=ModelPublic)
 async def get_model(
     session: SessionDep,
     ctx: TenantContextDep,
     id: int,
 ):
-    return await _get_model(session=session, ctx=ctx, id=id)
+    model = await Model.one_by_id(session, id, options=[selectinload(Model.instances)])
+    assert_resource_visible(ctx, model, not_found_message="Model not found")
+    public = ModelPublic.model_validate(model)
+    public.has_stale_lora_instances = is_lora_list_stale(model)
+    return public
 
 
 @router.get("/{id}/dashboard")
@@ -209,6 +280,12 @@ async def _get_model(
 @router.get("/{id}/instances", response_model=ModelInstancesPublic)
 async def get_model_instances(ctx: TenantContextDep, id: int, params: ListParamsDep):
     if params.watch:
+        # Gate the stream on the same visibility check the non-watch
+        # branch applies, so a model id outside the caller's scope can't
+        # be tailed live.
+        async with async_session() as session:
+            model = await Model.one_by_id(session, id)
+            assert_resource_visible(ctx, model, not_found_message="Model not found")
         fields = {"model_id": id}
         return StreamingResponse(
             ModelInstance.streaming(fields=fields),
@@ -300,6 +377,64 @@ async def validate_model_in(
         for param_names, error_message in unsupported_params:
             if find_parameter(model_in.backend_parameters, param_names):
                 raise BadRequestException(message=error_message)
+
+    validate_and_normalize_lora_list(model_in)
+
+
+def validate_and_normalize_lora_list(
+    model_in: Union[ModelCreate, ModelUpdate, ModelSpecBase],
+) -> None:
+    """Normalize each lora_name to the stored "<base>:<short>" form.
+
+    Accepts a bare short name and prepends the base prefix; a correct "<base>:"
+    prefix is kept as-is. Rejects wrong prefixes, embedded colons, empty names,
+    and duplicates. The API strips the prefix again on the way out (see
+    ModelPublic._strip_lora_prefix).
+    """
+    lora_list = getattr(model_in, "lora_list", None)
+    if not lora_list:
+        return
+
+    expected_prefix = f"{model_in.name}:"
+    seen: set = set()
+    for i, item in enumerate(lora_list):
+        entry = LoraListEntry.model_validate(item) if isinstance(item, dict) else item
+        short_name = (entry.lora_name or "").strip()
+        if not short_name:
+            raise BadRequestException(
+                message="lora_name must not be empty in lora_list."
+            )
+        if ":" in short_name:
+            if not short_name.startswith(expected_prefix):
+                raise BadRequestException(
+                    message=(
+                        f"lora_name '{short_name}' must not contain ':'. Set "
+                        f"lora_name to the bare adapter name (e.g. 'my-adapter'); "
+                        f"the '{expected_prefix}' prefix is added automatically."
+                    )
+                )
+            short_name = short_name[len(expected_prefix) :]
+            if not short_name:
+                raise BadRequestException(
+                    message=(
+                        f"lora_name is missing the suffix after the base model "
+                        f"prefix '{expected_prefix}'."
+                    )
+                )
+            if ":" in short_name:
+                raise BadRequestException(
+                    message=(
+                        f"lora_name '{entry.lora_name}' must not contain a nested "
+                        f"':' after the base model prefix."
+                    )
+                )
+        entry.lora_name = lora_route_name_for(model_in.name, short_name)
+        lora_list[i] = entry
+        if short_name in seen:
+            raise BadRequestException(
+                message=f"Duplicate lora_name '{short_name}' in lora_list."
+            )
+        seen.add(short_name)
 
 
 async def validate_gpu_ids(  # noqa: C901
@@ -416,21 +551,84 @@ async def validate_distributed_vllm_limit_per_worker(
             )
 
 
-@router.post("", response_model=ModelPublic)
+async def assert_cluster_belongs_to_org(
+    ctx: TenantContext,
+    session: AsyncSession,
+    cluster_id: Optional[int],
+    owner_principal_id: int,
+    cluster: Optional[Cluster] = None,
+):
+    """Ensure a chosen cluster is visible to the caller and owned by the
+    given Org.
+
+    A model runs on infrastructure owned by its Org, so its cluster must
+    belong to that Org — otherwise a tenant could target the platform's
+    (or another Org's) cluster, stamping a cross-tenant model. A cluster the
+    caller can't see is reported as missing (404), so cross-tenant cluster
+    ids can't be probed via a 403-vs-404 difference; a visible cluster owned
+    by another Org is a 403. No cluster chosen (``cluster_id is None``)
+    leaves default-cluster resolution to pick the Org's own cluster.
+
+    ``cluster`` may be passed pre-fetched to avoid a duplicate lookup.
+    """
+    if cluster_id is None:
+        return
+    if cluster is None:
+        cluster = await Cluster.one_by_id(session, cluster_id)
+    not_found = f"Cluster {cluster_id} not found"
+    assert_cluster_visible(ctx, cluster, not_found_message=not_found)
+    if cluster.deleted_at is not None:
+        raise NotFoundException(message=not_found)
+    if cluster.owner_principal_id != owner_principal_id:
+        raise ForbiddenException(
+            message="The selected cluster does not belong to the current organization."
+        )
+
+
+@router.post(
+    "",
+    response_model=ModelPublic,
+)
 async def create_model(
     session: SessionDep, ctx: TenantContextDep, model_in: ModelCreate
 ):
+    # Resolve the owning Org first — admin in "All" mode (no current
+    # principal) inherits the chosen cluster's Org, or falls back to
+    # the platform Org. The same value drives both the uniqueness
+    # pre-check below and the row we stamp on insert; resolving it up
+    # front keeps them in sync so the pre-check actually catches a
+    # collision in the Org the model will land in.
+    target_org_id = ctx.current_principal_id
+    cluster = None
+    if target_org_id is None and model_in.cluster_id is not None:
+        # Admin "All" mode has no principal context; derive the owning Org
+        # from the chosen cluster. Reused by the check below to avoid a
+        # second lookup. Under an Org context the helper does the single
+        # lookup itself.
+        cluster = await Cluster.one_by_id(session, model_in.cluster_id)
+        if cluster is None:
+            raise NotFoundException(message=f"Cluster {model_in.cluster_id} not found")
+        target_org_id = cluster.owner_principal_id
+    if target_org_id is None:
+        target_org_id = platform_principal_id()
+
+    # The chosen cluster must exist, be visible to the caller, and be owned
+    # by the target Org. In admin "All" mode target_org_id was derived from
+    # the cluster above, so the ownership check is trivially satisfied and
+    # this mainly rejects a missing/deleted or non-visible cluster_id.
+    await assert_cluster_belongs_to_org(
+        ctx, session, model_in.cluster_id, target_org_id, cluster=cluster
+    )
+
     # Model & ModelRoute names are unique within their Org. Two Orgs
     # can each have a "llama3" without colliding.
-    org_scope = ctx.current_principal_id
     existing = await Model.one_by_fields(
         session,
-        {"name": model_in.name, "owner_principal_id": org_scope},
+        {"name": model_in.name, "owner_principal_id": target_org_id},
     )
     if existing:
         raise AlreadyExistsException(
-            message=f"Model '{model_in.name}' already exists. "
-            "Please choose a different name or check the existing model."
+            message=f"Model with name '{model_in.name}' already exists."
         )
     should_create_route = (
         model_in.enable_model_route is not None and model_in.enable_model_route
@@ -438,12 +636,11 @@ async def create_model(
     if should_create_route:
         existing_route = await ModelRoute.one_by_fields(
             session,
-            {"name": model_in.name, "owner_principal_id": org_scope},
+            {"name": model_in.name, "owner_principal_id": target_org_id},
         )
         if existing_route:
             raise AlreadyExistsException(
-                message=f"Model route '{model_in.name}' already exists. "
-                "Please choose a different name or check the existing model route."
+                message=f"Model route with name '{model_in.name}' already exists."
             )
     await validate_model_in(session, model_in)
     model_in_dict = model_in.model_dump(exclude={"enable_model_route"})
@@ -451,19 +648,23 @@ async def create_model(
     # Stamp tenant scope. ModelBase has owner_principal_id defaulted to
     # PLATFORM_PRINCIPAL_ID, so `model_dump()` always emits the key —
     # `setdefault` would silently leave it at 1 even when the caller is
-    # acting under a different Org. Override directly:
-    #   - Caller has a current Org context → that Org wins
-    #   - Caller is admin in "All" mode → fall back to the chosen
-    #     cluster's owner Org so the model lives where it actually runs
-    #     (otherwise it'd land in Platform/Default and the cluster's Org
-    #     couldn't see / manage it)
-    target_org_id = ctx.current_principal_id
-    if target_org_id is None and model_in.cluster_id is not None:
-        cluster = await Cluster.one_by_id(session, model_in.cluster_id)
-        if cluster is not None:
-            target_org_id = cluster.owner_principal_id
-    if target_org_id is not None:
-        model_in_dict["owner_principal_id"] = target_org_id
+    # acting under a different Org. Override directly with the value we
+    # resolved above.
+    model_in_dict["owner_principal_id"] = target_org_id
+
+    # Multi-tenant default: a non-platform Org's new model (and the
+    # route(s) it spawns) is scoped to that Org via ALLOWED_PRINCIPALS
+    # with the owning Org auto-granted below. The Default (platform) Org
+    # keeps AUTHED. Caller's explicit ``access_policy`` always wins and
+    # then manages its own grants via /principals. ``model_dump`` always
+    # emits ``access_policy`` (it has a default), so override directly.
+    org_scoped_default = (
+        target_org_id is not None
+        and target_org_id != platform_principal_id()
+        and "access_policy" not in model_in.model_fields_set
+    )
+    if org_scoped_default:
+        model_in_dict["access_policy"] = AccessPolicyEnum.ALLOWED_PRINCIPALS
 
     try:
         model: Model = await Model.create(
@@ -475,7 +676,7 @@ async def create_model(
                 description=model.description,
                 categories=model.categories,
                 generic_proxy=model.generic_proxy,
-                created_by_model=True,
+                created_model_id=model.id,
                 access_policy=model.access_policy,
                 owner_principal_id=model.owner_principal_id,
             )
@@ -496,20 +697,51 @@ async def create_model(
                 source=model_route_target,
                 auto_commit=False,
             )
+            if org_scoped_default:
+                # Auto-grant the owning Org on the primary route so its
+                # members see it out of the box. The route is brand new,
+                # so no existence check is needed; LoRA child routes get
+                # their own grants inside create_lora_model_routes.
+                session.add(
+                    ModelRoutePrincipalLink(
+                        route_id=model_route.id,
+                        principal_id=model.owner_principal_id,
+                    )
+                )
+            await create_lora_model_routes(
+                session,
+                model,
+                access_policy=model.access_policy,
+                generic_proxy=model.generic_proxy,
+            )
             await session.commit()
             await revoke_model_access_cache(session=session)
+    except BadRequestException:
+        await session.rollback()
+        raise
     except Exception as e:
+        await session.rollback()
         raise InternalServerErrorException(message=f"Failed to create model: {e}")
 
     return model
 
 
-@router.put("/{id}", response_model=ModelPublic)
+@router.put(
+    "/{id}",
+    response_model=ModelPublic,
+)
 async def update_model(
     session: SessionDep, ctx: TenantContextDep, id: int, model_in: ModelUpdate
 ):
     model = await Model.one_by_id(session, id)
     assert_resource_visible(ctx, model, not_found_message="Model not found")
+
+    # Block re-pointing a model at another Org's (e.g. the Default org's
+    # shared) or a non-visible cluster: its cluster must stay owned by the
+    # model's Org.
+    await assert_cluster_belongs_to_org(
+        ctx, session, model_in.cluster_id, model.owner_principal_id
+    )
 
     await validate_model_in(session, model_in)
 
@@ -522,14 +754,34 @@ async def update_model(
         model_in = patch
 
     try:
-        await ModelService(session).update(model, model_in)
+        await ModelService(session).update(model, model_in, auto_commit=False)
+        updated = await Model.one_by_id(session, id)
+        if not updated:
+            raise RuntimeError("Model not found after update")
+        base_route = await ModelRoute.one_by_field(session, "name", updated.name)
+        if base_route:
+            await create_lora_model_routes(
+                session,
+                updated,
+                access_policy=updated.access_policy,
+                generic_proxy=updated.generic_proxy,
+            )
+            await cleanup_orphan_lora_routes(session, updated)
+        await session.commit()
+        await revoke_model_access_cache(session=session)
+    except BadRequestException:
+        await session.rollback()
+        raise
     except Exception as e:
+        await session.rollback()
         raise InternalServerErrorException(message=f"Failed to update model: {e}")
 
-    return model
+    return updated
 
 
-@router.delete("/{id}")
+@router.delete(
+    "/{id}",
+)
 async def delete_model(session: SessionDep, ctx: TenantContextDep, id: int):
     model = await Model.one_by_id(
         session,

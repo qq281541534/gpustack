@@ -2,13 +2,13 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: {{ config.system_namespace }}
+  name: {{ config.namespace }}
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: gpustack-operator-worker
-  namespace: {{ config.system_namespace }}
+  namespace: {{ config.namespace }}
   labels:
     app.kubernetes.io/part-of: gpustack-operator-worker
 ---
@@ -21,7 +21,7 @@ metadata:
 subjects:
   - kind: ServiceAccount
     name: gpustack-operator-worker
-    namespace: {{ config.system_namespace }}
+    namespace: {{ config.namespace }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
@@ -31,14 +31,14 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: gpustack-operator-worker-deployment
-  namespace: {{ config.system_namespace }}
+  namespace: {{ config.namespace }}
 data:
   values.yaml: |
 
     #@data/values
     ---
     certmanagerEnabled: false
-    namespaceName: "{{ config.system_namespace }}"
+    namespaceName: "{{ config.namespace }}"
 
   template.yaml: |
 
@@ -59,7 +59,7 @@ data:
     spec:
       selector:
         app.kubernetes.io/part-of: gpustack-operator
-        app.kubernetes.io/component: worker
+        app.kubernetes.io/component: operator
         app.kubernetes.io/name: gpustack-operator-worker
       sessionAffinity: ClientIP
       ports:
@@ -105,24 +105,34 @@ data:
       namespace: #@ data.values.namespaceName
       labels:
         app.kubernetes.io/part-of: gpustack-operator
-        app.kubernetes.io/component: worker
+        app.kubernetes.io/component: operator
         app.kubernetes.io/name: gpustack-operator-worker
     spec:
       replicas: 1
       selector:
         matchLabels:
           app.kubernetes.io/part-of: gpustack-operator
-          app.kubernetes.io/component: worker
+          app.kubernetes.io/component: operator
           app.kubernetes.io/name: gpustack-operator-worker
       template:
         metadata:
           labels:
             app.kubernetes.io/part-of: gpustack-operator
-            app.kubernetes.io/component: worker
+            app.kubernetes.io/component: operator
             app.kubernetes.io/name: gpustack-operator-worker
         spec:
           serviceAccountName: gpustack-operator-worker
           restartPolicy: Always
+          {%- if config.image_pull_secrets %}
+          imagePullSecrets:
+          {%- for ips in config.image_pull_secrets %}
+            - name: {{ ips.name }}
+          {%- endfor %}
+          {%- endif %}
+          {%- if config.k8s_options and config.k8s_options.node_selector %}
+          nodeSelector:
+            {{ config.k8s_options.node_selector | to_yaml | indent(12) }}
+          {%- endif %}
           affinity:
             podAntiAffinity:
               preferredDuringSchedulingIgnoredDuringExecution:
@@ -138,7 +148,7 @@ data:
                         - key: app.kubernetes.io/component
                           operator: In
                           values:
-                            - worker
+                            - operator
                         - key: app.kubernetes.io/name
                           operator: In
                           values:
@@ -148,10 +158,9 @@ data:
               image: {{ config.operator_image }}
               imagePullPolicy: IfNotPresent
               args:
-                - gpustack
+                - gpustack-operator
                 - worker
                 - -v=2
-                - --disable-peer
                 #@ if/end data.values.certmanagerEnabled:
                 - --cert-dir=/var/run/gpustack/certs
               resources:
@@ -180,6 +189,28 @@ data:
                       fieldPath: spec.nodeName
                 - name: KUBERNETES_SERVICE_NAME
                   value: gpustack-operator-worker
+                {%- if config.system_default_container_registry %}
+                - name: GPUSTACK_CONTAINER_REGISTRY
+                  value: {{ config.system_default_container_registry }}
+                {%- endif %}
+                {%- if config.container_namespace %}
+                - name: GPUSTACK_CONTAINER_NAMESPACE
+                  value: {{ config.container_namespace }}
+                {%- endif %}
+                {%- if config.image_pull_secrets %}
+                - name: GPUSTACK_IMAGE_PULL_SECRETS
+                  value: {{  config.image_pull_secrets | map(attribute='name') | join(',') }}
+                {%- endif %}
+                {%- if config.operator_instance_access_static_address  %}
+                - name: GPUSTACK_INSTANCE_ACCESS_STATIC_ADDRESS
+                  value: {{ config.operator_instance_access_static_address }}
+                {%- endif %}
+                {%- if config.operator_env %}
+                {%- for k, v in config.operator_env.items() %}
+                - name: {{ k }}
+                  value: {{ v | tojson }}
+                {%- endfor %}
+                {%- endif %}
               ports:
                 - name: https
                   containerPort: 31443
@@ -244,11 +275,21 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: gpustack-operator-worker-deployment
-  namespace: {{ config.system_namespace }}
+  namespace: {{ config.namespace }}
 spec:
   template:
     spec:
       serviceAccountName: gpustack-operator-worker
+      {%- if config.image_pull_secrets %}
+      imagePullSecrets:
+      {%- for ips in config.image_pull_secrets %}
+        - name: {{ ips.name }}
+      {%- endfor %}
+      {%- endif %}
+      {%- if config.k8s_options and config.k8s_options.node_selector %}
+      nodeSelector:
+        {{ config.k8s_options.node_selector | to_yaml | indent(8) }}
+      {%- endif %}
       containers:
       - name: main
         image: {{ config.operator_image }}
@@ -266,6 +307,8 @@ spec:
             name: gpustack-operator-worker-deployment
             defaultMode: 0755
   backoffLimit: 5
+  # Cleanup the job after 1 day.
+  ttlSecondsAfterFinished: 86400
 ---
 apiVersion: v1
 kind: Namespace

@@ -1,4 +1,4 @@
-# Installation
+# Installation via Docker
 
 ## Prerequisites
 
@@ -36,7 +36,7 @@ Check the GPUStack container logs:
 sudo docker logs -f gpustack
 ```
 
-If everything is normal, open `http://your_host_ip` in a browser to access the GPUStack UI.
+Once the server is up, open `http://your_host_ip` in a browser to access the GPUStack UI.
 
 Log in with username `admin` and the default password. Retrieve the initial password with:
 
@@ -71,7 +71,7 @@ The following sections describe examples of custom configuration options when st
 
 ### Using an External Database
 
-By default, GPUStack uses an embedded PostgreSQL database. To use an external database such as PostgreSQL or MySQL, set the `GPUSTACK_DATABASE_URL` environment variable or use the `--database-url` argument when starting the GPUStack container:
+By default, GPUStack uses an embedded PostgreSQL database. To use an external database such as PostgreSQL or MySQL, set the `GPUSTACK_DATABASE_URL` environment variable or use the `--database-url` argument when starting the GPUStack container. See [Database Requirements](requirements.md#database-requirements) for the list of compatible databases and verified versions.
 
 ```diff
  sudo docker run -d --name gpustack \
@@ -109,7 +109,7 @@ If GPUStack needs to communicate with services that use certificates issued by a
 
 !!! note
 
-    The certificate file must have a `.crt` extension. You can mount multiple CA certificates by adding additional `--volume` flags.
+    The CA certificate must be PEM-encoded with a `.crt` extension. You can mount multiple CA certificates by adding additional `--volume` flags.
 
 ## Installation via Docker Compose
 
@@ -143,7 +143,7 @@ Start the GPUStack server:
 sudo docker compose -f docker-compose.server.yaml up -d
 ```
 
-If everything is normal, open `http://your_host_ip` in a browser to access the GPUStack UI.
+Once the server is up, open `http://your_host_ip` in a browser to access the GPUStack UI.
 
 Log in with username `admin` and the default password. Retrieve the initial password with:
 

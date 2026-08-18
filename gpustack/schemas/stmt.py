@@ -152,80 +152,152 @@ principal_users_after_drop_view_stmt = "DROP VIEW IF EXISTS principal_users"
 
 def principal_users_after_create_view_stmt() -> str:
     """Helper view: (principal_id, user_id) — every user covered by a
-    principal, expanded across direct USER ownership and active
-    ORG/GROUP memberships. Used by ``non_admin_user_models`` so the
-    ALLOWED_PRINCIPALS branch can index-join instead of running a
-    correlated EXISTS over ``principal_memberships`` per row.
+    principal, expanded across direct USER ownership, direct ORG/GROUP
+    membership, and transitive ORG membership via a joined Group.
+    Used by ``non_admin_user_models`` so the ALLOWED_PRINCIPALS branch
+    can index-join instead of running a correlated EXISTS over
+    ``principal_memberships`` per row.
+
+    After identity consolidation, USER rows live in the same
+    ``principals`` table as ORG / GROUP — a USER-principal's id IS the
+    user's id, so the first branch is a self-trivial select instead of
+    the old ``users JOIN principals`` shape.
+
+    Three branches:
+
+    1. The user themselves (always covered by their USER-principal).
+    2. Direct: ``(parent=Org/Group, member=User)`` — user joined the
+       Org/Group directly.
+    3. Transitive: user is in a Group that is itself a member of an
+       Org — propagates Org membership to every active user in the
+       Group.
+
+    ``UNION`` (not ``UNION ALL``): a user that is a direct member of an
+    Org AND a member of a Group that's a member of the same Org would
+    otherwise emit two ``(org_id, user_id)`` rows from branches 2 and 3,
+    which downstream ``non_admin_user_models`` JOINs would multiply into
+    duplicate model rows for that user.
     """
     return '''
 CREATE VIEW principal_users AS
-SELECT u.principal_id AS principal_id, u.id AS user_id
-FROM users u
-UNION ALL
-SELECT pm.parent_principal_id AS principal_id, u.id AS user_id
+SELECT u.id AS principal_id, u.id AS user_id
+FROM principals u
+WHERE u.kind = 'USER' AND u.deleted_at IS NULL
+UNION
+SELECT pm.parent_principal_id AS principal_id, pm.member_principal_id AS user_id
 FROM principal_memberships pm
-JOIN users u ON u.principal_id = pm.member_principal_id
+JOIN principals u ON u.id = pm.member_principal_id
 JOIN principals pr ON pr.id = pm.parent_principal_id
 WHERE pm.deleted_at IS NULL
   AND pr.deleted_at IS NULL
+  AND u.deleted_at IS NULL
+  AND u.kind = 'USER'
   AND pr.kind IN ('ORG', 'GROUP')
+UNION
+SELECT org_pm.parent_principal_id AS principal_id, group_pm.member_principal_id AS user_id
+FROM principal_memberships group_pm
+JOIN principal_memberships org_pm
+  ON org_pm.member_principal_id = group_pm.parent_principal_id
+ AND org_pm.deleted_at IS NULL
+JOIN principals u ON u.id = group_pm.member_principal_id
+JOIN principals grp ON grp.id = group_pm.parent_principal_id
+JOIN principals org ON org.id = org_pm.parent_principal_id
+WHERE group_pm.deleted_at IS NULL
+  AND grp.deleted_at IS NULL
+  AND grp.kind = 'GROUP'
+  AND org.deleted_at IS NULL
+  AND org.kind = 'ORG'
+  AND u.kind = 'USER'
+  AND u.deleted_at IS NULL
 '''
 
 
 def model_user_after_create_view_stmt(db_type: str) -> str:
     sql_false = '0' if db_type == "sqlite" else 'FALSE'
-    pid = (
-        "CONCAT(m.id, ':', u.id)"
-        if db_type == "mysql"
-        else "CAST(m.id AS TEXT) || ':' || CAST(u.id AS TEXT)"
-    )
-    # 4-branch UNION ALL — each branch is a straight index join, so the
+    # MySQL's CAST(... AS TEXT) is invalid; CHAR is the canonical
+    # variable-length text target there. PG / openGauss / sqlite all
+    # accept TEXT.
+    text_type = "CHAR" if db_type == "mysql" else "TEXT"
+    # MySQL only accepts ``INTEGER`` as a CAST target from 8.0.17; older
+    # servers / OceanBase compat modes want ``SIGNED``. PG / openGauss
+    # both accept ``INTEGER``.
+    int_type = "SIGNED" if db_type == "mysql" else "INTEGER"
+
+    def _pid(via_expr: str) -> str:
+        # ``pid`` keys identity-map lookups on MyModel, so it has to be
+        # genuinely unique per emitted row. ``route_id:user_id`` alone
+        # collides whenever a (user, route) is covered by multiple
+        # grant chains; folding ``via_principal_id`` into the suffix
+        # restores uniqueness. ``IFNULL`` / ``COALESCE`` are mandatory:
+        # both ``CONCAT(...)`` (MySQL) and ``||`` (PG / openGauss /
+        # sqlite) propagate NULL through the whole expression, so a raw
+        # NULL via on the PUBLIC/AUTHED branch would make pid itself
+        # NULL.
+        if db_type == "mysql":
+            return (
+                f"CONCAT(m.id, ':', u.id, ':', "
+                f"IFNULL(CAST({via_expr} AS CHAR), ''))"
+            )
+        return (
+            f"CAST(m.id AS TEXT) || ':' || CAST(u.id AS TEXT) "
+            f"|| ':' || COALESCE(CAST({via_expr} AS TEXT), '')"
+        )
+
+    # 2-branch UNION ALL — each branch is a straight index join, so the
     # planner doesn't have to materialize every (user, route) pair to
     # then OR-filter EXISTS subqueries against it. ``mrp.deleted_at IS
-    # NULL`` is required on every ACL branch: leaving it off was the
+    # NULL`` is required on the ACL branch: leaving it off was the
     # soft-delete-leak bug from review.
+    # After identity consolidation, USER rows live in ``principals``
+    # (kind = 'USER'). The single ACL branch joins through
+    # ``principal_users``, which maps a USER-principal to itself — so a
+    # USER grant resolves exactly like the released ``allowed_users``
+    # policy did (now folded into ALLOWED_PRINCIPALS; the migration
+    # converted existing rows), and that separate branch is gone.
+    #
+    # ``via_principal_id`` / ``via_principal_kind`` record which principal
+    # granted this (user, route) row visibility, so the API layer can
+    # partition results into Personal vs Org-scoped views without
+    # re-deriving the chain. NULL on the PUBLIC/AUTHED branch — those
+    # grants aren't principal-mediated. The kind is normalized to TEXT
+    # so PG's native ``principaltype`` enum doesn't poison the UNION's
+    # column type inference.
+    #
+    # The view's contract is one row per chain — multi-chain (user,
+    # route) collapse to "one row per route" is the API layer's job
+    # (see ``_get_model_routes``), because the visibility filter
+    # discriminates by chain ``via_principal_kind`` and would drop the
+    # wrong chain if the view picked one up front.
     return f'''
 CREATE VIEW non_admin_user_models AS
-SELECT {pid} AS pid, u.id AS user_id, m.*
-FROM users u
+SELECT {_pid("NULL")} AS pid,
+       u.id AS user_id,
+       CAST(NULL AS {int_type}) AS via_principal_id,
+       CAST(NULL AS {text_type}) AS via_principal_kind,
+       m.*
+FROM principals u
 CROSS JOIN model_routes m
-WHERE u.is_admin = {sql_false} AND u.is_system = {sql_false}
+WHERE u.kind = 'USER' AND u.deleted_at IS NULL
+  AND u.is_admin = {sql_false}
   AND m.access_policy IN ('PUBLIC', 'AUTHED')
 
 UNION ALL
 
-SELECT {pid} AS pid, u.id AS user_id, m.*
-FROM users u
-JOIN principal_memberships pm
-  ON pm.member_principal_id = u.principal_id
-  AND pm.deleted_at IS NULL
-JOIN model_routes m
-  ON m.owner_principal_id = pm.parent_principal_id
-  AND m.access_policy = 'ORG'
-WHERE u.is_admin = {sql_false} AND u.is_system = {sql_false}
-
-UNION ALL
-
-SELECT {pid} AS pid, u.id AS user_id, m.*
-FROM users u
-JOIN model_route_principals mrp
-  ON mrp.principal_id = u.principal_id
-  AND mrp.deleted_at IS NULL
-JOIN model_routes m
-  ON m.id = mrp.route_id
-  AND m.access_policy = 'ALLOWED_USERS'
-WHERE u.is_admin = {sql_false} AND u.is_system = {sql_false}
-
-UNION ALL
-
-SELECT {pid} AS pid, u.id AS user_id, m.*
-FROM users u
+SELECT {_pid("mrp.principal_id")} AS pid,
+       u.id AS user_id,
+       mrp.principal_id AS via_principal_id,
+       CAST(pr.kind AS {text_type}) AS via_principal_kind,
+       m.*
+FROM principals u
 JOIN principal_users pu ON pu.user_id = u.id
 JOIN model_route_principals mrp
   ON mrp.principal_id = pu.principal_id
   AND mrp.deleted_at IS NULL
+JOIN principals pr
+  ON pr.id = mrp.principal_id
 JOIN model_routes m
   ON m.id = mrp.route_id
   AND m.access_policy = 'ALLOWED_PRINCIPALS'
-WHERE u.is_admin = {sql_false} AND u.is_system = {sql_false}
+WHERE u.kind = 'USER' AND u.deleted_at IS NULL
+  AND u.is_admin = {sql_false}
 '''
