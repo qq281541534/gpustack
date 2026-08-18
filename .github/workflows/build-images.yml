@@ -177,6 +177,9 @@ jobs:
           file: pack/Dockerfile
           platforms: linux/amd64
           push: ${{ github.event_name == 'push' || github.event.inputs.push_image == 'true' }}
+          # Aliyun ACR rejects buildx provenance attestation manifests
+          # (unknown manifest class for application/vnd.oci.empty.v1+json).
+          provenance: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
