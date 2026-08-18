@@ -63,12 +63,24 @@ from gpustack.schemas.workers import (
     MemoryInfo,
 )
 from gpustack.schemas.users import User, UserCreate, UserUpdate, UserPublic, UsersPublic
+from gpustack.schemas.user_passwords import (  # noqa: F401  table registration
+    PasswordAlgorithm,
+    UserPassword,
+)
 from gpustack.schemas.api_keys import ApiKey, ApiKeyCreate, ApiKeyPublic, ApiKeysPublic
 from gpustack.schemas.system_load import SystemLoad
 from gpustack.schemas.model_usage import ModelUsage
 from gpustack.schemas.model_usage_details import (
     ModelUsageDetails,
     ModelUsageDetailsArchive,
+)
+from gpustack.schemas.metered_usage import (  # noqa: F401  table registration
+    MeteredUsage,
+    MeteredUsageArchive,
+)
+from gpustack.schemas.resource_events import (  # noqa: F401  table registration
+    ResourceEvent,
+    ResourceEventArchive,
 )
 from gpustack.schemas.common import PaginatedList
 from gpustack.schemas.benchmark import (
@@ -133,17 +145,34 @@ from gpustack.schemas.cluster_access import (
     ClusterAccess,
     ClusterAccessPublic,
 )
-from gpustack.schemas.tenant_quotas import (
-    TenantQuota,
-    TenantQuotaUpdate,
-    TenantQuotaPublic,
-    TenantQuotasPublic,
-)
 from gpustack.schemas.links import ModelRoutePrincipalLink  # noqa: F401
+from gpustack.schemas.gpu_instance_persistent_volume_types import (
+    GPUInstancePersistentVolumeType,
+    GPUInstancePersistentVolumeTypeListParams,
+    GPUInstancePersistentVolumeTypeCreate,
+    GPUInstancePersistentVolumeTypeUpdate,
+    GPUInstancePersistentVolumeTypePublic,
+    GPUInstancePersistentVolumeTypesPublic,
+    GPUInstancePersistentVolumeTypeStatus,
+    GPUInstancePersistentVolumeTypePhase,
+)
+from gpustack.schemas.gpu_instance_persistent_volumes import (
+    GPUInstancePersistentVolume,
+    GPUInstancePersistentVolumeListParams,
+    GPUInstancePersistentVolumeCreate,
+    GPUInstancePersistentVolumeUpdate,
+    GPUInstancePersistentVolumePublic,
+    GPUInstancePersistentVolumesPublic,
+    GPUInstancePersistentVolumeStatus,
+    GPUInstancePersistentVolumePhase,
+)
 from gpustack.schemas.gpu_instance_ssh_public_keys import (
     GPUInstanceSSHPublicKey,
+    GPUInstanceSSHPublicKeyListParams,
+    GPUInstanceSSHPublicKeyCreate,
     GPUInstanceSSHPublicKeyUpdate,
     GPUInstanceSSHPublicKeyPublic,
+    GPUInstanceSSHPublicKeysPublic,
 )
 from gpustack.schemas.gpu_instance_templates import (
     GPUInstanceTemplate,
@@ -152,6 +181,18 @@ from gpustack.schemas.gpu_instance_templates import (
     GPUInstanceTemplateUpdate,
     GPUInstanceTemplatePublic,
     GPUInstanceTemplatesPublic,
+)
+from gpustack.schemas.gpu_instance_types import (
+    GPUAggregatedInstanceTypePublic,
+    GPUAggregatedInstanceTypesPublic,
+)
+from gpustack.schemas.gpu_instances import (
+    GPUInstance,
+    GPUInstanceListParams,
+    GPUInstanceCreate,
+    GPUInstanceUpdate,
+    GPUInstancePublic,
+    GPUInstancesPublic,
 )
 
 __all__ = [
@@ -198,6 +239,10 @@ __all__ = [
     "MemoryInfo",
     "SystemLoad",
     "ModelUsage",
+    "MeteredUsage",
+    "MeteredUsageArchive",
+    "ResourceEvent",
+    "ResourceEventArchive",
     "ModelFile",
     "ModelFileCreate",
     "ModelFileUpdate",
@@ -269,17 +314,40 @@ __all__ = [
     "UserGroupMembershipPublic",
     "ClusterAccess",
     "ClusterAccessPublic",
-    "TenantQuota",
-    "TenantQuotaUpdate",
-    "TenantQuotaPublic",
-    "TenantQuotasPublic",
+    "GPUInstancePersistentVolumeType",
+    "GPUInstancePersistentVolumeTypeListParams",
+    "GPUInstancePersistentVolumeTypeCreate",
+    "GPUInstancePersistentVolumeTypeUpdate",
+    "GPUInstancePersistentVolumeTypePublic",
+    "GPUInstancePersistentVolumeTypesPublic",
+    "GPUInstancePersistentVolumeTypeStatus",
+    "GPUInstancePersistentVolumeTypePhase",
+    "GPUInstancePersistentVolume",
+    "GPUInstancePersistentVolumeListParams",
+    "GPUInstancePersistentVolumeCreate",
+    "GPUInstancePersistentVolumeUpdate",
+    "GPUInstancePersistentVolumePublic",
+    "GPUInstancePersistentVolumesPublic",
+    "GPUInstancePersistentVolumeStatus",
+    "GPUInstancePersistentVolumePhase",
     "GPUInstanceSSHPublicKey",
+    "GPUInstanceSSHPublicKeyListParams",
+    "GPUInstanceSSHPublicKeyCreate",
     "GPUInstanceSSHPublicKeyUpdate",
     "GPUInstanceSSHPublicKeyPublic",
+    "GPUInstanceSSHPublicKeysPublic",
     "GPUInstanceTemplate",
     "GPUInstanceTemplateListParams",
     "GPUInstanceTemplateCreate",
     "GPUInstanceTemplateUpdate",
     "GPUInstanceTemplatePublic",
     "GPUInstanceTemplatesPublic",
+    "GPUAggregatedInstanceTypePublic",
+    "GPUAggregatedInstanceTypesPublic",
+    "GPUInstance",
+    "GPUInstanceListParams",
+    "GPUInstanceCreate",
+    "GPUInstanceUpdate",
+    "GPUInstancePublic",
+    "GPUInstancesPublic",
 ]

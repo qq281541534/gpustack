@@ -2,6 +2,10 @@ import asyncio
 from multiprocessing import Process
 import os
 import re
+import shutil
+import subprocess
+import tempfile
+import threading
 import importlib.util
 import aiohttp
 
@@ -11,15 +15,22 @@ import logging
 import secrets
 import tenacity
 from sqlmodel.ext.asyncio.session import AsyncSession
+
+from gpustack.gpu_instances import sync_builtin_templates_to_db
 from gpustack.logging import setup_logging
 from gpustack.schemas.users import (
     User,
-    UserRole,
-    get_default_cluster_user,
-    default_cluster_user_name,
+    get_default_cluster_principal,
+    default_cluster_principal_name,
 )
-from gpustack.schemas.principals import PLATFORM_PRINCIPAL_ID
-from gpustack.schemas.models import ModelInstance
+from gpustack.schemas.principals import (
+    Principal,
+    PrincipalType,
+    init_authenticated_principal_id,
+    init_platform_principal_id,
+    platform_principal_id,
+)
+from gpustack.schemas.models import Model, ModelInstance
 from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.workers import Worker
 from gpustack.schemas.clusters import Cluster, ClusterProvider, ClusterStateEnum
@@ -30,12 +41,9 @@ from gpustack.security import (
     get_secret_hash,
     API_KEY_PREFIX,
 )
-from gpustack.routes.auth import remove_initial_password_file_if_exists
 from gpustack.server.app import create_app
-from gpustack.server.services import (
-    create_user_with_principal,
-    provision_bootstrap_admin_orgs,
-)
+from gpustack.server.passwords import set_password
+from gpustack.server.services import provision_bootstrap_admin_orgs
 from gpustack.config.config import Config
 from gpustack.schemas.config import GatewayModeEnum
 from gpustack.config import registration
@@ -51,9 +59,18 @@ from gpustack.server.controllers import (
     ModelRouteController,
     ModelRouteTargetController,
     ModelProviderController,
-    GPUInstanceSSHPublicKeyController,
+)
+from gpustack.gpu_instances.controllers import (
+    GPUInstanceController,
+    GPUInstancePersistentVolumeController,
+    GPUInstancePersistentVolumeTypeController,
 )
 from gpustack.server.db import async_session
+from gpustack.server.lora_model_routes import (
+    cleanup_orphan_lora_routes,
+    create_lora_model_routes,
+)
+from gpustack.utils.lora_model_source import normalized_lora_list
 from gpustack.server.init_db import init_db, get_query_count
 from gpustack.scheduler.scheduler import Scheduler
 from gpustack.server.system_load import SystemLoadCollector
@@ -61,8 +78,16 @@ from gpustack.server.update_check import UpdateChecker
 from gpustack.server.worker_status_buffer import flush_worker_status_to_db
 from gpustack.server.metrics_collector import flush_gateway_metrics_to_db
 from gpustack.server.usage_details_archiver import UsageDetailsArchiver
+from gpustack.server.resource_event_logger import ResourceEventLogger
+from gpustack.server.resource_usage_collector import ResourceUsageCollector
+from gpustack.server.storage_usage_collector import StorageUsageCollector
+from gpustack import envs
+from gpustack.server.usage_archiver import TableArchiver
+from gpustack.schemas.metered_usage import MeteredUsage, MeteredUsageArchive
+from gpustack.schemas.resource_events import ResourceEvent, ResourceEventArchive
 from gpustack.server.worker_instance_cleaner import WorkerInstanceCleaner
 from gpustack.server.worker_syncer import WorkerSyncer
+from gpustack.utils.platform import is_inside_kubernetes
 from gpustack.utils.process import add_signal_handlers_in_loop
 from gpustack.config.registration import write_registration_token
 from gpustack.exporter.exporter import MetricExporter
@@ -75,7 +100,7 @@ from gpustack.gateway.utils import (
     cleanup_model_mapper,
     cleanup_fallback_filters,
     cleanup_ai_proxy_config,
-    cleanup_generic_route_transformer,
+    cleanup_generic_proxy_router,
     cleanup_mcpbridge_registry,
     resolve_instance_address_from_model_header,
 )
@@ -98,13 +123,117 @@ from gpustack.api.auth import (
     authenticate_worker_by_request_headers,
 )
 
+from gpustack.gpu_instances import gateway_client
+from gpustack.gpu_instances.gateway import (
+    reconcile_gpustack_operator_subscription,
+)
+
 logger = logging.getLogger(__name__)
+
+
+class _ExternalSubprocess:
+    """Adapter that exposes a ``subprocess.Popen`` as a ``multiprocessing.Process``-like
+    handle, so it can live alongside the worker process in ``_sub_processes`` and be
+    driven by ``_start_sub_processes`` / ``_monitor_sub_processes``.
+
+    Stdout and stderr are captured and pumped line-by-line into the server logger
+    by background daemon threads, so the operator's output shows up in the same
+    place as the rest of the server log.
+    """
+
+    def __init__(self, args, name="", log=None, on_exit=None):
+        self._args = args
+        self.name = name or args[0]
+        self._popen = None
+        self._logger = log or logger
+        self._log_threads = []
+        self._on_exit = on_exit
+        self._exit_callback_invoked = False
+        self._exit_lock = threading.Lock()
+
+    def start(self):
+        self._popen = subprocess.Popen(
+            self._args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        self._spawn_log_pump(self._popen.stdout, logging.INFO)
+        self._spawn_log_pump(self._popen.stderr, logging.INFO)
+        if self._on_exit is not None:
+            self._spawn_exit_watcher()
+
+    def stop(self):
+        if self._popen:
+            self._popen.terminate()
+            try:
+                self._popen.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._popen.kill()
+
+    def _spawn_exit_watcher(self):
+        def watch():
+            try:
+                self._popen.wait()
+            finally:
+                self._invoke_on_exit()
+
+        t = threading.Thread(
+            target=watch,
+            name=f"{self.name}-exit-watcher",
+            daemon=True,
+        )
+        t.start()
+
+    def _invoke_on_exit(self):
+        with self._exit_lock:
+            if self._exit_callback_invoked:
+                return
+            self._exit_callback_invoked = True
+        try:
+            self._on_exit()
+        except Exception:
+            self._logger.exception("[%s] on_exit callback failed", self.name)
+
+    def _spawn_log_pump(self, stream, level):
+        def pump():
+            try:
+                for line in iter(stream.readline, ""):
+                    line = line.rstrip()
+                    if line:
+                        self._logger.log(level, "[%s] %s", self.name, line)
+            finally:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+
+        t = threading.Thread(
+            target=pump,
+            name=f"{self.name}-log-{'out' if level == logging.INFO else 'err'}",
+            daemon=True,
+        )
+        t.start()
+        self._log_threads.append(t)
+
+    def is_alive(self) -> bool:
+        if self._popen is None:
+            return False
+        return self._popen.poll() is None
+
+    @property
+    def exitcode(self):
+        if self._popen is None:
+            return None
+        return self._popen.returncode
 
 
 class Server:
     def __init__(self, config: Config, worker_process: Process):
         self._config: Config = config
-        self._sub_processes = []
+        self._before_healthy_sub_processes = []
+        self._after_healthy_sub_processes = []
         self._async_tasks = []
         self._worker_process = worker_process
         # Coordination components
@@ -113,7 +242,7 @@ class Server:
 
     @property
     def all_processes(self):
-        return self._sub_processes
+        return self._before_healthy_sub_processes + self._after_healthy_sub_processes
 
     def _create_async_task(self, coro):
         self._async_tasks.append(asyncio.create_task(coro))
@@ -125,6 +254,12 @@ class Server:
     async def start(self):
         logger.info("Starting GPUStack server.")
 
+        if self._config.external_auth_insecure_skip_tls_verify:
+            logger.warning(
+                "external_auth_insecure_skip_tls_verify is enabled: TLS "
+                "verification is DISABLED for the external-auth IdP handshake."
+            )
+
         add_signal_handlers_in_loop()
 
         self._run_migrations()
@@ -133,7 +268,9 @@ class Server:
         init_model_catalog(self._config.model_catalog_file)
         # it's safe to determine server_role after migration
         if self._config.server_role() == Config.ServerRole.BOTH:
-            self._sub_processes.append(self._worker_process)
+            self._after_healthy_sub_processes.append(self._worker_process)
+
+        self._enqueue_operator_process()
 
         # Create FastAPI app. Plugin ``__init__(app, cfg)`` runs here and
         # may attach a distributed-mode coordinator to the plugin instance.
@@ -165,6 +302,7 @@ class Server:
         self._start_default_registry_checker()
         self._start_proxy_servers(app)
         self._start_extension_plugins(app)
+        self._start_gpustack_operator_subscription()
 
         serving_host = (
             "127.0.0.1"
@@ -281,8 +419,16 @@ class Server:
         inference_backend_controller = InferenceBackendController()
         tasks.append(asyncio.create_task(inference_backend_controller.start()))
 
-        g_inst_sshpublickey_controller = GPUInstanceSSHPublicKeyController(self.config)
-        tasks.append(asyncio.create_task(g_inst_sshpublickey_controller.start()))
+        gpu_instance_controller = GPUInstanceController(self._config)
+        tasks.append(asyncio.create_task(gpu_instance_controller.start()))
+
+        gpu_instance_pv_controller = GPUInstancePersistentVolumeController(self._config)
+        tasks.append(asyncio.create_task(gpu_instance_pv_controller.start()))
+
+        gpu_instance_pvt_controller = GPUInstancePersistentVolumeTypeController(
+            self._config
+        )
+        tasks.append(asyncio.create_task(gpu_instance_pvt_controller.start()))
 
         logger.debug("Controllers started.")
         return tasks
@@ -306,6 +452,19 @@ class Server:
         self._create_async_task(flush_worker_status_to_db())
 
         logger.debug("Worker status flusher started.")
+
+    def _start_gpustack_operator_subscription(self):
+        """Keep the in-process gpustack-operator gateway in sync with Cluster events.
+
+        Runs on every server instance — each server spawns its own
+        ``gpustack-operator`` subprocess and must feed it the current cluster
+        set, so this cannot be a leader-only task.
+        """
+        if shutil.which("gpustack-operator") is None:
+            return
+        self._create_async_task(reconcile_gpustack_operator_subscription())
+
+        logger.debug("GPUStack operator subscription started.")
 
     def _start_gateway_metrics_flusher(self):
         # Always start — both the gateway report endpoint and the in-process
@@ -343,6 +502,62 @@ class Server:
 
         logger.debug("Usage details archiver started.")
 
+    def _start_resource_usage(self):
+        """Start the resource-metering pipeline: event logger → collectors →
+        events archiver. Leader-only — the logger writes one resource_events row
+        per lifecycle transition, so concurrent loggers would double-write.
+
+        The events archiver construction can fail on schema drift / bad cron;
+        surface that and skip just the archiver, keeping the logger + collectors
+        (and the rest of the leader tasks) running.
+        """
+        self._create_async_task(ResourceEventLogger().start())
+        self._create_async_task(ResourceUsageCollector().start())
+        self._create_async_task(StorageUsageCollector().start())
+
+        # Hot/cold archivers for metered_usage + resource_events. Construction can
+        # fail on schema drift / bad cron; surface that and skip just the failed
+        # archiver, keeping the logger + collectors (and other leader tasks).
+        for archiver_factory, name in (
+            (
+                lambda: TableArchiver(
+                    MeteredUsage,
+                    MeteredUsageArchive,
+                    anchor_col="bucket_start",
+                    retention_months=envs.METERED_USAGE_RETENTION_MONTHS,
+                    cron=envs.METERED_USAGE_ARCHIVE_CRON,
+                    batch_size=envs.METERED_USAGE_ARCHIVE_BATCH_SIZE,
+                    label="metered_usage",
+                ),
+                "metered_usage",
+            ),
+            (
+                lambda: TableArchiver(
+                    ResourceEvent,
+                    ResourceEventArchive,
+                    anchor_col="occurred_at",
+                    retention_months=envs.USAGE_EVENTS_RETENTION_MONTHS,
+                    cron=envs.USAGE_EVENTS_ARCHIVE_CRON,
+                    batch_size=envs.USAGE_EVENTS_ARCHIVE_BATCH_SIZE,
+                    label="resource_events",
+                ),
+                "resource_events",
+            ),
+        ):
+            try:
+                archiver = archiver_factory()
+            except Exception:
+                logger.critical(
+                    "%s archiver failed to initialize — archival is DISABLED; "
+                    "the hot table will grow unbounded until resolved.",
+                    name,
+                    exc_info=True,
+                )
+            else:
+                self._create_async_task(archiver.start())
+
+        logger.debug("Resource usage metering started.")
+
     def _start_update_checker(self):
         """Start update checker."""
         if self._config.disable_update_check:
@@ -352,18 +567,73 @@ class Server:
         logger.debug("Update checker started.")
 
     async def _monitor_sub_processes(self):
-        while self._sub_processes:
-            for process in self._sub_processes[:]:
+        while self.all_processes:
+            for process in self.all_processes[:]:
                 if not process.is_alive():
                     if process.exitcode != 0:
                         raise RuntimeError(
                             f"Sub process {process.name} died with exit code {process.exitcode}"
                         )
-                    self._sub_processes.remove(process)
+                    if process in self._before_healthy_sub_processes:
+                        self._before_healthy_sub_processes.remove(process)
+                    elif process in self._after_healthy_sub_processes:
+                        self._after_healthy_sub_processes.remove(process)
             await asyncio.sleep(5)
 
+    def _enqueue_operator_process(self):
+        """Queue the ``gpustack-operator wg`` subprocess for startup.
+
+        Skipped silently when the binary is not on PATH so deployments without
+        the operator addon installed don't fail.
+
+        The worker gateway is bound to a process-private unix socket whose
+        path is randomized for each server startup. This narrows the
+        socket's discoverability so unrelated local processes cannot easily
+        target it, and the path is handed to the in-process gateway client
+        so other server code can reach the operator's ``/apis/*`` endpoints.
+        """
+        if shutil.which("gpustack-operator") is None:
+            logger.debug("gpustack-operator binary not found on PATH, skipping start.")
+            return
+
+        socket_dir = tempfile.mkdtemp(prefix="gpustack-operator-")
+        os.chmod(socket_dir, 0o700)
+
+        socket_path = os.path.join(socket_dir, f"{secrets.token_hex(8)}.sock")
+        gateway_client.set_gateway_unix_path(socket_path)
+
+        args = [
+            "gpustack-operator",
+            "wg",
+            "--worker-conn-gpustack-api-port",
+            str(self._config.get_api_port()),
+            "--bind-unix-path",
+            socket_path,
+        ]
+        if self._config.debug:
+            args.append("--v=4")
+
+        def _cleanup_socket_dir():
+            shutil.rmtree(socket_dir, ignore_errors=True)
+
+        self._before_healthy_sub_processes.append(
+            _ExternalSubprocess(
+                args, name="gpustack-operator", on_exit=_cleanup_socket_dir
+            )
+        )
+
     def _start_sub_processes(self):
-        async def start_process_after_api_ready():
+        # Start before-healthy subprocesses synchronously so they are guaranteed
+        # to be spawned before any leader task (scheduler, controllers, ...) is
+        # scheduled. Otherwise the coroutine would only be queued and would not
+        # actually run until the first ``await`` in ``start()``, by which time
+        # controllers have already been created.
+        for process in self._before_healthy_sub_processes:
+            process.start()
+
+        async def wait_and_start_after_healthy():
+            # Wait for the API to be healthy before starting the rest of the processes,
+            # so that they can rely on the API being available when they start.
             api_url = f"http://127.0.0.1:{self._config.api_port}/healthz"
             async with aiohttp.ClientSession() as session:
                 while True:
@@ -377,13 +647,16 @@ class Server:
                     except asyncio.CancelledError:
                         return
 
-            for process in self._sub_processes:
+            # Start the rest of the processes after the API is ready.
+            for process in self._after_healthy_sub_processes:
                 process.start()
+
             await self._monitor_sub_processes()
 
-        if len(self._sub_processes) == 0:
+        if len(self.all_processes) == 0:
             return
-        self._create_async_task(start_process_after_api_ready())
+
+        self._create_async_task(wait_and_start_after_healthy())
 
     async def _wait_for_gateway_ready(self):
         if self._config.gateway_mode != GatewayModeEnum.embedded:
@@ -439,6 +712,16 @@ class Server:
             os.makedirs(data_dir)
 
     async def _init_data(self, session: AsyncSession):
+        # Resolve PLATFORM_PRINCIPAL_ID first: the identity-consolidation
+        # migration renumbers the platform principal above
+        # MAX(users.id), so every downstream init step that defaults to
+        # ``platform_principal_id()`` needs the live value bound.
+        await self._init_platform_principal_id(session)
+        # ``system/authenticated`` is seeded lazily on first call —
+        # bind it at startup so the resolver returns a real id before
+        # the first request lands on ``_accessible_clusters``.
+        await self._init_authenticated_principal_id(session)
+
         init_data_funcs = [
             self._init_user,
             self._init_default_cluster,
@@ -446,9 +729,39 @@ class Server:
             self._migrate_legacy_workers,
             self._ensure_registration_token,
             self._cleanup_orphaned_gateway_data,
+            sync_builtin_templates_to_db,
+            self._reconcile_lora_model_routes,
         ]
         for init_data_func in init_data_funcs:
             await init_data_func(session)
+
+    async def _reconcile_lora_model_routes(self, session: AsyncSession):
+        """Bring per-LoRA ModelRoute rows in sync with each Model.lora_list:
+        create missing ones and remove orphans (LoRA child routes whose
+        name `<base>:<lora>` is no longer in lora_list and not mounted
+        on any RUNNING instance).
+        """
+        all_models = await Model.all_by_fields(session, fields={"deleted_at": None})
+        models_with_lora = [m for m in all_models if normalized_lora_list(m)]
+        for model in models_with_lora:
+            await create_lora_model_routes(
+                session,
+                model,
+                access_policy=model.access_policy,
+                generic_proxy=model.generic_proxy,
+            )
+            await cleanup_orphan_lora_routes(session, model)
+
+        await session.commit()
+        logger.info(
+            f"LoRA model route reconcile: {len(models_with_lora)} models with lora_list scanned"
+        )
+
+    async def _init_platform_principal_id(self, session: AsyncSession):
+        await init_platform_principal_id(session)
+
+    async def _init_authenticated_principal_id(self, session: AsyncSession):
+        await init_authenticated_principal_id(session)
 
     async def _init_user(self, session: AsyncSession):
         # Skip bootstrap when any non-system admin already exists, so that
@@ -456,39 +769,70 @@ class Server:
         # admin to be regenerated on master restart.
         existing_admin = await User.first_by_fields(
             session=session,
-            fields={"is_admin": True, "is_system": False, "is_active": True},
+            fields={
+                "is_admin": True,
+                "kind": PrincipalType.USER,
+                "is_active": True,
+            },
         )
         if existing_admin:
             return
 
-        # Drop any stale initial password file from a prior bootstrap before
-        # generating a new one, so the login page does not show an outdated
-        # "retrieve initial password" hint.
-        remove_initial_password_file_if_exists(self._config)
-
+        # A machine-generated bootstrap password forces a first-login change
+        # and surfaces the retrieval guide; an operator-supplied one does not.
+        # The machine-generated password lives in the ``initial_admin_password``
+        # file under ``data_dir``: in HA the Helm chart mounts a shared Secret
+        # there so every replica reads the same value, and single-node installs
+        # generate it locally and write it there. An explicit
+        # ``--bootstrap-password`` takes precedence and is not force-changed.
         bootstrap_password = self._config.bootstrap_password
         require_password_change = False
+        password_file = os.path.join(self._config.data_dir, "initial_admin_password")
         if not bootstrap_password:
             require_password_change = True
-            bootstrap_password = generate_secure_password()
-            bootstrap_password_file = os.path.join(
-                self._config.data_dir, "initial_admin_password"
-            )
-            with open(bootstrap_password_file, "w") as file:
-                file.write(bootstrap_password + "\n")
-            logger.info(
-                "Generated initial admin password. "
-                f"You can get it from {bootstrap_password_file}"
-            )
+            if os.path.exists(password_file):
+                try:
+                    with open(password_file, encoding="utf-8") as file:
+                        bootstrap_password = file.read().strip()
+                except (OSError, ValueError) as e:
+                    # ValueError covers UnicodeDecodeError on a corrupted /
+                    # non-UTF-8 file, which is not an OSError.
+                    logger.warning(
+                        f"Failed to read initial admin password from {password_file}: {e}"
+                    )
+            # An empty / whitespace-only / unreadable file (interrupted write,
+            # empty Secret mount, permission issue) must never yield an empty
+            # admin password — fall back to a freshly generated one.
+            if bootstrap_password:
+                logger.info(f"Using initial admin password from {password_file}.")
+            else:
+                bootstrap_password = generate_secure_password()
+                try:
+                    with open(password_file, "w", encoding="utf-8") as file:
+                        file.write(bootstrap_password + "\n")
+                    logger.info(
+                        "Generated initial admin password. "
+                        f"You can get it from {password_file}"
+                    )
+                except OSError as e:
+                    logger.warning(
+                        "Generated initial admin password but could not persist it "
+                        f"to {password_file}: {e}"
+                    )
 
         user = User(
-            username="admin",
-            full_name="Default System Admin",
-            hashed_password=get_secret_hash(bootstrap_password),
+            name="admin",
+            display_name="Default System Admin",
             is_admin=True,
-            require_password_change=require_password_change,
         )
-        user = await create_user_with_principal(session, user)
+        user = await User.create(session, user, auto_commit=False)
+        await set_password(
+            session,
+            user.id,
+            bootstrap_password,
+            require_password_change=require_password_change,
+            auto_commit=False,
+        )
         await provision_bootstrap_admin_orgs(session, user)
         await session.commit()
 
@@ -496,14 +840,14 @@ class Server:
         if not self._config.token:
             return
         # this should be created from sql migration script.
-        cluster_user = await get_default_cluster_user(session)
-        if cluster_user is None or cluster_user.cluster is None:
+        cluster_principal = await get_default_cluster_principal(session)
+        if cluster_principal is None or cluster_principal.cluster is None:
             logger.debug(
                 "Default cluster user not exist, skipping legacy token migration."
             )
             return
 
-        default_cluster = cluster_user.cluster
+        default_cluster = cluster_principal.cluster
         if not default_cluster:
             logger.debug(
                 "Default cluster does not exist, skipping legacy token migration."
@@ -515,17 +859,14 @@ class Server:
             default_cluster.registration_token = self._config.token
             await default_cluster.update(session=session, auto_commit=False)
 
-            default_cluster_user = await User.one_by_fields(
-                session=session,
-                fields={
-                    "cluster_id": default_cluster.id,
-                    "is_system": True,
-                    "role": UserRole.Cluster,
-                },
+            if default_cluster.system_principal_id is None:
+                raise RuntimeError("Default cluster has no system principal.")
+            default_cluster_principal = await Principal.one_by_id(
+                session=session, id=default_cluster.system_principal_id
             )
-            if default_cluster_user is None:
+            if default_cluster_principal is None:
                 raise RuntimeError("Default cluster user does not exist.")
-            if len(default_cluster_user.api_keys) > 0:
+            if len(default_cluster_principal.api_keys) > 0:
                 raise RuntimeError(
                     "Default cluster user already has API keys, cannot migrate legacy token."
                 )
@@ -534,8 +875,8 @@ class Server:
                 name="Legacy Cluster Token",
                 access_key="",
                 hashed_secret_key=get_secret_hash(self._config.token),
-                user_id=default_cluster_user.id,
-                user=default_cluster_user,
+                user_id=default_cluster_principal.id,
+                user=default_cluster_principal,
             )
             await ApiKey.create(session, new_key, auto_commit=False)
             await session.commit()
@@ -562,42 +903,33 @@ class Server:
         if len(workers) == 0:
             return
         system_name_prefix = "system/worker"
-        worker_ids = [worker.id for worker in workers]
-        worker_users = await User.all_by_fields(
-            session=session,
-            fields={
-                "cluster_id": default_cluster.id,
-                "is_system": True,
-                "role": UserRole.Worker,
-            },
-            extra_conditions=[User.worker_id.in_(worker_ids)],
-        )
-        user_by_worker_id = {user.worker_id: user for user in worker_users}
+        # ``worker.system_principal_id`` is the post-inversion link. For
+        # legacy workers it'll be NULL until we provision one below.
         for worker in workers:
             try:
-                worker_user = user_by_worker_id.get(worker.id, None)
-                if not worker_user:
-                    to_create_user = User(
-                        username=f'{system_name_prefix}-{worker.id}',
-                        is_system=True,
-                        role=UserRole.Worker,
-                        hashed_password="",
-                        cluster=default_cluster,
-                        cluster_id=default_cluster.id,
-                        worker=worker,
-                        worker_id=worker.id,
+                worker_principal = None
+                if worker.system_principal_id is not None:
+                    worker_principal = await Principal.one_by_id(
+                        session=session, id=worker.system_principal_id
                     )
-                    worker_user = await create_user_with_principal(
-                        session, to_create_user
+                if not worker_principal:
+                    to_create_principal = Principal(
+                        name=f'{system_name_prefix}-{worker.id}',
+                        kind=PrincipalType.SYSTEM,
                     )
+                    worker_principal = await Principal.create(
+                        session, to_create_principal, auto_commit=False
+                    )
+                    worker.system_principal_id = worker_principal.id
+                    await worker.save(session=session, auto_commit=False)
                     access_key = secrets.token_hex(8)
                     secret_key = secrets.token_hex(16)
                     to_create_apikey = ApiKey(
-                        name=worker_user.username,
+                        name=worker_principal.name,
                         access_key=access_key,
                         hashed_secret_key=get_secret_hash(secret_key),
-                        user=worker_user,
-                        user_id=worker_user.id,
+                        user=worker_principal,
+                        user_id=worker_principal.id,
                     )
                     await ApiKey.create(session, to_create_apikey, auto_commit=False)
                     await worker.update(
@@ -614,20 +946,20 @@ class Server:
                 raise e
 
     async def _ensure_registration_token(self, session: AsyncSession):
-        cluster_user = await get_default_cluster_user(session)
-        if cluster_user is None or cluster_user.cluster is None:
+        cluster_principal = await get_default_cluster_principal(session)
+        if cluster_principal is None or cluster_principal.cluster is None:
             logger.debug(
                 "Default cluster user not exist, skipping registration token generation."
             )
             return
         # Hold a local reference: ``ApiKey.create`` triggers
         # ``ActiveRecordMixin._refresh_related_objects`` which calls
-        # ``session.refresh(cluster_user)``, expiring its eagerly-loaded
+        # ``session.refresh(cluster_principal)``, expiring its eagerly-loaded
         # ``cluster`` attribute. With ``User.cluster`` set to
-        # ``lazy="noload"``, accessing ``cluster_user.cluster``
+        # ``lazy="noload"``, accessing ``cluster_principal.cluster``
         # afterwards returns ``None`` and the subsequent update would
         # blow up.
-        cluster = cluster_user.cluster
+        cluster = cluster_principal.cluster
         token = cluster.registration_token
         if not token:
             try:
@@ -637,8 +969,8 @@ class Server:
                     name="Default Cluster Token",
                     access_key=access_key,
                     hashed_secret_key=get_secret_hash(secret_key),
-                    user_id=cluster_user.id,
-                    user=cluster_user,
+                    user_id=cluster_principal.id,
+                    user=cluster_principal,
                 )
                 await ApiKey.create(session, new_key, auto_commit=False)
                 token = f"{API_KEY_PREFIX}_{access_key}_{secret_key}"
@@ -728,7 +1060,7 @@ class Server:
             routes=model_routes,
             k8s_config=k8s_config,
         )
-        await cleanup_generic_route_transformer(
+        await cleanup_generic_proxy_router(
             routes=model_routes,
             k8s_config=k8s_config,
             namespace=self.config.gateway_namespace,
@@ -752,8 +1084,8 @@ class Server:
     async def _init_default_cluster(self, session: AsyncSession):
         if not self._should_create_default_cluster():
             return
-        default_cluster_user = await get_default_cluster_user(session)
-        if default_cluster_user:
+        default_cluster_principal = await get_default_cluster_principal(session)
+        if default_cluster_principal:
             return
         user_defined_default_cluster = await self.user_defined_default_cluster(session)
         set_default = user_defined_default_cluster is None
@@ -770,22 +1102,21 @@ class Server:
             hashed_suffix=hashed_suffix,
             registration_token="",
             is_default=set_default,
-            owner_principal_id=PLATFORM_PRINCIPAL_ID,
+            owner_principal_id=platform_principal_id(),
         )
         default_cluster = await Cluster.create(
             session, default_cluster, auto_commit=False
         )
 
-        default_cluster_user = User(
-            username=default_cluster_user_name,
-            is_system=True,
-            is_admin=False,
-            require_password_change=False,
-            role=UserRole.Cluster,
-            hashed_password="",
-            cluster=default_cluster,
+        default_cluster_principal = Principal(
+            name=default_cluster_principal_name,
+            kind=PrincipalType.SYSTEM,
         )
-        await create_user_with_principal(session, default_cluster_user)
+        default_cluster_principal = await Principal.create(
+            session, default_cluster_principal, auto_commit=False
+        )
+        default_cluster.system_principal_id = default_cluster_principal.id
+        await default_cluster.save(session=session, auto_commit=False)
 
         # No cluster_access grant needed: the cluster's `owner_principal_id`
         # already binds it to the platform Org, whose members are
@@ -803,7 +1134,7 @@ class Server:
             session=session,
             fields={
                 "is_default": True,
-                "owner_principal_id": PLATFORM_PRINCIPAL_ID,
+                "owner_principal_id": platform_principal_id(),
                 "deleted_at": None,
             },
         )
@@ -888,21 +1219,32 @@ class Server:
                     )
 
     async def _prepare_jwt_secret_key(self):
-        """Enforce that distributed deployments use an explicit JWT secret.
+        """Enforce that in-cluster distributed deployments use an explicit JWT secret.
 
         ``Config`` auto-generates a local ``jwt_secret_key`` file during init
         so early startup paths (e.g. ``initialize_gateway``) have a usable key.
-        That auto-generated value is safe only in single-node mode; distributed
-        instances must share the SAME secret or JWTs signed by one instance
-        won't verify on another. We rely on the ``_jwt_secret_key_user_provided``
-        flag (set from --jwt-secret-key / GPUSTACK_JWT_SECRET_KEY / config file)
-        rather than the current value, since the value is always populated by
-        the time this runs.
+        That auto-generated value is safe only when a single instance owns the
+        secret; distributed instances must share the SAME secret or JWTs signed
+        by one instance won't verify on another. We rely on the
+        ``_jwt_secret_key_user_provided`` flag (set from --jwt-secret-key /
+        GPUSTACK_JWT_SECRET_KEY / config file) rather than the current value,
+        since the value is always populated by the time this runs.
+
+        A single-container deployment (e.g. a plain ``docker run`` against an
+        external database) still selects a distributed coordinator, but it owns
+        the secret alone: the persisted ``<data_dir>/jwt_secret_key`` stays
+        stable across restarts on a mounted volume, so the auto-generated key is
+        safe and we don't force one. Only in-cluster deployments run instances
+        that each own an ephemeral ``data_dir``, so the explicit secret is
+        required there.
         """
         if self._config._jwt_secret_key_user_provided:
             return
 
         if isinstance(self._coordinator, LocalCoordinator):
+            return
+
+        if not is_inside_kubernetes():
             return
 
         raise RuntimeError(
@@ -989,6 +1331,9 @@ class Server:
 
         # Usage Details Archiver (move aged rows to archive table)
         self._start_usage_details_archiver()
+
+        # Resource usage metering (event logger → collectors → archiver)
+        self._start_resource_usage()
 
         # Worker Syncer (checks worker reachability and updates states)
         self._start_worker_syncer(self._app)

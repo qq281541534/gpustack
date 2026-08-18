@@ -1,15 +1,15 @@
 import logging
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 from gpustack.policies.base import WorkerFilter
 from gpustack.schemas.models import Model, get_backend, BackendEnum
 from gpustack.schemas.workers import Worker
 from gpustack.schemas.inference_backend import (
     InferenceBackend,
+    VersionConfig,
 )
 from gpustack.server.db import async_session
 from gpustack_runner import list_service_runners
-from gpustack_runtime.deployer.__utils__ import compare_versions
 from gpustack_runtime.detector.ascend import get_ascend_cann_variant
 from gpustack_runtime.detector import ManufacturerEnum
 
@@ -52,79 +52,81 @@ class BackendFrameworkFilter(WorkerFilter):
             query_conditions.add(("cpu", None, self.model.backend_version, None))
         return list(query_conditions)
 
-    async def _has_lower_runners(self, **kwargs) -> Tuple[bool, List[str]]:
-        backend_version = kwargs.get("backend_version")
-        if backend_version:
-            kwargs.pop("backend_version")
-        # Since backend versions are backward compatible,
-        # if an exact version match cannot be found, we can try to see if a lower version is available.
-        runners_list = list_service_runners(**kwargs)
-        supported_runtime_versions = []
-        for runner in runners_list:
-            if not runner.versions or len(runner.versions) == 0:
+    def _visible_version_configs(
+        self,
+        inference_backends: List[InferenceBackend],
+    ) -> Dict[str, VersionConfig]:
+        """
+        Version configs of this model's backend visible under the Hybrid
+        scope: the Platform row (owner_principal_id IS NULL) merged with the
+        model owner's row, whose keys override the Platform ones. Rows owned
+        by other principals are ignored.
+        """
+        # getattr, NOT direct access: the scheduler deploys persisted
+        # Model rows, but the evaluator drives this same filter through
+        # find_candidate with a ModelSpec (compatibility checks before a
+        # model exists), which carries no owner_principal_id — pydantic
+        # raises AttributeError on direct access. Unowned specs fall back
+        # to Platform-only visibility.
+        owner_id = getattr(self.model, "owner_principal_id", None)
+        platform_row = None
+        owner_row = None
+        for b in inference_backends:
+            if b.backend_name != self.backend_name:
                 continue
-            try:
-                runner_version = runner.versions[0].backends[0].versions[0].version
-                if compare_versions(runner_version, backend_version) <= 0:
-                    return True, []
-                supported_runtime_versions.append(runner_version)
-            except Exception:
-                pass
-
-        return False, supported_runtime_versions
+            if b.owner_principal_id is None:
+                platform_row = b
+            elif b.owner_principal_id == owner_id:
+                owner_row = b
+        merged: Dict[str, VersionConfig] = {}
+        for row in (platform_row, owner_row):
+            if row and row.version_configs and row.version_configs.root:
+                merged.update(row.version_configs.root)
+        return merged
 
     async def _has_supported_runners(
         self,
         inference_backends: List[InferenceBackend],
         gpu_type: str,
-        runtime_version: Optional[str],
         backend_version: Optional[str],
         variant: Optional[str],
-    ) -> Tuple[bool, List[str]]:
+    ) -> bool:
         """
-        Get supported runner versions for given GPU configuration.
+        Check whether a supported runner exists for the given GPU configuration.
 
         Args:
             gpu_type: GPU type (cuda, rocm, cann)
-            runtime_version: GPU runtime version (e.g., "12.4")
             backend_version: Inference Backend version (e.g., "0.11.0")
             variant: Variant for Ascend GPUs (CANN version)
 
         Returns:
-            Tuple of (is_supported, supported_runtime_versions)
+            True if a supported runner exists, False otherwise.
         """
-        backend = next(
-            (b for b in inference_backends if b.backend_name == self.backend_name),
-            None,
-        )
+        version_configs = self._visible_version_configs(inference_backends)
+        for version, version_config in version_configs.items():
+            if backend_version and backend_version != version:
+                continue
 
-        if backend and backend.version_configs and backend.version_configs.root:
-            for version, version_config in backend.version_configs.root.items():
-                if backend_version and backend_version != version:
-                    continue
+            # Check if gpu_type is supported by custom_framework
+            is_custom_supported = version_config.custom_framework and (
+                version_config.custom_framework == "cpu"
+                or gpu_type == version_config.custom_framework
+            )
 
-                # Check if gpu_type is supported by custom_framework
-                is_custom_supported = version_config.custom_framework and (
-                    version_config.custom_framework == "cpu"
-                    or gpu_type == version_config.custom_framework
-                )
+            # Check if gpu_type is supported by built_in_frameworks
+            is_built_in_supported = version_config.built_in_frameworks and (
+                "cpu" in version_config.built_in_frameworks
+                or gpu_type in version_config.built_in_frameworks
+            )
 
-                # Check if gpu_type is supported by built_in_frameworks
-                is_built_in_supported = version_config.built_in_frameworks and (
-                    "cpu" in version_config.built_in_frameworks
-                    or gpu_type in version_config.built_in_frameworks
-                )
-
-                # GPU is supported if either custom or built-in framework supports it
-                if is_custom_supported or is_built_in_supported:
-                    return True, []
+            # GPU is supported if either custom or built-in framework supports it
+            if is_custom_supported or is_built_in_supported:
+                return True
 
         kwargs = {
             "backend": gpu_type,
             "service": self.backend_name.lower(),
         }
-        if runtime_version:
-            kwargs["backend_version"] = runtime_version
         if variant:
             kwargs["backend_variant"] = variant
 
@@ -138,9 +140,9 @@ class BackendFrameworkFilter(WorkerFilter):
 
         runners_list = list_service_runners(**kwargs)
         if runners_list and len(runners_list) > 0:
-            return True, []
+            return True
 
-        return await self._has_lower_runners(**kwargs)
+        return False
 
     async def filter(self, workers: List[Worker]) -> Tuple[List[Worker], List[str]]:
         """
@@ -183,10 +185,9 @@ class BackendFrameworkFilter(WorkerFilter):
                 # Check framework compatibility
 
                 # Get supported runners for this GPU configuration
-                is_supported, supported_versions = await self._has_supported_runners(
+                is_supported = await self._has_supported_runners(
                     inference_backends,
                     gpu_type,
-                    runtime_version,
                     backend_version,
                     variant,
                 )
@@ -217,11 +218,6 @@ class BackendFrameworkFilter(WorkerFilter):
                             reason_text += (
                                 f"GPU device ({gpu_type} {runtime_version or ''})"
                             )
-                        reason_text += (
-                            f", The supported runtimes are {gpu_type} {', '.join(supported_versions)}"
-                            if supported_versions
-                            else ""
-                        )
                         incompatible_reasons.append(reason_text)
 
             if is_compatible:

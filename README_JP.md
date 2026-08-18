@@ -10,8 +10,6 @@
         <img alt="Documentation" src="https://img.shields.io/badge/ドキュメント-GPUStack-blue?logo=readthedocs&logoColor=white"></a>
     <a href="./LICENSE" target="_blank">
         <img alt="License" src="https://img.shields.io/github/license/gpustack/gpustack?logo=github&logoColor=white&label=License&color=blue"></a>
-    <a href="./docs/assets/wechat-group-qrcode.jpg" target="_blank">
-        <img alt="WeChat" src="https://img.shields.io/badge/微信群-GPUStack-blue?logo=wechat&logoColor=white"></a>
     <a href="https://discord.gg/VXYJzuaqwD" target="_blank">
         <img alt="Discord" src="https://img.shields.io/badge/Discord-GPUStack-blue?logo=discord&logoColor=white"></a>
     <a href="https://twitter.com/intent/follow?screen_name=gpustack_ai" target="_blank">
@@ -29,11 +27,12 @@
 
 ## 概要
 
-GPUStackは、効率的なAIモデルデプロイメントのために設計されたオープンソースのGPUクラスタマネージャーです。推論エンジン（vLLM、SGLang、TensorRT-LLM、またはカスタムエンジン）を構成・オーケストレーションし、GPUクラスタ全体のパフォーマンスを最適化します。主な機能は以下の通りです：
+GPUStackは、AIモデルサービングとGPUインスタンスプロビジョニングのためのオープンソースのGPUクラスタマネージャーです。推論エンジン（vLLM、SGLang、TensorRT-LLM、またはカスタムエンジン）を構成・オーケストレーションし、オンデマンドでSSHアクセス可能なGPUインスタンスを起動できます。主な機能は以下の通りです：
 - **マルチクラスタGPU管理。** 複数の環境にわたるGPUクラスタを管理します。これには、オンプレミスサーバー、Kubernetesクラスタ、およびクラウドプロバイダが含まれます。
 - **プラグ可能な推論エンジン。** vLLM、SGLang、TensorRT-LLMなどの高性能推論エンジンを自動的に設定します。必要に応じてカスタム推論エンジンを追加することもできます。
 - **Day 0モデルサポート。** GPUStackのプラグ可能なエンジンアーキテクチャにより、新しいモデルがリリースされた当日にデプロイできます。
 - **パフォーマンス最適化設定。** 低レイテンシまたは高スループット向けの事前調整済みモードを提供します。GPUStackは、LMCacheやHiCacheなどの拡張KVキャッシュシステムをサポートし、TTFTを削減します。また、EAGLE3、MTP、N-gramなどの投機的デコード手法の組み込みサポートも含まれます。
+- **GPUインスタンス。** オンデマンドでSSHアクセス可能なGPUインスタンスを起動し、開発、ファインチューニング、対話的なワークロードに対応します。
 - **エンタープライズグレードの運用。** 自動化された障害回復、負荷分散、監視、認証、およびアクセス制御のサポートを提供します。
 
 ## アーキテクチャ
@@ -48,7 +47,7 @@ GPUStackは、開発チーム、IT組織、およびサービスプロバイダ�
 
 GPUStackの自動化されたエンジン選択とパラメータ最適化により、すぐに使える強力な推論パフォーマンスを提供します。以下の図は、デフォルトのvLLM設定と比較したスループットの向上を示しています：
 
-![a100-throughput-comparison](docs/assets/a100-throughput-comparison.png)
+![h200-throughput-comparison](docs/assets/h200-throughput-comparison.png)
 
 詳細なベンチマーク方法と結果については、[推論パフォーマンスラボ](https://docs.gpustack.ai/latest/performance-lab/overview/)をご覧ください。
 
@@ -145,23 +144,23 @@ sudo docker exec gpustack cat /var/lib/gpustack/initial_admin_password
 
 1. GPUStack UIの`Catalog`ページに移動します。
 
-2. 利用可能なモデルのリストから`Qwen3 0.6B`モデルを選択します。
-
-3. デプロイ互換性チェックが通過した後、`Save`ボタンをクリックしてモデルをデプロイします。
+2. 利用可能なモデルのリストから`Qwen3.5-0.8B`モデルを選択します。
 
 ![カタログからqwen3をデプロイ](docs/assets/quick-start/quick-start-qwen3.png)
+
+3. デプロイ互換性チェックが通過した後、`Save`ボタンをクリックしてモデルをデプロイします。
 
 4. GPUStackはモデルファイルのダウンロードとモデルのデプロイを開始します。デプロイステータスが`Running`と表示されたら、モデルは正常にデプロイされています。
 
 ![モデルが実行中](docs/assets/quick-start/model-running.png)
 
-5. ナビゲーションメニューで`Playground - Chat`をクリックし、右上の`Model`ドロップダウンからモデル`qwen3-0.6b`が選択されていることを確認します。これでUIプレイグラウンドでモデルとチャットできるようになります。
+5. ナビゲーションメニューで`Playground - Chat`をクリックし、右上の`Model`ドロップダウンからモデル`qwen3.5-0.8b`が選択されていることを確認します。これでUIプレイグラウンドでモデルとチャットできるようになります。
 
 ![クイックチャット](docs/assets/quick-start/quick-chat.png)
 
 ### API経由でモデルを使用
 
-1. ユーザーアバターにカーソルを合わせて`API Keys`ページに移動し、`New API Key`ボタンをクリックします。
+1. `Access Control` > `API Keys`ページに移動し、`New API Key`ボタンをクリックします。
 
 2. `Name`を入力し、`Save`ボタンをクリックします。
 
@@ -177,7 +176,7 @@ curl http://your_gpustack_server_url/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $GPUSTACK_API_KEY" \
   -d '{
-    "model": "qwen3-0.6b",
+    "model": "qwen3.5-0.8b",
     "messages": [
       {
         "role": "system",
@@ -198,11 +197,9 @@ curl http://your_gpustack_server_url/v1/chat/completions \
 
 ## ビルド
 
-1. Python（バージョン3.10から3.12）をインストールします。
+1. [Docker](https://docs.docker.com/engine/install/) をインストールします。
 
-2. `make build`を実行します。
-
-ビルドされたwheelパッケージは`dist`ディレクトリにあります。
+2. `make package` を実行します。
 
 ## 貢献
 

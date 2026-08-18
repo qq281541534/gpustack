@@ -11,6 +11,8 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from sqlmodel import select
 
+from gpustack.server.db import async_session
+
 from gpustack.api.exceptions import (
     AlreadyExistsException,
     ConflictException,
@@ -28,10 +30,10 @@ from gpustack.schemas.organizations import (
     validate_org_input,
 )
 from gpustack.schemas.principals import (
-    PLATFORM_PRINCIPAL_ID,
     OrgRole,
     Principal,
     PrincipalType,
+    platform_principal_id,
 )
 from gpustack.server.deps import SessionDep, TenantContextDep
 
@@ -45,13 +47,12 @@ def _to_public(p: Principal) -> OrganizationPublic:
 
 @router.get("", response_model=OrganizationsPublic)
 async def get_organizations(
-    session: SessionDep,
     params: OrganizationListParams = Depends(),
     search: Optional[str] = None,
 ):
     fuzzy_fields = {}
     if search:
-        fuzzy_fields = {"name": search, "slug": search}
+        fuzzy_fields = {"name": search, "display_name": search}
 
     fields = {"deleted_at": None, "kind": PrincipalType.ORG}
 
@@ -61,15 +62,16 @@ async def get_organizations(
             media_type="text/event-stream",
         )
 
-    page = await Principal.paginated_by_query(
-        session=session,
-        fields=fields,
-        fuzzy_fields=fuzzy_fields,
-        page=params.page,
-        per_page=params.perPage,
-        order_by=params.order_by,
-    )
-    page.items = [_to_public(p) for p in page.items]
+    async with async_session() as session:
+        page = await Principal.paginated_by_query(
+            session=session,
+            fields=fields,
+            fuzzy_fields=fuzzy_fields,
+            page=params.page,
+            per_page=params.perPage,
+            order_by=params.order_by,
+        )
+        page.items = [_to_public(p) for p in page.items]
     return page
 
 
@@ -83,28 +85,38 @@ async def get_organization(session: SessionDep, id: int):
 
 @router.post("", response_model=OrganizationPublic)
 async def create_organization(session: SessionDep, org_in: OrganizationCreate):
-    # Block reserved names ("Personal" / "Global") and slug patterns
-    # ("user-N") on the input side. Validation lives in the route, not
-    # the schema, so the same model can serialize already-existing
-    # auto-created USER-principals without rejecting them.
+    # Block reserved display-names ("Personal" / "Global") and name
+    # patterns ("user-N") on the input side. Validation lives in the
+    # route, not the schema, so the same model can serialize
+    # already-existing auto-created USER-principals without rejecting
+    # them.
     try:
-        validate_org_input(name=org_in.name, slug=org_in.slug)
+        validate_org_input(display_name=org_in.display_name, name=org_in.name)
     except ValueError as e:
         raise InvalidException(message=str(e))
 
-    existing = await Principal.one_by_fields(
-        session, {"slug": org_in.slug, "deleted_at": None}
-    )
+    # ORG has its own name namespace (see partitioning rationale on
+    # ``Principal.name``); a same-named USER / SYSTEM / GROUP lives in a
+    # separate partition and does not block Org creation.
+    existing = (
+        await session.exec(
+            select(Principal).where(
+                Principal.name == org_in.name,
+                Principal.kind == PrincipalType.ORG,
+                Principal.deleted_at.is_(None),
+            )
+        )
+    ).first()
     if existing:
         raise AlreadyExistsException(
-            message=f"Organization with slug '{org_in.slug}' already exists"
+            message=f"Organization with name '{org_in.name}' already exists."
         )
 
     try:
         to_create = Principal(
             kind=PrincipalType.ORG,
             name=org_in.name,
-            slug=org_in.slug,
+            display_name=org_in.display_name,
             description=org_in.description,
         )
         created = await Principal.create(session, to_create)
@@ -122,7 +134,7 @@ async def update_organization(session: SessionDep, id: int, org_in: Organization
         raise NotFoundException(message="Organization not found")
 
     try:
-        validate_org_input(name=org_in.name)
+        validate_org_input(display_name=org_in.display_name)
     except ValueError as e:
         raise InvalidException(message=str(e))
 
@@ -140,7 +152,7 @@ async def delete_organization(session: SessionDep, id: int):
     org = await Principal.one_by_id(session, id)
     if not org or org.deleted_at is not None or org.kind != PrincipalType.ORG:
         raise NotFoundException(message="Organization not found")
-    if org.id == PLATFORM_PRINCIPAL_ID:
+    if org.id == platform_principal_id():
         raise ConflictException(
             message="The built-in platform organization cannot be deleted"
         )
@@ -205,17 +217,26 @@ async def _has_resources(session, owner_principal_id: int) -> list[str]:
         if (await session.exec(stmt)).first() is not None:
             blockers.append(label)
 
-    # Child principals (groups belonging to this org).
-    group_stmt = (
-        select(Principal.id)
+    # Group memberships into this Org — Group-principals are peer-level
+    # now, but if any are still joined to this Org via an active
+    # ``principal_memberships`` row, surface that to the operator before
+    # the Org is deleted. The grant rows themselves CASCADE on Org
+    # delete, but the Groups don't, so block to make the operator
+    # explicit.
+    from gpustack.schemas.principals import PrincipalMembership
+
+    group_member_stmt = (
+        select(PrincipalMembership.id)
+        .join(Principal, Principal.id == PrincipalMembership.member_principal_id)
         .where(
+            PrincipalMembership.parent_principal_id == owner_principal_id,
+            PrincipalMembership.deleted_at.is_(None),
             Principal.kind == PrincipalType.GROUP,
-            Principal.parent_principal_id == owner_principal_id,
             Principal.deleted_at.is_(None),
         )
         .limit(1)
     )
-    if (await session.exec(group_stmt)).first() is not None:
+    if (await session.exec(group_member_stmt)).first() is not None:
         blockers.append("user_groups")
 
     return blockers
@@ -243,7 +264,7 @@ async def list_organization_directory(
         raise ForbiddenException(message="Insufficient permission")
     fuzzy_fields = {}
     if search:
-        fuzzy_fields = {"name": search, "slug": search}
+        fuzzy_fields = {"name": search, "display_name": search}
     fields = {"deleted_at": None, "kind": PrincipalType.ORG}
     page_data = await Principal.paginated_by_query(
         session=session,

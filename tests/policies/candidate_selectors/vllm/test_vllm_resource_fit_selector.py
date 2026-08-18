@@ -1,5 +1,6 @@
 import pytest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from tests.utils.mock import mock_async_session
 
@@ -15,9 +16,11 @@ from gpustack.schemas.models import (
     CategoryEnum,
     ComputedResourceClaim,
     ExtendedKVCacheConfig,
+    LoraListEntry,
     ModelInstanceStateEnum,
     ModelInstanceSubordinateWorker,
     BackendEnum,
+    SourceEnum,
 )
 from tests.fixtures.workers.fixtures import (
     linux_mix_1_nvidia_4080_16gx1_rocm_7800_16gx1,
@@ -39,6 +42,7 @@ from tests.fixtures.workers.fixtures import (
     linux_nvidia_26_H200_141gx8,
 )
 from tests.utils.scheduler import compare_candidates
+from gpustack.utils.unit import byte_to_gib
 
 
 def expected_candidate(
@@ -567,7 +571,267 @@ async def test_select_candidates(
     with (
         patch(
             'gpustack.scheduler.scheduler.BackendFrameworkFilter._has_supported_runners',
-            return_value=(True, []),
+            return_value=True,
+        ),
+        patch(
+            'gpustack.schemas.workers.Worker.all',
+            return_value=workers,
+        ),
+        patch(
+            'gpustack.policies.worker_filters.backend_framework_filter.async_session',
+            return_value=mock_async_session(),
+        ),
+        patch(
+            'gpustack.policies.scorers.placement_scorer.async_session',
+            return_value=mock_async_session(),
+        ),
+        patch(
+            'gpustack.policies.scorers.model_file_locality_scorer.async_session',
+            return_value=mock_async_session(),
+        ),
+    ):
+        m.backend = BackendEnum.VLLM.value
+
+        mis = []
+
+        resource_fit_selector = VLLMResourceFitSelector(config, m, mis)
+        placement_scorer = PlacementScorer(m, mis)
+
+        actual_candidates = await resource_fit_selector.select_candidates(workers)
+        actual_candidates = await placement_scorer.score(actual_candidates)
+        actual_candidate, _ = await scheduler.find_candidate(config, m, workers, mis)
+
+        try:
+            assert len(actual_candidates) == len(expected_candidates)
+            compare_candidates(actual_candidates, expected_candidates)
+            compare_candidates(
+                [actual_candidate], [expected_candidates[final_candidate_index]]
+            )
+        except AssertionError as e:
+            raise AssertionError(f"Test case '{case_name}' failed: {str(e)}") from e
+
+
+@pytest.mark.parametrize(
+    "case_name, m, workers, expected_candidates, final_candidate_index",
+    [
+        # Headless mode sentinel (--data-parallel-backend mp) without explicit
+        # TP/DP. Scheduler should fall through the vram-based multi-worker
+        # path exactly like the ray path — sentinel only affects worker-side
+        # command construction.
+        # Check point:
+        # - Headless sentinel does not break auto multi-worker scheduling.
+        (
+            "headless_auto_schedule_16_gpus_2_workers_deepseek_r1",
+            make_model(
+                0,
+                None,
+                "deepseek-ai/DeepSeek-R1",
+                backend_parameters=["--data-parallel-backend=mp"],
+            ),
+            [
+                linux_nvidia_1_4090_24gx1(),
+                linux_nvidia_3_4090_24gx1(),
+                linux_nvidia_22_H100_80gx8(),
+                linux_nvidia_23_H100_80gx8(),
+                linux_nvidia_24_H100_80gx8(),
+                linux_nvidia_25_H100_80gx8(),
+            ],
+            [
+                expected_candidate(
+                    22,
+                    "host22-h100",
+                    [0, 1, 2, 3, 4, 5, 6, 7],
+                    {
+                        0: 77309411328,
+                        1: 77309411328,
+                        2: 77309411328,
+                        3: 77309411328,
+                        4: 77309411328,
+                        5: 77309411328,
+                        6: 77309411328,
+                        7: 77309411328,
+                    },
+                    [
+                        ModelInstanceSubordinateWorker(
+                            worker_id=23,
+                            worker_ip="192.168.50.23",
+                            total_gpus=8,
+                            gpu_indexes=[0, 1, 2, 3, 4, 5, 6, 7],
+                            computed_resource_claim=ComputedResourceClaim(
+                                vram={
+                                    0: 77309411328,
+                                    1: 77309411328,
+                                    2: 77309411328,
+                                    3: 77309411328,
+                                    4: 77309411328,
+                                    5: 77309411328,
+                                    6: 77309411328,
+                                    7: 77309411328,
+                                },
+                            ),
+                        ),
+                    ],
+                )
+            ],
+            0,
+        ),
+        # Issue #5089 regression: TP=8 DP=2 DP-Local=1 in headless mode on a
+        # 2x8 GPU H100 cluster. Prior to the fix --data-parallel-size-local
+        # was parsed only when on the same line as other args, causing the
+        # scheduler to reject otherwise valid candidates.
+        # Check point:
+        # - world_size = TP * DP = 16 (not multiplied by DPL).
+        # - Multi-worker auto-select returns 2x H100 workers, 8 GPU each.
+        (
+            "headless_5089_tp8_dp2_dpl1_2x_h100",
+            make_model(
+                0,
+                None,
+                "deepseek-ai/DeepSeek-R1",
+                backend_parameters=[
+                    "--tensor-parallel-size=8",
+                    "--data-parallel-size=2",
+                    "--data-parallel-size-local=1",
+                    "--data-parallel-backend=mp",
+                ],
+            ),
+            [
+                linux_nvidia_22_H100_80gx8(),
+                linux_nvidia_23_H100_80gx8(),
+            ],
+            [
+                expected_candidate(
+                    22,
+                    "host22-h100",
+                    [0, 1, 2, 3, 4, 5, 6, 7],
+                    {
+                        0: 77309411328,
+                        1: 77309411328,
+                        2: 77309411328,
+                        3: 77309411328,
+                        4: 77309411328,
+                        5: 77309411328,
+                        6: 77309411328,
+                        7: 77309411328,
+                    },
+                    [
+                        ModelInstanceSubordinateWorker(
+                            worker_id=23,
+                            worker_ip="192.168.50.23",
+                            total_gpus=8,
+                            gpu_indexes=[0, 1, 2, 3, 4, 5, 6, 7],
+                            computed_resource_claim=ComputedResourceClaim(
+                                vram={
+                                    0: 77309411328,
+                                    1: 77309411328,
+                                    2: 77309411328,
+                                    3: 77309411328,
+                                    4: 77309411328,
+                                    5: 77309411328,
+                                    6: 77309411328,
+                                    7: 77309411328,
+                                },
+                            ),
+                        ),
+                    ],
+                )
+            ],
+            0,
+        ),
+        # Headless mode scaling to 3 nodes via DP=3 DP-Local=1.
+        # Check point:
+        # - world_size = TP * DP = 24, scheduler picks 3x H100 workers.
+        # - The per-node DP-Local stays 1 (g_per_node=8, tp=8).
+        (
+            "headless_tp8_dp3_dpl1_3x_h100",
+            make_model(
+                0,
+                None,
+                "deepseek-ai/DeepSeek-R1",
+                backend_parameters=[
+                    "--tensor-parallel-size=8",
+                    "--data-parallel-size=3",
+                    "--data-parallel-size-local=1",
+                    "--data-parallel-backend=mp",
+                ],
+            ),
+            [
+                linux_nvidia_22_H100_80gx8(),
+                linux_nvidia_23_H100_80gx8(),
+                linux_nvidia_24_H100_80gx8(),
+            ],
+            [
+                expected_candidate(
+                    22,
+                    "host22-h100",
+                    [0, 1, 2, 3, 4, 5, 6, 7],
+                    {
+                        0: 77309411328,
+                        1: 77309411328,
+                        2: 77309411328,
+                        3: 77309411328,
+                        4: 77309411328,
+                        5: 77309411328,
+                        6: 77309411328,
+                        7: 77309411328,
+                    },
+                    [
+                        ModelInstanceSubordinateWorker(
+                            worker_id=23,
+                            worker_ip="192.168.50.23",
+                            total_gpus=8,
+                            gpu_indexes=[0, 1, 2, 3, 4, 5, 6, 7],
+                            computed_resource_claim=ComputedResourceClaim(
+                                vram={
+                                    0: 77309411328,
+                                    1: 77309411328,
+                                    2: 77309411328,
+                                    3: 77309411328,
+                                    4: 77309411328,
+                                    5: 77309411328,
+                                    6: 77309411328,
+                                    7: 77309411328,
+                                },
+                            ),
+                        ),
+                        ModelInstanceSubordinateWorker(
+                            worker_id=24,
+                            worker_ip="192.168.50.24",
+                            total_gpus=8,
+                            gpu_indexes=[0, 1, 2, 3, 4, 5, 6, 7],
+                            computed_resource_claim=ComputedResourceClaim(
+                                vram={
+                                    0: 77309411328,
+                                    1: 77309411328,
+                                    2: 77309411328,
+                                    3: 77309411328,
+                                    4: 77309411328,
+                                    5: 77309411328,
+                                    6: 77309411328,
+                                    7: 77309411328,
+                                },
+                            ),
+                        ),
+                    ],
+                )
+            ],
+            0,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_select_candidates_headless(
+    config, case_name, m, workers, expected_candidates, final_candidate_index
+):
+    """
+    Auto-scheduling under vLLM headless mode (sentinel `--data-parallel-backend mp`).
+    Verifies that the scheduler still produces correct multi-worker candidates
+    and that the #5089 fix (DP-Local parsing + world_size formula) holds.
+    """
+    with (
+        patch(
+            'gpustack.scheduler.scheduler.BackendFrameworkFilter._has_supported_runners',
+            return_value=True,
         ),
         patch(
             'gpustack.schemas.workers.Worker.all',
@@ -818,7 +1082,7 @@ async def test_select_candidates_from_different_gpu_types(
     with (
         patch(
             'gpustack.scheduler.scheduler.BackendFrameworkFilter._has_supported_runners',
-            return_value=(True, []),
+            return_value=True,
         ),
         patch(
             'gpustack.schemas.workers.Worker.all',
@@ -1429,3 +1693,89 @@ async def test_output_schedule_msg(config, index, workers, model, expect_msg):
         _ = await placement_scorer.score(candidates)
 
         assert resource_fit_selector._messages == expect_msg
+
+
+@pytest.mark.asyncio
+async def test_lora_vram_claim_in_output_schedule_msg(config):
+    """
+    When LoRA adapters are configured, estimate_model_vram includes LoRA weights in
+    (base + lora) * 1.2 + 2 GiB framework overhead; the schedule message reflects the
+    combined claim (insufficient VRAM on available workers).
+    """
+    base_bytes = 56 * 1024**3
+    lora_bytes = 8 * 1024**3
+    lora_repo = "user/lora-adapter-vram-test"
+    expected_vram = int((base_bytes + lora_bytes) * 1.2) + 2 * 1024**3
+    expected_gib = byte_to_gib(expected_vram)
+    expected_total_gib = byte_to_gib(int(expected_vram / 0.9))
+
+    # Minimal HF-like config so _init_model_parameters does not download from the hub.
+    mock_pretrained = SimpleNamespace(
+        architectures=["Qwen2ForCausalLM"],
+        num_attention_heads=64,
+        num_key_value_heads=8,
+        hidden_size=4096,
+        vocab_size=152064,
+        num_hidden_layers=64,
+        torch_dtype="bfloat16",
+        max_position_embeddings=32768,
+    )
+
+    def fake_get_model_weight_size(model, token=None):
+        if model.huggingface_repo_id == lora_repo:
+            return lora_bytes
+        return base_bytes
+
+    workers = [linux_nvidia_4_4080_16gx4()]
+    m = make_model(
+        1,
+        None,
+        "Qwen/Qwen3-32B",
+        lora_list=[
+            LoraListEntry(
+                lora_name="adapter1",
+                lora_repo_name=lora_repo,
+                source=SourceEnum.HUGGING_FACE.value,
+            )
+        ],
+    )
+    mis = []
+
+    resource_fit_selector = VLLMResourceFitSelector(config, m, mis)
+    placement_scorer = PlacementScorer(m, mis)
+
+    with (
+        patch(
+            "gpustack.policies.candidate_selectors.base_candidate_selector.get_pretrained_config_with_workers",
+            new=AsyncMock(return_value=mock_pretrained),
+        ),
+        patch(
+            "gpustack.policies.utils.get_model_weight_size",
+            side_effect=fake_get_model_weight_size,
+        ),
+        patch(
+            "gpustack.schemas.workers.Worker.all",
+            return_value=workers,
+        ),
+        patch(
+            "gpustack.policies.worker_filters.backend_framework_filter.async_session",
+            return_value=mock_async_session(),
+        ),
+        patch(
+            "gpustack.policies.scorers.placement_scorer.async_session",
+            return_value=mock_async_session(),
+        ),
+        patch(
+            "gpustack.policies.scorers.model_file_locality_scorer.async_session",
+            return_value=mock_async_session(),
+        ),
+    ):
+        candidates = await resource_fit_selector.select_candidates(workers)
+        _ = await placement_scorer.score(candidates)
+
+    expect_msg = [
+        f"""- The model requires approximately {expected_gib} GiB of VRAM.
+- With --gpu-memory-utilization=0.9, all GPUs combined need to provide at least {expected_total_gib} GiB of total VRAM and each GPU needs 90% of allocatable VRAM.
+- The largest available worker has 63.97 GiB allocatable VRAM, 4/4 of GPUs meet the VRAM utilization ratio, providing 57.57 GiB of allocatable VRAM."""
+    ]
+    assert resource_fit_selector._messages == expect_msg

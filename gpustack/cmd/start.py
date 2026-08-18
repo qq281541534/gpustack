@@ -241,8 +241,9 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
     server_group.add_argument(
         "--force-auth-localhost",
         action=OptionalBoolAction,
-        help="Force authentication for requests originating from localhost (127.0.0.1)."
-        "When set to True, all requests from localhost will require authentication.",
+        help="(DEPRECATED) No-op. Localhost callers are always authenticated; "
+        "this flag is retained for backwards compatibility with existing configurations "
+        "and will be removed in a future release.",
         default=get_gpustack_env_bool("FORCE_AUTH_LOCALHOST"),
     )
     server_group.add_argument(
@@ -360,6 +361,11 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         action='append',
         help='HTTP request headers allowed in cross-origin requests. Specify the flag multiple times for multiple headers. Example: --allow-headers Authorization --allow-headers X-API-Key --allow-headers Content-Type. Default: ["Authorization", "Content-Type", "X-API-Key"].',
     )
+    server_group.add_argument(
+        "--trusted-hosts",
+        action='append',
+        help='Allowlist for the X-Forwarded-Host header behind a reverse proxy. Specify the flag multiple times for multiple hosts. When unset, derived from --server-external-url. If both are unset, it defaults to "*" to trust any host (not recommended unless the server is only reachable via a trusted proxy).',
+    )
 
     # OIDC settings
     server_group.add_argument(
@@ -467,6 +473,44 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         default=get_gpustack_env("SAML_SECURITY"),
     )
 
+    # CAS settings
+    server_group.add_argument(
+        "--cas-server-url",
+        type=str,
+        help="CAS (Central Authentication Service) server base URL, e.g., 'https://cas.example.com/cas'. Setting this enables CAS login.",
+        default=get_gpustack_env("CAS_SERVER_URL"),
+    )
+    server_group.add_argument(
+        "--cas-callback-url",
+        type=str,
+        help="CAS callback URL registered with the CAS server. Defaults to `<server-url>/auth/cas/callback` when unset.",
+        default=get_gpustack_env("CAS_CALLBACK_URL"),
+    )
+    server_group.add_argument(
+        "--cas-validate-endpoint",
+        type=str,
+        help="CAS ticket validation endpoint, relative to --cas-server-url. Default: '/p3/serviceValidate' (CAS 3.0, returns attributes). Use '/serviceValidate' for pre-3.0 servers.",
+        default=get_gpustack_env("CAS_VALIDATE_ENDPOINT"),
+    )
+    server_group.add_argument(
+        "--cas-username-attribute",
+        type=str,
+        help="CAS XML attribute name to use as the GPUStack username. Defaults to the CAS `cas:user` element when unset.",
+        default=get_gpustack_env("CAS_USERNAME_ATTRIBUTE"),
+    )
+    server_group.add_argument(
+        "--cas-full-name-attribute",
+        type=str,
+        help="CAS XML attribute name to use as the user's full name, e.g., 'displayName'.",
+        default=get_gpustack_env("CAS_FULL_NAME_ATTRIBUTE"),
+    )
+    server_group.add_argument(
+        "--cas-avatar-attribute",
+        type=str,
+        help="CAS XML attribute name to use as the user's avatar URL.",
+        default=get_gpustack_env("CAS_AVATAR_ATTRIBUTE"),
+    )
+
     # External Authentication settings
     server_group.add_argument(
         "--external-auth-name",
@@ -491,6 +535,13 @@ def start_cmd_options(parser_server: argparse.ArgumentParser):
         action=OptionalBoolAction,
         help="Set newly created externally authenticated users inactive by default.",
         default=get_gpustack_env_bool("EXTERNAL_AUTH_DEFAULT_INACTIVE"),
+    )
+    server_group.add_argument(
+        "--external-auth-insecure-skip-tls-verify",
+        action=OptionalBoolAction,
+        help="Skip TLS verification for the external-auth IdP handshake "
+        "(OIDC/CAS). Testing against self-signed IdPs only; never in production.",
+        default=get_gpustack_env_bool("EXTERNAL_AUTH_INSECURE_SKIP_TLS_VERIFY"),
     )
     server_group.add_argument(
         "--external-auth-post-logout-redirect-key",
@@ -785,10 +836,12 @@ def set_server_options(args, config_data: dict):
         "allow_credentials",
         "allow_methods",
         "allow_headers",
+        "trusted_hosts",
         "external_auth_name",
         "external_auth_full_name",
         "external_auth_avatar_url",
         "external_auth_default_inactive",
+        "external_auth_insecure_skip_tls_verify",
         "oidc_issuer",
         "oidc_client_id",
         "oidc_client_secret",
@@ -807,6 +860,12 @@ def set_server_options(args, config_data: dict):
         "saml_sp_private_key",
         "saml_sp_attribute_prefix",
         "saml_security",
+        "cas_server_url",
+        "cas_callback_url",
+        "cas_validate_endpoint",
+        "cas_username_attribute",
+        "cas_full_name_attribute",
+        "cas_avatar_attribute",
         "server_external_url",
         "gateway_concurrency",
         "gateway_plugin_server_url",
@@ -867,4 +926,10 @@ def set_third_party_env(cfg: Config):
         logger.warning(
             "enable_hf_transfer is deprecated and ignored: hf_transfer support was "
             "removed in huggingface_hub v1.0. hf_xet is now the default downloader."
+        )
+    if cfg.force_auth_localhost is not None:
+        logger.warning(
+            "force_auth_localhost is deprecated and ignored: localhost callers "
+            "are always authenticated. This flag will be removed in a future "
+            "release."
         )

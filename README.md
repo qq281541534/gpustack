@@ -10,8 +10,6 @@
         <img alt="Documentation" src="https://img.shields.io/badge/Docs-GPUStack-blue?logo=readthedocs&logoColor=white"></a>
     <a href="./LICENSE" target="_blank">
         <img alt="License" src="https://img.shields.io/github/license/gpustack/gpustack?logo=github&logoColor=white&label=License&color=blue"></a>
-    <a href="./docs/assets/wechat-group-qrcode.jpg" target="_blank">
-        <img alt="WeChat" src="https://img.shields.io/badge/WeChat-GPUStack-blue?logo=wechat&logoColor=white"></a>
     <a href="https://discord.gg/VXYJzuaqwD" target="_blank">
         <img alt="Discord" src="https://img.shields.io/badge/Discord-GPUStack-blue?logo=discord&logoColor=white"></a>
     <a href="https://twitter.com/intent/follow?screen_name=gpustack_ai" target="_blank">
@@ -29,11 +27,12 @@
 
 ## Overview
 
-GPUStack is an open-source GPU cluster manager designed for efficient AI model deployment. It configures and orchestrates inference engines — vLLM, SGLang, TensorRT-LLM, or your own — to optimize performance across GPU clusters. Its core features include:
+GPUStack is an open-source GPU cluster manager for AI model serving and GPU instance provisioning. It configures and orchestrates inference engines — vLLM, SGLang, TensorRT-LLM, or your own — and lets you launch SSH-accessible GPU instances on demand. Its core features include:
 - **Multi-Cluster GPU Management.** Manages GPU clusters across multiple environments. This includes on-premises servers, Kubernetes clusters, and cloud providers.
 - **Pluggable Inference Engines.** Automatically configures high-performance inference engines such as vLLM, SGLang, and TensorRT-LLM. You can also add custom inference engines as needed.
 - **Day 0 Model Support.** GPUStack's pluggable engine architecture enables you to deploy new models on the day they are released.
 - **Performance-Optimized Configurations.** Offers pre-tuned modes for low latency or high throughput. GPUStack supports extended KV cache systems like LMCache and HiCache to reduce TTFT. It also includes built-in support for speculative decoding methods such as EAGLE3, MTP, and N-grams.
+- **GPU Instances.** Launches SSH-accessible GPU instances on demand for development, fine-tuning, and interactive workloads.
 - **Enterprise-Grade Operations.** Offers support for automated failure recovery, load balancing, monitoring, authentication, and access control.
 
 ## Architecture
@@ -48,7 +47,7 @@ The figure below illustrates how a single GPUStack server can manage multiple GP
 
 GPUStack's automated engine selection and parameter optimization deliver strong inference performance out of the box. The following figure shows throughput improvements over default vLLM configurations:
 
-![a100-throughput-comparison](docs/assets/a100-throughput-comparison.png)
+![h200-throughput-comparison](docs/assets/h200-throughput-comparison.png)
 
 For detailed benchmarking methods and results, visit our [Inference Performance Lab](https://docs.gpustack.ai/latest/performance-lab/overview/).
 
@@ -152,23 +151,23 @@ Open your browser and navigate to `http://your_host_ip` to access the GPUStack U
 
 1. Navigate to the `Catalog` page in the GPUStack UI.
 
-2. Select the `Qwen3 0.6B` model from the list of available models.
-
-3. After the deployment compatibility checks pass, click the `Save` button to deploy the model.
+2. Select the `Qwen3.5-0.8B` model from the list of available models.
 
 ![deploy qwen3 from catalog](docs/assets/quick-start/quick-start-qwen3.png)
+
+3. After the deployment compatibility checks pass, click the `Save` button to deploy the model.
 
 4. GPUStack will start downloading the model files and deploying the model. When the deployment status shows `Running`, the model has been deployed successfully.
 
 ![model is running](docs/assets/quick-start/model-running.png)
 
-5. Click `Playground - Chat` in the navigation menu, check that the model `qwen3-0.6b` is selected from the top-right `Model` dropdown. Now you can chat with the model in the UI playground.
+5. Click `Playground - Chat` in the navigation menu, check that the model `qwen3.5-0.8b` is selected from the top-right `Model` dropdown. Now you can chat with the model in the UI playground.
 
 ![quick chat](docs/assets/quick-start/quick-chat.png)
 
 ### Use the model via API
 
-1. Hover over the user avatar and navigate to the `API Keys` page, then click the `New API Key` button.
+1. Navigate to the `Access Control` > `API Keys` page, then click the `New API Key` button.
 
 2. Fill in the `Name` and click the `Save` button.
 
@@ -184,7 +183,7 @@ curl http://your_gpustack_server_url/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $GPUSTACK_API_KEY" \
   -d '{
-    "model": "qwen3-0.6b",
+    "model": "qwen3.5-0.8b",
     "messages": [
       {
         "role": "system",
@@ -205,11 +204,9 @@ Please see the [official docs site](https://docs.gpustack.ai) for complete docum
 
 ## Build
 
-1. Install Python (version 3.10 to 3.12).
+1. Install [Docker](https://docs.docker.com/engine/install/).
 
-2. Run `make build`.
-
-You can find the built wheel package in `dist` directory.
+2. Run `make package`.
 
 ## Contributing
 

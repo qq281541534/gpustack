@@ -13,9 +13,6 @@
   <a href="https://discord.gg/VXYJzuaqwD" target="_blank">
     <img alt="Discord" src="https://img.shields.io/badge/Discord-GPUStack-blue?logo=discord&logoColor=white">
   </a>
-  <a href="https://github.com/gpustack/gpustack/blob/main/docs/assets/wechat-group-qrcode.jpg" target="_blank">
-    <img alt="WeChat" src="https://img.shields.io/badge/微信群-GPUStack-blue?logo=wechat&logoColor=white">
-  </a>
 </p>
 
 <p align="center">
@@ -75,7 +72,7 @@ The figure below illustrates how a single GPUStack server can manage multiple GP
 
 GPUStack's automated engine selection and parameter optimization deliver strong inference performance out of the box. The following figure shows throughput improvements over default vLLM configurations:
 
-![a100-throughput-comparison](assets/a100-throughput-comparison.png)
+![h200-throughput-comparison](assets/h200-throughput-comparison.png)
 
 For detailed benchmarking methods and results, visit our [Inference Performance Lab](https://docs.gpustack.ai/latest/performance-lab/overview/).
 

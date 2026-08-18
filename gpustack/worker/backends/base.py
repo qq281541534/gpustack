@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import sys
 import shlex
 import json
@@ -28,9 +29,14 @@ from gpustack_runtime.deployer.docker import DockerWorkloadPlan
 from gpustack_runtime.deployer import WorkloadPlan
 
 from gpustack.client.generated_clientset import ClientSet
+from gpustack import envs
 from gpustack.config.config import Config, set_global_config
 from gpustack.logging import setup_logging
-from gpustack.schemas.inference_backend import InferenceBackend, ContainerEnvConfig
+from gpustack.schemas.inference_backend import (
+    InferenceBackend,
+    ContainerEnvConfig,
+    ParameterFormatEnum,
+)
 from gpustack.schemas.models import (
     BackendEnum,
     ModelInstance,
@@ -41,6 +47,7 @@ from gpustack.schemas.models import (
 )
 from gpustack.schemas.workers import GPUDevicesStatus
 from gpustack.server.bus import Event
+from gpustack.utils.command import flatten_to_argv, is_parameter_key
 from gpustack.utils.config import apply_registry_override_to_image
 from gpustack.utils.envs import filter_env_vars
 from gpustack.utils.hub import get_hf_text_config, get_max_model_len
@@ -55,6 +62,58 @@ lock = threading.Lock()
 
 class ModelInstanceStateError(Exception):
     pass
+
+
+def _normalize_param_format(
+    tokens: List[str], target: ParameterFormatEnum
+) -> List[str]:
+    """
+    Walk an argv-style token stream, regroup each ``--key [value...]`` cluster,
+    and emit each cluster in ``target`` format. The key's leading dashes are
+    preserved verbatim — ``-n`` / ``-ngl`` / ``-m`` are real llama.cpp short
+    options and must not be coerced into ``--n`` / ``--ngl`` / ``--m``.
+
+    Multi-value clusters (``--lora-modules v1 v2``) always stay in space form —
+    ``--key=v1 --key=v2`` would change argparse semantics (the later value
+    overwrites the earlier one), so equal form is unsafe to use for them.
+
+    Stray positional tokens that do not follow a key (rare; only happens on
+    malformed input) pass through verbatim — let the inference server reject
+    them rather than guessing.
+    """
+    result: List[str] = []
+    i = 0
+    n = len(tokens)
+    while i < n:
+        tok = tokens[i]
+        if not is_parameter_key(tok):
+            result.append(tok)
+            i += 1
+            continue
+
+        if "=" in tok:
+            head_key, _, head_val = tok.partition("=")
+            values = [head_val]
+            i += 1
+        else:
+            head_key = tok
+            values = []
+            i += 1
+            while i < n and not is_parameter_key(tokens[i]):
+                values.append(tokens[i])
+                i += 1
+
+        if not values:
+            result.append(head_key)
+        elif len(values) == 1 and target == ParameterFormatEnum.EQUAL:
+            result.append(f"{head_key}={values[0]}")
+        elif len(values) == 1:
+            result.extend([head_key, values[0]])
+        else:
+            result.append(head_key)
+            result.extend(values)
+
+    return result
 
 
 # Reference: requirements for `usage.prompt_tokens_details.cached_tokens` to
@@ -169,11 +228,17 @@ class InferenceServer(ABC):
         if event.data["state"] == ModelInstanceStateEnum.ERROR:
             raise ModelInstanceStateError()
         elif event.data["state"] == ModelInstanceStateEnum.STARTING:
-            self._model_path = str(Path(event.data["resolved_path"]).absolute())
+            resolved_path = event.data["resolved_path"]
+            if not resolved_path:
+                raise ValueError(
+                    "Model instance reached STARTING without a resolved model path"
+                )
+            self._model_path = str(Path(resolved_path).absolute())
             if event.data["draft_model_resolved_path"]:
                 self._draft_model_path = str(
                     Path(event.data["draft_model_resolved_path"]).absolute()
                 )
+            self._model_instance = ModelInstance.model_validate(event.data)
             return True
 
         return False
@@ -392,6 +457,11 @@ class InferenceServer(ABC):
         if self._model.env:
             env.update(self._model.env)
 
+        # Skip the container toolkit's NVIDIA_REQUIRE_CUDA check so a newer-minor
+        # image starts on an older host driver. setdefault keeps user overrides.
+        if self._should_disable_cuda_compat():
+            env.setdefault("NVIDIA_DISABLE_REQUIRE", "1")
+
         return env
 
     @lru_cache
@@ -462,6 +532,37 @@ class InferenceServer(ABC):
                 gpu_device.arch_family,
             )
         return None, None, None
+
+    def _cuda_minor_version_compatibility_enabled(self) -> bool:
+        """Resolve the switch: a per-model
+        ``GPUSTACK_ENABLE_CUDA_MINOR_VERSION_COMPATIBILITY`` in the model's env
+        overrides the global default (``gpustack.envs``); off by default."""
+        model_env = self._model.env or {}
+        if envs.ENABLE_CUDA_MINOR_VERSION_COMPATIBILITY_ENV in model_env:
+            return to_bool(model_env[envs.ENABLE_CUDA_MINOR_VERSION_COMPATIBILITY_ENV])
+        return envs.ENABLE_CUDA_MINOR_VERSION_COMPATIBILITY
+
+    def _should_disable_cuda_compat(self) -> bool:
+        """Whether to disable the image's cuda-compat and rely on the host driver.
+
+        True when enabled and the runner image targets a newer CUDA minor than the
+        host driver (same major) -- there cuda-compat would break consumer GPUs.
+        """
+        if not self._cuda_minor_version_compatibility_enabled():
+            return False
+        backend, host_runtime_version, _ = self._get_device_info()
+        if backend != "cuda" or not host_runtime_version:
+            return False
+        # Resolve the raw image (no registry override / version write-back side
+        # effect); the tag still carries the cudaX.Y we parse.
+        resolved_image, _ = self._resolve_image()
+        image_cuda_version = _parse_image_cuda_version(resolved_image)
+        if not image_cuda_version:
+            return False
+        return (
+            _major_version(image_cuda_version) == _major_version(host_runtime_version)
+            and compare_versions(image_cuda_version, host_runtime_version) > 0
+        )
 
     def _get_configured_resources(
         self, mount_all_devices: bool = False
@@ -596,13 +697,12 @@ class InferenceServer(ABC):
             else self._model_instance.port
         )
 
-    @staticmethod
-    def _get_serving_command_script(env: dict[str, str]) -> Optional[str]:
+    def _get_serving_command_script(self, env: dict[str, str]) -> Optional[str]:
         """
         Get the serving command script for the model instance.
 
-        Return None if `GPUSTACK_MODEL_SERVING_COMMAND_SCRIPT_DISABLED` is disabled,
-        or no specific envs are set.
+        Return None if `GPUSTACK_MODEL_SERVING_COMMAND_SCRIPT_DISABLED` is set, or
+        no prep step (installing PyPi packages, disabling cuda-compat) is needed.
 
         Args:
             env:
@@ -619,17 +719,35 @@ class InferenceServer(ABC):
         ):
             return None
 
-        # Skip if no specific envs are set.
-        if not env or "PYPI_PACKAGES_INSTALL" not in env:
+        disable_cuda_compat = self._should_disable_cuda_compat()
+
+        # Skip if no prep step is needed.
+        if not disable_cuda_compat and not (env and "PYPI_PACKAGES_INSTALL" in env):
             return None
 
-        return """#!/bin/sh
+        cuda_compat_step = ""
+        if disable_cuda_compat:
+            cuda_compat_step = """if [ -d /usr/local/cuda/compat ]; then
+    echo "Disabling bundled cuda-compat to run with the host driver (CUDA minor version compatibility)"
+    rm -rf /usr/local/cuda/compat 2>/dev/null || true
+    ldconfig 2>/dev/null || true
+    if [ -d /usr/local/cuda/compat ]; then
+        echo "Warning: failed to remove /usr/local/cuda/compat (needs a root container); the bundled cuda-compat may still be used"
+    fi
+fi
+
+"""
+
+        return (
+            """#!/bin/sh
 
 #
 # Prepare
 #
 
-if [ -n "${PYPI_PACKAGES_INSTALL:-}" ]; then
+"""
+            + cuda_compat_step
+            + """if [ -n "${PYPI_PACKAGES_INSTALL:-}" ]; then
     if command -v uv >/dev/null 2>&1; then
         echo "Installing additional PyPi packages: ${PYPI_PACKAGES_INSTALL}"
         export UV_HTTP_TIMEOUT=500
@@ -662,6 +780,7 @@ fi
 
 exec "$@"
 """
+        )
 
     def build_versioned_command_args(
         self,
@@ -674,7 +793,7 @@ exec "$@"
         when the version uses non-built-in version and defines a custom run_command
 
         Args:
-        - default_args: The default command argument list (e.g., ["vllm", "serve", "/path/to/model"]).
+        - default_args: The default command argument list.
         - model_path: Path used to replace {{model_path}}; if None, fall back to self._model_path.
         - port: Port used to replace {{port}}; if None, fall back to self._model_instance.port.
 
@@ -705,6 +824,9 @@ exec "$@"
             )
             resolved_port = port if port is not None else self._model_instance.port
             resolved_model_name = self._model_instance.model_name
+            selected_gpu_indexes = sorted(
+                d.index for d in self._get_selected_gpu_devices()
+            )
 
             command = self.inference_backend.replace_command_param(
                 version=version,
@@ -712,6 +834,8 @@ exec "$@"
                 port=resolved_port,
                 worker_ip=self._worker.ip,
                 model_name=resolved_model_name,
+                gpu_count=len(selected_gpu_indexes),
+                gpu_ids=selected_gpu_indexes,
                 command=version_config.run_command,
                 env=self._model.env,
             )
@@ -722,30 +846,48 @@ exec "$@"
         return default_args
 
     @staticmethod
+    def _override_entrypoint(
+        command: Optional[List[str]],
+        command_args: List[str],
+        command_script: Optional[str],
+    ) -> Tuple[Optional[List[str]], Optional[List[str]]]:
+        """
+        Map command / command_args / command_script onto the container's
+        ENTRYPOINT/CMD override semantics.
+
+        - command_script becomes the entrypoint, so the original command is
+          prepended to its args.
+        - Otherwise merge command and args into command to override the image
+          ENTRYPOINT (args alone would be appended to ENTRYPOINT, not replace it).
+        - When there is no command to override the ENTRYPOINT, leave the args
+          appended as-is.
+        """
+        if command_script:
+            return None, (command or []) + command_args
+        if not command:
+            return None, command_args
+        return command + command_args, None
+
+    @staticmethod
     def _get_backend_parameter_start_index(
         arguments: List[str],
         entrypoint: Optional[List[str]] = None,
     ) -> int:
         """
-        Return where backend parameters start in container args.
-
-        When a container entrypoint is configured separately, `arguments`
-        contains only entrypoint arguments, so backend parameters start at 0.
-        Otherwise, skip the command prefix embedded in `arguments`.
+        Return where backend parameters start in `arguments`, skipping any
+        command prefix or model path that may precede the first option.
         """
-        if entrypoint:
-            return 0
-
         if not arguments:
             return 0
 
-        command = os.path.basename(arguments[0])
-        if (
-            len(arguments) >= 3
-            and command.startswith("python")
-            and arguments[1] == "-m"
-        ):
-            return 3
+        if not entrypoint:
+            command = os.path.basename(arguments[0])
+            if (
+                len(arguments) >= 3
+                and command.startswith("python")
+                and arguments[1] == "-m"
+            ):
+                return 3
 
         for index, argument in enumerate(arguments):
             if argument.startswith("-"):
@@ -844,11 +986,11 @@ exec "$@"
             # Return directly if there is not a valid device.
             # GPUStack-Runner does not provide CPU-only platform images.
             # To use a CPU-only version, user must configure in `Inference Backend` page.
-            return None
+            return None, None
 
         if backend not in available_backends():
             # Return directly if found backend is not within the available backends.
-            return None
+            return None, None
 
         """
         Retrieve runners by queries.
@@ -880,7 +1022,7 @@ exec "$@"
                 backend_variant = "910b"
 
         logger.info(
-            f"_resolve_image query: backend={backend}, backend_variant={backend_variant}, service={service}, service_version={service_version}, platform={platform.system_arch()}"
+            f"_resolve_image query: backend={backend}, backend_variant={backend_variant}, service={service}, service_version={service_version}, platform={platform.system_arch()}, runtime_version={runtime_version}"
         )
 
         runners = list_backend_runners(
@@ -947,13 +1089,25 @@ exec "$@"
                         backend_versioned_runner
                     )
                     return get_docker_image(backend_versioned_runner), service_version
+            # Every runner is newer than the host runtime. Same-major minor
+            # version compatibility holds even on consumer GPUs, but cross-major
+            # (e.g. 12.x host -> 13.x) does not; prefer the newest runner sharing
+            # the host major, and fall back to the oldest only if none matches.
+            host_major = _major_version(backend_version)
+            fallback_runner = next(
+                (
+                    candidate
+                    for candidate in backend_versioned_runners
+                    if _major_version(candidate.version) == host_major
+                ),
+                backend_versioned_runners[-1],
+            )
+        else:
+            # Failed to detect host runtime version: fall back to the latest.
+            fallback_runner = backend_versioned_runners[0]
 
-        # Return the first(latest) backend version of selected runner
-        # if failed to detect host backend version or no backend version matched.
-        service_version = _get_service_version_from_versioned_runner(
-            backend_versioned_runners[0]
-        )
-        return get_docker_image(backend_versioned_runners[0]), service_version
+        service_version = _get_service_version_from_versioned_runner(fallback_runner)
+        return get_docker_image(fallback_runner), service_version
 
     def _update_model_backend_service_version(
         self, service_version: Optional[str]
@@ -983,29 +1137,29 @@ exec "$@"
 
     def _flatten_backend_param(self) -> List[str]:
         """
-        Flattens all backend parameter strings into a list of individual tokens.
+        Reduce ``backend_parameters`` to a flat argv-style token list.
 
-        Each entry in `backend_parameters` may contain one or more whitespace-separated
-        arguments. This method splits them and returns a single flattened list.
-        e.g.
-            self._model.backend_parameters = ["--ctx-size 1024"] -> ["--ctx-size", "1024"]
-            self._model.backend_parameters = [" --ctx-size=1024"] -> ["--ctx-size=1024"]
-            self._model.backend_parameters = ["--ctx-size =1024"] -> ["--ctx-size=1024"]
+        ``backend_parameters`` is semantically a concatenated argv: each element
+        may be one token (``"--host"``, ``"0.0.0.0"``), one full
+        ``--key value`` / ``--key=value`` string, or a whole pasted command line
+        (``"--a 1 --b=2 --flag"``). ``flatten_to_argv`` recovers the underlying
+        token stream uniformly.
+
+        If the backend's ``parameter_format`` is set, each ``--key value(s)``
+        cluster is normalized to that form (multi-value clusters always stay in
+        space form — equal form can't safely express them).
         """
-        result = []
-        for param in self._model.backend_parameters or []:
-            # Strip leading/trailing whitespace
-            param_stripped = param.strip()
+        tokens = flatten_to_argv(self._model.backend_parameters or [])
 
-            if "=" in param_stripped:
-                # Handle cases like "--foo = bar" or "--foo  =bar"
-                # Split by = and strip whitespace around it
-                key, value = map(str.strip, param_stripped.split("=", 1))
-                result.append(f"{key}={value}")
-                continue
+        parameter_format = (
+            getattr(self.inference_backend, "parameter_format", None)
+            if self.inference_backend
+            else None
+        )
+        if parameter_format is None or not tokens:
+            return tokens
 
-            result.extend(shlex.split(param_stripped))
-        return result
+        return _normalize_param_format(tokens, parameter_format)
 
     def _transform_workload_plan(
         self, workload: WorkloadPlan
@@ -1036,6 +1190,33 @@ def _get_service_version_from_versioned_runner(
             f"Failed to get service version from backend versioned runner: {e}"
         )
         return None
+
+
+def _major_version(version: Optional[str]) -> Optional[str]:
+    """Extract the major version segment, e.g. '12' from 'v12.8'."""
+    if not version:
+        return None
+    return version.removeprefix("v").split(".", 1)[0]
+
+
+_CUDA_IMAGE_VERSION_PATTERN = re.compile(r"cuda(\d+)\.(\d+)")
+
+
+def _parse_image_cuda_version(image: Optional[str]) -> Optional[str]:
+    """Extract the CUDA ``major.minor`` from a runner image tag
+    (``gpustack/runner:cuda12.9-...`` -> ``"12.9"``); None if the tag has none."""
+    if not image:
+        return None
+    # Isolate the tag first so a registry/namespace segment carrying a cudaX.Y
+    # (e.g. a mirror path) can't shadow the version in the actual tag.
+    reference = image.split("/")[-1]
+    if ":" not in reference:
+        return None
+    tag = reference.split(":", 1)[1]
+    match = _CUDA_IMAGE_VERSION_PATTERN.search(tag)
+    if not match:
+        return None
+    return f"{match.group(1)}.{match.group(2)}"
 
 
 def is_ascend_310p(devices: GPUDevicesStatus) -> bool:
@@ -1078,3 +1259,40 @@ def cal_distributed_parallelism_arguments(
             f"The number of GPUs selected for each worker is not equal: {num_gpus} != {tp}, fallback to using pipeline parallelism."
         )
     return tp, pp
+
+
+def read_lora_max_rank(paths: List[str]) -> Optional[int]:
+    """
+    Read the max LoRA rank across adapter dirs' adapter_config.json.
+
+    Returns the largest of each adapter's `r` and any `rank_pattern` values.
+    Returns None when no readable rank is found, so callers can skip injecting
+    --max-lora-rank and fall back to the engine default / user-provided value.
+    """
+    max_rank: Optional[int] = None
+    for path in paths:
+        if not path:
+            continue
+        config_path = os.path.join(path, "adapter_config.json")
+        try:
+            data = json.loads(Path(config_path).read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.warning(f"Skip reading LoRA rank from {config_path}: {e}")
+            continue
+        if not isinstance(data, dict):
+            logger.warning(
+                f"Skip reading LoRA rank from {config_path}: not a JSON object"
+            )
+            continue
+        ranks = []
+        if isinstance(data.get("r"), int):
+            ranks.append(data["r"])
+        # PEFT allows per-module overrides in rank_pattern that may exceed `r`.
+        rank_pattern = data.get("rank_pattern")
+        if isinstance(rank_pattern, dict):
+            ranks.extend(
+                value for value in rank_pattern.values() if isinstance(value, int)
+            )
+        if ranks:
+            max_rank = max([max_rank, *ranks]) if max_rank is not None else max(ranks)
+    return max_rank

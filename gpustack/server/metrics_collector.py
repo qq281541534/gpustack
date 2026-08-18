@@ -1,9 +1,11 @@
 import asyncio
 import logging
-from datetime import date, datetime, timezone
+import time
+from datetime import date, datetime, timezone, tzinfo
 from typing import Dict, List, Optional, Set, Tuple
 
 from pydantic import BaseModel
+from sqlmodel import or_
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack import envs
@@ -14,8 +16,12 @@ from gpustack.schemas.model_routes import ModelRoute
 from gpustack.schemas.model_usage import ModelUsage, OperationEnum
 from gpustack.schemas.model_usage_details import ModelUsageDetails
 from gpustack.schemas.models import Model, is_embedding_model, is_reranker_model
-from gpustack.schemas.users import User
+from gpustack.schemas.principals import (
+    Principal,
+    PrincipalType,
+)
 from gpustack.server.db import async_session
+from gpustack.utils.rollup_tz import resolve_rollup_tz
 from gpustack.utils.usage_snapshots import build_model_usage_snapshot
 
 logger = logging.getLogger(__name__)
@@ -31,7 +37,9 @@ FLUSH_INTERVAL_SECONDS = 10
 #   "{model_id}.{provider_id}.{model}.{user_id}.{access_key}.{operation}.{date}"
 # ``operation`` and ``date`` are part of the key so per-operation rollups
 # stay separate and a stream that crosses midnight lands in the period
-# it ends in (anchored on completed_at).
+# it ends in (anchored on completed_at). ``date`` is computed in the
+# configured rollup timezone (see ``_ROLLUP_TZ``), not UTC, so midnight here
+# means local-calendar midnight.
 gateway_metrics_buffer: Dict[str, "ModelUsageMetrics"] = {}
 # Raw per-report metrics retained for ``model_usage_details`` audit rows.
 # Unlike ``gateway_metrics_buffer``, entries are not aggregated.
@@ -39,6 +47,14 @@ gateway_details_buffer: List["ModelUsageMetrics"] = []
 # Single lock guarding both rollup and details buffers; ingest writes
 # them together, so they must be drained together too.
 gateway_buffers_lock = asyncio.Lock()
+
+# Throttle state for the "missing model_route_id" warning. A regressed
+# gateway can emit many such rows per second; collapse to one warning per
+# interval with the suppressed count so logs stay readable without losing
+# the signal.
+_MISSING_ROUTE_ID_WARN_INTERVAL_SECONDS = 60.0
+_missing_route_id_last_warned_at: float = 0.0
+_missing_route_id_suppressed: int = 0
 
 
 class ModelUsageMetrics(BaseModel):
@@ -76,6 +92,9 @@ class ModelUsageMetrics(BaseModel):
     # None when the gateway report doesn't carry it; middleware-fed metrics
     # always populate it so per-operation rollups survive unification.
     operation: Optional[OperationEnum] = None
+    # Tenant identifier sourced from the gateway's X-Organization-Id header
+    # (configurable via the token-usage plugin's ``organizationIDHeader``).
+    organization_id: Optional[str] = None
 
 
 def _unixmilli_to_naive_utc(ms: Optional[int]) -> Optional[datetime]:
@@ -91,6 +110,13 @@ def _unixmilli_to_naive_utc(ms: Optional[int]) -> Optional[datetime]:
     return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).replace(tzinfo=None)
 
 
+# Shared with the metered_usage read API so the daily token rollup and the
+# GPU/storage views share one timezone (see ``gpustack.utils.rollup_tz``).
+# Resolved once at import time; tests monkeypatch this attribute to pin a
+# deterministic timezone independent of the host's ``TZ``.
+_ROLLUP_TZ: tzinfo = resolve_rollup_tz()
+
+
 def _resolve_metric_datetime(
     metric: ModelUsageMetrics,
 ) -> Tuple[date, datetime]:
@@ -99,19 +125,30 @@ def _resolve_metric_datetime(
     Prefers ``completed_at`` so a stream that crosses a calendar boundary
     lands in the period it ends in (per the proxy contract). Falls back to
     ``started_at`` and finally to server ``now`` if both are absent.
+
+    The returned ``date`` is bucketed in ``_ROLLUP_TZ`` — **not** UTC — so a
+    request completing at e.g. ``2026-05-27T16:30Z`` (= ``2026-05-28 00:30``
+    in Asia/Shanghai) lands in the May-28 bucket instead of being attributed
+    to the previous UTC day. The returned ``datetime`` stays naive UTC so
+    downstream audit / lifecycle stamps keep matching ``UTCDateTime``.
     """
     dt = (
         _unixmilli_to_naive_utc(metric.completed_at)
         or _unixmilli_to_naive_utc(metric.started_at)
         or datetime.now(timezone.utc).replace(tzinfo=None)
     )
-    return dt.date(), dt
+    bucket_date = dt.replace(tzinfo=timezone.utc).astimezone(_ROLLUP_TZ).date()
+    return bucket_date, dt
 
 
 def _make_buffer_key(metric: ModelUsageMetrics) -> str:
     # Include the completion-anchored date so streams that cross midnight
     # accumulate into the correct billing-period rollup instead of being
-    # merged with the next day's traffic.
+    # merged with the next day's traffic. ``organization_id`` is included
+    # to match the DB upsert key in ``create_or_update_model_usage`` —
+    # otherwise the same user calling from different Org contexts within
+    # one flush window would merge in memory but split on write, losing
+    # tokens.
     metric_date, _ = _resolve_metric_datetime(metric)
     operation = metric.operation.value if metric.operation else ""
     return ".".join(
@@ -122,6 +159,8 @@ def _make_buffer_key(metric: ModelUsageMetrics) -> str:
             metric.model,
             metric.user_id,
             metric.access_key,
+            metric.organization_id,
+            metric.model_route_id,
             operation,
             metric_date.isoformat(),
         ]
@@ -168,7 +207,19 @@ def _resolve_usage_tokens(
 
 async def accumulate_gateway_metrics(metrics: List[ModelUsageMetrics]):
     async with gateway_buffers_lock:
+        # Product invariant: every inference request resolves to a route
+        # (the gateway can't dispatch otherwise). A NULL model_route_id
+        # means an ingest source regressed — the row will pollute the
+        # "Untracked" bucket reserved for pre-upgrade legacy data. Tally
+        # per-batch and surface via a throttled summary so a regressed
+        # gateway doesn't flood logs.
+        missing_route_id_count = 0
+        missing_route_id_sample: Optional[ModelUsageMetrics] = None
         for incoming in metrics:
+            if incoming.model_route_id is None:
+                missing_route_id_count += 1
+                if missing_route_id_sample is None:
+                    missing_route_id_sample = incoming
             # Take ownership before any in-place work:
             #   * ``_estimate_partial_usage`` mutates token fields directly.
             #   * The rollup buffer's ``+=`` mutates the stored entry, which
@@ -193,6 +244,7 @@ async def accumulate_gateway_metrics(metrics: List[ModelUsageMetrics]):
                 existing.input_cached_token += metric.input_cached_token
                 existing.request_count += metric.request_count
         _trim_details_buffer_locked()
+        _maybe_warn_missing_route_id(missing_route_id_count, missing_route_id_sample)
 
 
 def _trim_details_buffer_locked() -> None:
@@ -219,6 +271,46 @@ def _trim_details_buffer_locked() -> None:
     )
 
 
+def _maybe_warn_missing_route_id(
+    batch_missing: int, sample: Optional[ModelUsageMetrics]
+) -> None:
+    """Emit at most one 'missing model_route_id' warning per interval.
+
+    Accumulates the suppressed count across batches and flushes it the next
+    time the interval has elapsed, so a regressed gateway shows up as one
+    log line per minute with the running total rather than thousands of
+    near-identical lines. Caller must hold ``gateway_buffers_lock``.
+    """
+    global _missing_route_id_last_warned_at, _missing_route_id_suppressed
+    if batch_missing <= 0:
+        return
+    _missing_route_id_suppressed += batch_missing
+    now = time.monotonic()
+    if now - _missing_route_id_last_warned_at < _MISSING_ROUTE_ID_WARN_INTERVAL_SECONDS:
+        return
+    total = _missing_route_id_suppressed
+    _missing_route_id_last_warned_at = now
+    _missing_route_id_suppressed = 0
+    if sample is not None:
+        logger.warning(
+            "Gateway metrics missing model_route_id (%d in the last ~%ds); "
+            "rows land in the Untracked bucket. Sample: model=%s user_id=%s "
+            "access_key=%s",
+            total,
+            int(_MISSING_ROUTE_ID_WARN_INTERVAL_SECONDS),
+            sample.model,
+            sample.user_id,
+            sample.access_key,
+        )
+    else:
+        logger.warning(
+            "Gateway metrics missing model_route_id (%d in the last ~%ds); "
+            "rows land in the Untracked bucket.",
+            total,
+            int(_MISSING_ROUTE_ID_WARN_INTERVAL_SECONDS),
+        )
+
+
 async def flush_gateway_metrics():
     async with gateway_buffers_lock:
         if not gateway_metrics_buffer and not gateway_details_buffer:
@@ -240,7 +332,15 @@ async def flush_gateway_metrics():
 async def flush_gateway_metrics_to_db():
     while True:
         await asyncio.sleep(FLUSH_INTERVAL_SECONDS)
-        await flush_gateway_metrics()
+        try:
+            await flush_gateway_metrics()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Never let a flush error escape this loop -- an unhandled
+            # exception propagates through the server's asyncio.gather and
+            # crashes the whole process. Log and retry on the next tick.
+            logger.exception("Error in gateway metrics flush loop")
 
 
 async def create_or_update_model_usage(
@@ -255,8 +355,10 @@ async def create_or_update_model_usage(
             "provider_name": metric.provider_name,
             "provider_type": metric.provider_type,
             "model_name": metric.model_name,
+            "model_route_id": metric.model_route_id,
             "access_key": metric.access_key,
             "operation": metric.operation,
+            "consumer_principal_id": metric.consumer_principal_id,
             "date": metric.date,
         },
     )
@@ -267,6 +369,13 @@ async def create_or_update_model_usage(
         current_usage.completion_token_count += metric.completion_token_count
         current_usage.prompt_cached_token_count += metric.prompt_cached_token_count
         current_usage.request_count += metric.request_count
+        # Refresh route name snapshot to the latest non-NULL value so that
+        # a mid-day rename converges to one consistent label per (route_id,
+        # date) cell. A NULL incoming name means the route was deleted
+        # between dispatch and flush — keep the existing snapshot rather
+        # than wiping a still-meaningful audit label.
+        if metric.model_route_name is not None:
+            current_usage.model_route_name = metric.model_route_name
         await current_usage.save(session=session, auto_commit=auto_commit)
 
 
@@ -275,6 +384,8 @@ def _validate_usage_metric(
     models: Dict[int, Model],
     providers: Dict[int, ModelProvider],
     user_ids: Set[int],
+    route_name_by_id: Dict[int, str],
+    route_base_model_id_by_id: Dict[int, int],
 ) -> bool:
     if metric.model_id is None and metric.provider_id is None:
         logger.debug(
@@ -287,10 +398,24 @@ def _validate_usage_metric(
             logger.debug(f"Model ID {metric.model_id} not found in database.")
             return False
         if model.name != metric.model:
-            logger.debug(
-                f"Model name {metric.model} does not match database record {model.name} for model ID {metric.model_id}."
-            )
-            return False
+            # LoRA requests carry the LoRA route name (e.g. "base:adapter") in
+            # `metric.model` since LoRA entries are expanded into ModelRoute
+            # names by `lora_route_name_for` and there is no standalone Model
+            # row. Accept the mismatch when model_route_id binds to a route
+            # whose name == metric.model and whose created_model_id == base.
+            route_id = metric.model_route_id
+            if (
+                route_id is None
+                or route_name_by_id.get(route_id) != metric.model
+                or route_base_model_id_by_id.get(route_id) != metric.model_id
+            ):
+                logger.debug(
+                    f"Dropping usage metric: model={metric.model!r} does not "
+                    f"match base model name {model.name!r} "
+                    f"(model_id={metric.model_id}) and no matching LoRA route "
+                    f"is bound (model_route_id={route_id})."
+                )
+                return False
     if metric.provider_id is not None:
         provider = providers.get(metric.provider_id)
         if not provider:
@@ -311,14 +436,23 @@ def _build_metric_snapshot(
     metric: ModelUsageMetrics,
     model_by_id: Dict[int, Model],
     provider_by_id: Dict[int, ModelProvider],
-    user_by_id: Dict[int, User],
+    user_by_id: Dict[int, Principal],
     api_key_by_access_key: Dict[str, ApiKey],
     cluster_names_by_id: Dict[int, str],
+    route_name_by_id: Dict[int, str],
+    route_owner_by_id: Dict[int, int],
 ) -> dict:
     user = user_by_id.get(metric.user_id)
     api_key = api_key_by_access_key.get(metric.access_key)
     model = model_by_id.get(metric.model_id)
     provider = provider_by_id.get(metric.provider_id)
+    # Route name is resolved from the live table; falls back to None when
+    # the route was deleted between dispatch and flush. The id is always
+    # preserved verbatim so audit/breakdown can still attribute the row.
+    model_route_id = metric.model_route_id
+    model_route_name = (
+        route_name_by_id.get(model_route_id) if model_route_id is not None else None
+    )
     if model is None:
         snapshot = {
             "model_id": metric.model_id,
@@ -334,13 +468,19 @@ def _build_metric_snapshot(
                     "provider_id": provider.id,
                     "provider_name": provider.name,
                     "provider_type": provider_type,
+                    # MaaS provider targets have no local Model row, so the
+                    # tenant scope can't be sourced from model.owner_principal_id.
+                    # The provider always belongs to one Org (non-NULL owner),
+                    # so it is the authoritative owner for this usage row —
+                    # mirroring the model-path's model.owner_principal_id.
+                    "owner_principal_id": getattr(provider, "owner_principal_id", None),
                 }
             )
         if user is not None:
             snapshot.update(
                 {
                     "user_id": user.id,
-                    "user_name": user.username,
+                    "user_name": user.name,
                 }
             )
         if api_key is not None:
@@ -352,6 +492,31 @@ def _build_metric_snapshot(
                     "api_key_is_custom": api_key.is_custom,
                 }
             )
+            # A key with a non-NULL owner pins the consumer to that tenant
+            # (an Org, or a user's own personal principal). An admin
+            # "All"-mode key carries ``owner_principal_id = NULL``; leaving
+            # the field unset lets the no-Org fallback below attribute the
+            # usage to the caller's personal domain instead of writing a
+            # NULL row.
+            if api_key.owner_principal_id is not None:
+                snapshot["consumer_principal_id"] = api_key.owner_principal_id
+        if model_route_id is not None:
+            snapshot["model_route_id"] = model_route_id
+            snapshot["model_route_name"] = model_route_name
+        # ``owner_principal_id`` is the tenant scope of the *consumed
+        # resource*, not of the caller — the caller's principal is captured
+        # separately as ``consumer_principal_id`` (from api_key.owner above).
+        # So the fallback must NOT reuse api_key.owner here: that conflates
+        # consumer with owner and only coincides under the same-Org rule.
+        #
+        # When the model was deleted before flush (provider also absent),
+        # source the owner from the route, which has a non-NULL owner and
+        # outlives the model. A provider-sourced owner (set above for MaaS
+        # provider targets) is authoritative and must not be overwritten.
+        if snapshot.get("owner_principal_id") is None and model_route_id is not None:
+            route_owner = route_owner_by_id.get(model_route_id)
+            if route_owner is not None:
+                snapshot["owner_principal_id"] = route_owner
     else:
         snapshot = build_model_usage_snapshot(
             model,
@@ -359,6 +524,8 @@ def _build_metric_snapshot(
             user=user,
             api_key=api_key,
             provider=provider,
+            model_route_id=model_route_id,
+            model_route_name=model_route_name,
         )
     snapshot.setdefault("user_id", metric.user_id)
     snapshot.setdefault("provider_id", metric.provider_id)
@@ -366,7 +533,90 @@ def _build_metric_snapshot(
     snapshot.setdefault("provider_type", metric.provider_type)
     snapshot.setdefault("access_key", metric.access_key)
     snapshot.setdefault("api_key_is_custom", None)
+    # For cookie-authed traffic (no api_key) the gateway plugin provides the
+    # active tenant via the wire-format ``organization_id`` header — parse it
+    # back to int so the row carries its Org scope.
+    #
+    # The raw header is client-controlled, so it must be validated before it
+    # becomes an attribution: a spoofed / stale id would silently mis-attribute
+    # usage to the wrong (or a non-existent) principal. This branch is therefore
+    # gated on ``api_key is None`` — only the direct (cookie) path validates the
+    # header against ``get_tenant_context`` before stamping the metric (see
+    # ``_resolve_direct_consumer_org`` in ``api/middlewares.py``). The gateway /
+    # api_key path never trusts the raw header: a NULL-owner key leaves
+    # ``consumer_principal_id`` unset (above) and falls through to the
+    # personal-domain fallback below rather than the unvalidated header.
+    if (
+        "consumer_principal_id" not in snapshot
+        and api_key is None
+        and metric.organization_id
+    ):
+        try:
+            snapshot["consumer_principal_id"] = int(metric.organization_id)
+        except (TypeError, ValueError):
+            pass
+    # Fallback for no-Org traffic — attribute the usage to the caller's
+    # personal domain (their own USER-principal). This is the same rule for
+    # everyone, admin included: there is no active Org to bill, so consumption
+    # is personal. It covers
+    #   * OSS regular users (never in an Org; the OSS UI omits the header),
+    #   * cookie-authed Playground traffic with no Org header,
+    #   * admin / "All"-scope callers whose api_key has a NULL owner (the
+    #     api_key branch above intentionally leaves the field unset for them).
+    # Recording to the personal domain keeps NULL off new rows and mirrors the
+    # read side's self-scope filter (``consumer_principal_id == user.id OR IS
+    # NULL``) so the caller sees their own usage. Enterprise Org traffic is
+    # unaffected — either ``organization_id`` or the api_key owner is set, so
+    # this branch never runs. SYSTEM callers (worker-proxied inference) are
+    # left unattributed.
+    if (
+        "consumer_principal_id" not in snapshot
+        and user is not None
+        and user.kind == PrincipalType.USER
+    ):
+        snapshot["consumer_principal_id"] = user.id
     return snapshot
+
+
+async def _resolve_consumer_info_by_id(
+    session, api_keys, all_metrics, users
+) -> Dict[int, tuple]:
+    """``consumer_principal_id → (name, kind)`` for every consumer referenced by
+    the batch.
+
+    The consumer is the API-key owner Org, a personal USER-principal, or the
+    cookie-auth ``X-Organization-Id`` header. Snapshotting the display name +
+    kind onto ``ModelUsage`` lets the Organization breakdown keep the real name
+    after a hard-delete and tag personal (USER) rows — parity with the other
+    ``*_name`` denorms. ``name`` (slug) is used, NOT display_name, so the token
+    and resource tabs stay consistent.
+    """
+    consumer_ids: set = {
+        k.owner_principal_id for k in api_keys if k.owner_principal_id is not None
+    }
+    # ``organization_id`` comes from the ``X-Organization-Id`` wire header, so it
+    # may be a non-numeric / empty string — coerce defensively (mirrors the
+    # guarded parse in _build_metric_snapshot) rather than crashing the batch.
+    for m in all_metrics:
+        org = getattr(m, "organization_id", None)
+        if not org:
+            continue
+        try:
+            consumer_ids.add(int(org))
+        except (TypeError, ValueError):
+            continue
+    consumer_ids |= {u.id for u in users}
+    if not consumer_ids:
+        return {}
+    consumer_principals = await Principal.all_by_fields(
+        session=session,
+        fields={},
+        extra_conditions=[Principal.id.in_(consumer_ids)],
+    )
+    return {
+        p.id: (p.name, p.kind.value if hasattr(p.kind, "value") else p.kind)
+        for p in consumer_principals
+    }
 
 
 async def store_usage_metrics(
@@ -379,6 +629,7 @@ async def store_usage_metrics(
 
     all_metrics = list(metrics) + detail_metrics
     dedup_model_names = {m.model for m in all_metrics}
+    dedup_model_ids = {m.model_id for m in all_metrics if m.model_id is not None}
     dedup_user_ids = {m.user_id for m in all_metrics if m.user_id is not None}
     dedup_access_keys = {m.access_key for m in all_metrics if m.access_key is not None}
     dedup_provider_ids = {
@@ -389,10 +640,18 @@ async def store_usage_metrics(
     }
     async with async_session() as session:
         try:
+            # Load models by name OR id. LoRA requests carry the LoRA route
+            # name in `metric.model` (no Model row by that name), so the base
+            # model can only be reached via `metric.model_id`.
+            model_conditions = []
+            if dedup_model_names:
+                model_conditions.append(Model.name.in_(dedup_model_names))
+            if dedup_model_ids:
+                model_conditions.append(Model.id.in_(dedup_model_ids))
             models = await Model.all_by_fields(
                 session=session,
                 fields={},
-                extra_conditions=[Model.name.in_(dedup_model_names)],
+                extra_conditions=[or_(*model_conditions)] if model_conditions else [],
             )
             providers = await ModelProvider.all_by_fields(
                 session=session,
@@ -403,10 +662,14 @@ async def store_usage_metrics(
                     else []
                 ),
             )
-            users = await User.all_by_fields(
+            # Generic principal lookup — the caller of a model_usage
+            # record can be a USER (human via login + API key) or a
+            # SYSTEM principal (worker proxying inference). No kind
+            # filter, no User-shape implication.
+            users = await Principal.all_by_fields(
                 session=session,
                 fields={},
-                extra_conditions=[User.id.in_(dedup_user_ids)],
+                extra_conditions=[Principal.id.in_(dedup_user_ids)],
             )
             api_keys = await ApiKey.all_by_fields(
                 session=session,
@@ -418,6 +681,8 @@ async def store_usage_metrics(
                 ),
             )
             route_name_by_id: Dict[int, str] = {}
+            route_base_model_id_by_id: Dict[int, int] = {}
+            route_owner_by_id: Dict[int, int] = {}
             if dedup_route_ids:
                 routes = await ModelRoute.all_by_fields(
                     session=session,
@@ -425,6 +690,16 @@ async def store_usage_metrics(
                     extra_conditions=[ModelRoute.id.in_(dedup_route_ids)],
                 )
                 route_name_by_id = {r.id: r.name for r in routes}
+                route_base_model_id_by_id = {
+                    r.id: r.created_model_id
+                    for r in routes
+                    if r.created_model_id is not None
+                }
+                route_owner_by_id = {
+                    r.id: r.owner_principal_id
+                    for r in routes
+                    if r.owner_principal_id is not None
+                }
             validated_user_ids = {u.id for u in users}
             user_by_id = {u.id: u for u in users}
             api_key_by_access_key = {k.access_key: k for k in api_keys}
@@ -438,9 +713,18 @@ async def store_usage_metrics(
             cluster_names_by_id = {c.id: c.name for c in clusters}
             provider_by_id = {p.id: p for p in providers}
 
+            consumer_info_by_id = await _resolve_consumer_info_by_id(
+                session, api_keys, all_metrics, users
+            )
+
             for metric in metrics:
                 if not _validate_usage_metric(
-                    metric, model_by_id, provider_by_id, validated_user_ids
+                    metric,
+                    model_by_id,
+                    provider_by_id,
+                    validated_user_ids,
+                    route_name_by_id,
+                    route_base_model_id_by_id,
                 ):
                     continue
                 snapshot = _build_metric_snapshot(
@@ -450,11 +734,21 @@ async def store_usage_metrics(
                     user_by_id,
                     api_key_by_access_key,
                     cluster_names_by_id,
+                    route_name_by_id,
+                    route_owner_by_id,
                 )
                 prompt_tokens, completion_tokens = _resolve_usage_tokens(
                     metric, model_by_id.get(metric.model_id)
                 )
                 metric_date, _ = _resolve_metric_datetime(metric)
+                # Consumer display-name + kind snapshot (ModelUsage-only; kept
+                # out of the shared snapshot so the detail table isn't touched).
+                consumer_id = snapshot.get("consumer_principal_id")
+                consumer_info = (
+                    consumer_info_by_id.get(consumer_id)
+                    if consumer_id is not None
+                    else None
+                )
                 model_usage = ModelUsage(
                     date=metric_date,
                     prompt_token_count=prompt_tokens,
@@ -462,6 +756,10 @@ async def store_usage_metrics(
                     prompt_cached_token_count=metric.input_cached_token,
                     request_count=metric.request_count,
                     operation=metric.operation,
+                    consumer_name=consumer_info[0] if consumer_info else None,
+                    consumer_principal_kind=(
+                        consumer_info[1] if consumer_info else None
+                    ),
                     **snapshot,
                 )
                 await create_or_update_model_usage(
@@ -470,7 +768,12 @@ async def store_usage_metrics(
 
             for metric in detail_metrics:
                 if not _validate_usage_metric(
-                    metric, model_by_id, provider_by_id, validated_user_ids
+                    metric,
+                    model_by_id,
+                    provider_by_id,
+                    validated_user_ids,
+                    route_name_by_id,
+                    route_base_model_id_by_id,
                 ):
                     continue
                 snapshot = _build_metric_snapshot(
@@ -480,18 +783,12 @@ async def store_usage_metrics(
                     user_by_id,
                     api_key_by_access_key,
                     cluster_names_by_id,
+                    route_name_by_id,
+                    route_owner_by_id,
                 )
                 prompt_tokens, completion_tokens = _resolve_usage_tokens(
                     metric, model_by_id.get(metric.model_id)
                 )
-                # Preserve the reported model_route_id verbatim — details
-                # is FK-less by design (ModelUsageDetails docstring) so the
-                # historical id stays audit-valuable even when the route
-                # was deleted between request dispatch and this flush.
-                # Name is best-effort from the live table; null when the
-                # route is gone.
-                model_route_id = metric.model_route_id
-                model_route_name = route_name_by_id.get(metric.model_route_id)
                 # cluster_id only lives on the audit/details rows, not on
                 # the dashboard rollup (ModelUsage). Prefer the metric's
                 # own cluster_id (captured at request time, survives model
@@ -508,12 +805,15 @@ async def store_usage_metrics(
                 session.add(
                     ModelUsageDetails(
                         date=metric_date,
-                        model_route_id=model_route_id,
-                        model_route_name=model_route_name,
                         cluster_id=cluster_id,
                         prompt_token_count=prompt_tokens,
                         completion_token_count=completion_tokens,
                         prompt_cached_token_count=metric.input_cached_token,
+                        # Persist the completion flag so downstream billing
+                        # can tell authoritative token counts from estimated
+                        # ones, and gate per-request charges (image/tts/stt)
+                        # on actual completion.
+                        completed=metric.completed,
                         operation=metric.operation,
                         # Proxy-reported wall-clock — preserved as NULL when
                         # the report didn't carry it, so reconciliation jobs

@@ -1,15 +1,18 @@
 """Organization membership management.
 
-These routes are nested under /organizations/{org_id}/members. Both the
-platform admin and any Org owner can manage memberships. The last owner
-of an Org cannot be demoted or removed — that would leave the Org
-without anyone able to manage members or infra.
+Routes live under ``/organizations/{org_id}/members``. Both the
+platform admin and any Org owner can manage memberships. The last
+OWNER of an Org cannot be demoted or removed — that protection
+counts both USER-owners and GROUP-owners (active members of a
+GROUP-owner can act as Org admin via transitive role resolution).
 
-Storage is the unified ``principal_memberships`` table. Each row links
-two principals: the parent (an ORG-principal here, but the same table
-also carries GROUP memberships) and the member (a USER-principal). The
-URL path's ``user_id`` is the legacy ``users.id``, which we resolve to
-the user's ``principal_id`` for storage.
+Storage is the unified ``principal_memberships`` table. Each row
+links two principals: the parent (an ORG-principal here) and the
+member (a USER or GROUP principal). Group-members confer ``role`` on
+every active user inside the Group. The URL path's ``principal_id``
+is the principal id of the member — for USER members that IS the
+user's id (post identity consolidation); for GROUP members it's the
+group's principal id.
 """
 
 from datetime import datetime, timezone
@@ -17,6 +20,8 @@ from typing import List, Optional
 
 from fastapi import APIRouter
 from pydantic import BaseModel
+from sqlalchemy import and_, exists, or_
+from sqlalchemy.orm import aliased
 from sqlmodel import select
 
 from gpustack.api.exceptions import (
@@ -26,6 +31,7 @@ from gpustack.api.exceptions import (
     InvalidException,
     NotFoundException,
 )
+from gpustack.schemas.api_keys import ApiKey
 from gpustack.schemas.organizations import OrganizationMembershipPublic
 from gpustack.schemas.principals import (
     OrgRole,
@@ -33,14 +39,14 @@ from gpustack.schemas.principals import (
     PrincipalMembership,
     PrincipalType,
 )
-from gpustack.schemas.users import User
 from gpustack.server.deps import SessionDep, TenantContextDep
+from gpustack.server.services import delete_accessible_model_cache
 
 router = APIRouter()
 
 
 class MembershipCreate(BaseModel):
-    user_ids: List[int]
+    principal_ids: List[int]
     role: OrgRole = OrgRole.MEMBER
 
 
@@ -70,21 +76,20 @@ async def _load_org(session, org_id: int) -> Principal:
     return org
 
 
-async def _resolve_user(session, user_id: int) -> Optional[User]:
-    user = await User.one_by_id(session, user_id)
-    if not user or user.is_system or user.deleted_at is not None:
+async def _resolve_member_principal(session, principal_id: int) -> Optional[Principal]:
+    """Return a principal eligible to be an Org member.
+
+    Only USER and GROUP kinds can join an Org. ORG-of-ORG is rejected
+    here even though the table would technically accept it.
+    """
+    p = await Principal.one_by_id(session, principal_id)
+    if (
+        not p
+        or p.deleted_at is not None
+        or p.kind not in (PrincipalType.USER, PrincipalType.GROUP)
+    ):
         return None
-    return user
-
-
-async def _list_memberships(
-    session, org_principal_id: int
-) -> List[PrincipalMembership]:
-    stmt = select(PrincipalMembership).where(
-        PrincipalMembership.parent_principal_id == org_principal_id,
-        PrincipalMembership.deleted_at.is_(None),
-    )
-    return list((await session.exec(stmt)).all())
+    return p
 
 
 async def _find_membership(
@@ -112,49 +117,131 @@ async def _find_membership(
 async def _has_other_owner(
     session, org_principal_id: int, exclude_member_principal_id: int
 ) -> bool:
-    stmt = select(PrincipalMembership.id).where(
-        PrincipalMembership.parent_principal_id == org_principal_id,
-        PrincipalMembership.role == OrgRole.OWNER,
-        PrincipalMembership.member_principal_id != exclude_member_principal_id,
-        PrincipalMembership.deleted_at.is_(None),
+    """True if at least one OWNER-membership other than ``exclude``
+    can actually act as an owner of this Org.
+
+    "Can act as owner" means:
+
+    - USER-owner: the user-principal itself is not soft-deleted.
+    - GROUP-owner: the group-principal is not soft-deleted *and* has
+      at least one active user-member. A soft-deleted Group, or a
+      Group with no active users, confers OWNER on nobody — counting
+      it would let the operator demote the last real owner and leave
+      the Org effectively ownerless.
+    """
+    gm = aliased(PrincipalMembership)
+    stmt = (
+        select(PrincipalMembership.id)
+        .join(Principal, Principal.id == PrincipalMembership.member_principal_id)
+        .where(
+            PrincipalMembership.parent_principal_id == org_principal_id,
+            PrincipalMembership.role == OrgRole.OWNER,
+            PrincipalMembership.member_principal_id != exclude_member_principal_id,
+            PrincipalMembership.deleted_at.is_(None),
+            Principal.deleted_at.is_(None),
+            or_(
+                Principal.kind == PrincipalType.USER,
+                and_(
+                    Principal.kind == PrincipalType.GROUP,
+                    exists(
+                        select(gm.id).where(
+                            gm.parent_principal_id == Principal.id,
+                            gm.deleted_at.is_(None),
+                        )
+                    ),
+                ),
+            ),
+        )
+        .limit(1)
     )
     return (await session.exec(stmt)).first() is not None
 
 
-async def _enrich_with_user_labels(
+async def _affected_user_ids(session, members: List[Principal]) -> set[int]:
+    """User ids whose ``get_user_accessible_model_names`` cache must be
+    invalidated when these Org memberships change.
+
+    USER members map to themselves. GROUP members fan out to every
+    active user currently in the group — removing a Group from an Org
+    revokes Org-mediated route access for each of those users via the
+    transitive branch of ``principal_users``. Soft-deleted users are
+    skipped: they can't authenticate, so no stale cache to clear.
+    """
+    user_ids: set[int] = set()
+    group_ids: set[int] = set()
+    for p in members:
+        if p.kind == PrincipalType.USER:
+            user_ids.add(p.id)
+        elif p.kind == PrincipalType.GROUP:
+            group_ids.add(p.id)
+    if group_ids:
+        stmt = (
+            select(PrincipalMembership.member_principal_id)
+            .join(Principal, Principal.id == PrincipalMembership.member_principal_id)
+            .where(
+                PrincipalMembership.parent_principal_id.in_(group_ids),
+                PrincipalMembership.deleted_at.is_(None),
+                Principal.kind == PrincipalType.USER,
+                Principal.deleted_at.is_(None),
+            )
+        )
+        user_ids.update((await session.exec(stmt)).all())
+    return user_ids
+
+
+async def _enrich_with_labels(
     session,
     org_principal_id: int,
     rows: List[PrincipalMembership],
 ) -> List[OrganizationMembershipPublic]:
-    """Bulk-resolve username / full_name / users.id for each membership.
+    """Resolve identity fields for each membership row.
 
-    Membership rows reference users via ``member_principal_id``
-    (= ``users.principal_id``). We join back to ``users`` so the
-    response can carry the legacy ``user_id`` (= ``users.id``) plus
-    display labels, in a single query — no per-row round trip from
-    the client.
+    Sends both ``Principal.name`` (stable identifier) and
+    ``Principal.display_name`` (optional human label); the UI picks
+    which to render. GROUP rows commonly have only ``name``; USER
+    rows commonly have both.
     """
     member_ids = {r.member_principal_id for r in rows}
-    user_by_principal: dict[int, User] = {}
-    if member_ids:
-        result = await session.exec(
-            select(User).where(User.principal_id.in_(member_ids))
-        )
-        user_by_principal = {u.principal_id: u for u in result.all()}
+    if not member_ids:
+        return []
+
+    principal_by_id: dict[int, Principal] = {
+        p.id: p
+        for p in (
+            await session.exec(
+                select(Principal).where(
+                    Principal.id.in_(member_ids),
+                    Principal.deleted_at.is_(None),
+                )
+            )
+        ).all()
+    }
+
     out: List[OrganizationMembershipPublic] = []
     for r in rows:
-        u = user_by_principal.get(r.member_principal_id)
-        out.append(
-            OrganizationMembershipPublic(
-                user_id=getattr(u, "id", 0),
-                organization_id=org_principal_id,
-                role=r.role,
-                created_at=r.created_at,
-                username=getattr(u, "username", None),
-                full_name=getattr(u, "full_name", None),
-            )
-        )
+        p = principal_by_id.get(r.member_principal_id)
+        if p is None:
+            continue
+        out.append(_to_public(p, r.role, r.created_at, org_principal_id))
     return out
+
+
+def _to_public(
+    p: Principal,
+    role: Optional[OrgRole],
+    created_at: datetime,
+    organization_id: int,
+) -> OrganizationMembershipPublic:
+    return OrganizationMembershipPublic(
+        principal_id=p.id,
+        principal_kind=p.kind,
+        principal_name=p.name,
+        principal_display_name=p.display_name,
+        principal_description=p.description,
+        organization_id=organization_id,
+        role=role,
+        created_at=created_at,
+    )
 
 
 @router.get(
@@ -162,11 +249,16 @@ async def _enrich_with_user_labels(
     response_model=List[OrganizationMembershipPublic],
 )
 async def list_org_members(session: SessionDep, ctx: TenantContextDep, org_id: int):
+    """List all members of an Org — Users and Groups together."""
     await _load_org(session, org_id)
     if not ctx.is_platform_admin and ctx.current_principal_id != org_id:
         raise ForbiddenException(message="Not a member of this organization")
-    rows = await _list_memberships(session, org_id)
-    return await _enrich_with_user_labels(session, org_id, rows)
+    stmt = select(PrincipalMembership).where(
+        PrincipalMembership.parent_principal_id == org_id,
+        PrincipalMembership.deleted_at.is_(None),
+    )
+    rows = list((await session.exec(stmt)).all())
+    return await _enrich_with_labels(session, org_id, rows)
 
 
 @router.post(
@@ -179,36 +271,46 @@ async def add_org_members(
     org_id: int,
     body: MembershipCreate,
 ):
-    """Add one or more members in a single request.
+    """Add one or more principals (Users or Groups) as Org members.
 
-    All-or-nothing: validate every user up front; if any are missing or
-    already members, raise and write nothing. On success, every row is
-    inserted in a single transaction.
+    All-or-nothing: validate every principal up front; if any are
+    missing, of the wrong kind, or already members, raise and write
+    nothing. On success, every row is inserted in a single
+    transaction. Soft-deleted rows are resurrected so the membership
+    timeline stays on a single row.
     """
     org = await _load_org(session, org_id)
 
     if not _can_manage(ctx, org_id):
         raise ForbiddenException(message="Insufficient permission to add member")
 
-    if not body.user_ids:
-        raise InvalidException(message="user_ids must not be empty")
+    if not body.principal_ids:
+        raise InvalidException(message="principal_ids must not be empty")
 
-    # Preserve order, drop duplicates the client sent.
-    user_ids = list(dict.fromkeys(body.user_ids))
+    principal_ids = list(dict.fromkeys(body.principal_ids))
 
-    # Bulk-resolve users in one query. Filter out system / soft-deleted
-    # rows the same way _resolve_user does.
-    rows = (await session.exec(select(User).where(User.id.in_(user_ids)))).all()
-    users_by_id: dict[int, User] = {
-        u.id: u for u in rows if not u.is_system and u.deleted_at is None
+    candidates = (
+        await session.exec(
+            select(Principal).where(
+                Principal.id.in_(principal_ids),
+                Principal.deleted_at.is_(None),
+            )
+        )
+    ).all()
+    principal_by_id: dict[int, Principal] = {
+        p.id: p
+        for p in candidates
+        if p.kind in (PrincipalType.USER, PrincipalType.GROUP)
     }
-    missing = [uid for uid in user_ids if uid not in users_by_id]
+    missing = [pid for pid in principal_ids if pid not in principal_by_id]
     if missing:
-        raise NotFoundException(message=f"User(s) not found: {missing}")
+        raise NotFoundException(message=f"Principal(s) not found: {missing}")
 
-    # Bulk-load existing memberships (including soft-deleted, so we can
-    # resurrect them instead of producing duplicate rows).
-    principal_ids = [users_by_id[uid].principal_id for uid in user_ids]
+    # System principals (cluster / worker service accounts) live in
+    # their own ``kind=SYSTEM`` row now, which the kind filter on
+    # ``principal_by_id`` (USER / GROUP only, above) already excludes —
+    # so no additional check is needed for them here.
+
     existing_rows = (
         await session.exec(
             select(PrincipalMembership).where(
@@ -220,77 +322,68 @@ async def add_org_members(
     existing_by_principal: dict[int, PrincipalMembership] = {
         m.member_principal_id: m for m in existing_rows
     }
-
     duplicates = [
-        uid
-        for uid in user_ids
-        if (m := existing_by_principal.get(users_by_id[uid].principal_id)) is not None
-        and m.deleted_at is None
+        pid
+        for pid in principal_ids
+        if (m := existing_by_principal.get(pid)) is not None and m.deleted_at is None
     ]
     if duplicates:
         raise AlreadyExistsException(
-            message=f"User(s) already members of organization {org.id}: {duplicates}"
+            message=f"Principal(s) already members of organization {org.id}: {duplicates}"
         )
 
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    stored_pairs: List[tuple[User, PrincipalMembership]] = []
+    stored: List[tuple[Principal, PrincipalMembership]] = []
     try:
-        for uid in user_ids:
-            user = users_by_id[uid]
-            existing = existing_by_principal.get(user.principal_id)
+        for pid in principal_ids:
+            p = principal_by_id[pid]
+            existing = existing_by_principal.get(pid)
             if existing is not None:
-                # Resurrect a soft-deleted row so the membership timeline
-                # stays on a single row.
                 existing.deleted_at = None
                 existing.role = body.role
                 existing.updated_at = now
                 session.add(existing)
-                stored_pairs.append((user, existing))
+                stored.append((p, existing))
             else:
                 row = PrincipalMembership(
                     parent_principal_id=org.id,
-                    member_principal_id=user.principal_id,
+                    member_principal_id=pid,
                     role=body.role,
                     created_at=now,
                     updated_at=now,
                 )
                 session.add(row)
-                stored_pairs.append((user, row))
+                stored.append((p, row))
         await session.commit()
     except Exception as e:
         await session.rollback()
         raise InvalidException(message=f"Failed to add members: {e}")
 
-    return [
-        OrganizationMembershipPublic(
-            user_id=user.id,
-            organization_id=org.id,
-            role=row.role,
-            created_at=row.created_at,
-            username=user.username,
-            full_name=user.full_name,
-        )
-        for user, row in stored_pairs
-    ]
+    # Bust each affected user's accessible-models cache so a session that
+    # queried before being added doesn't see a stale empty set.
+    affected = await _affected_user_ids(session, [p for p, _ in stored])
+    await delete_accessible_model_cache(*affected)
+
+    return [_to_public(p, row.role, row.created_at, org.id) for p, row in stored]
 
 
 @router.put(
-    "/organizations/{org_id}/members/{user_id}",
+    "/organizations/{org_id}/members/{principal_id}",
     response_model=OrganizationMembershipPublic,
 )
 async def update_org_member(
     session: SessionDep,
     ctx: TenantContextDep,
     org_id: int,
-    user_id: int,
+    principal_id: int,
     body: MembershipUpdate,
 ):
     await _load_org(session, org_id)
-    user = await _resolve_user(session, user_id)
-    if not user:
+    p = await _resolve_member_principal(session, principal_id)
+    if not p:
         raise NotFoundException(message="Membership not found")
 
-    membership = await _find_membership(session, org_id, user.principal_id)
+    membership = await _find_membership(session, org_id, principal_id)
     if not membership:
         raise NotFoundException(message="Membership not found")
 
@@ -299,7 +392,7 @@ async def update_org_member(
 
     if membership.role == OrgRole.OWNER and body.role != OrgRole.OWNER:
         if not await _has_other_owner(
-            session, org_id, exclude_member_principal_id=user.principal_id
+            session, org_id, exclude_member_principal_id=principal_id
         ):
             raise ConflictException(
                 message="Cannot demote the only owner of this organization"
@@ -314,29 +407,22 @@ async def update_org_member(
         await session.rollback()
         raise InvalidException(message=f"Failed to update member: {e}")
 
-    return OrganizationMembershipPublic(
-        user_id=user.id,
-        organization_id=org_id,
-        role=membership.role,
-        created_at=membership.created_at,
-        username=user.username,
-        full_name=user.full_name,
-    )
+    return _to_public(p, membership.role, membership.created_at, org_id)
 
 
-@router.delete("/organizations/{org_id}/members/{user_id}")
+@router.delete("/organizations/{org_id}/members/{principal_id}")
 async def remove_org_member(
     session: SessionDep,
     ctx: TenantContextDep,
     org_id: int,
-    user_id: int,
+    principal_id: int,
 ):
     await _load_org(session, org_id)
-    user = await _resolve_user(session, user_id)
-    if not user:
+    p = await _resolve_member_principal(session, principal_id)
+    if not p:
         raise NotFoundException(message="Membership not found")
 
-    membership = await _find_membership(session, org_id, user.principal_id)
+    membership = await _find_membership(session, org_id, principal_id)
     if not membership:
         raise NotFoundException(message="Membership not found")
 
@@ -345,10 +431,43 @@ async def remove_org_member(
 
     if membership.role == OrgRole.OWNER:
         if not await _has_other_owner(
-            session, org_id, exclude_member_principal_id=user.principal_id
+            session, org_id, exclude_member_principal_id=principal_id
         ):
             raise ConflictException(
                 message="Cannot remove the only owner of this organization"
+            )
+
+    # Snapshot the affected users BEFORE the soft-delete: for a GROUP
+    # member, the per-user fan-out reads ``principal_memberships`` rows
+    # that are still active here, but the Org→Group row we're about to
+    # delete doesn't affect that lookup (we expand the Group's own
+    # members, not its Org bindings).
+    affected = await _affected_user_ids(session, [p])
+
+    # Refuse removal while the member still has live API keys scoped to
+    # this Org: API-key auth resolves the Org from ``owner_principal_id``,
+    # not the (now-revoked) membership, so the key would keep working
+    # after removal. We don't auto-revoke — the Owner must clean up the
+    # keys (or disable them, once that's supported) first.
+    if affected:
+        preview_limit = 3
+        stmt = select(ApiKey.name).where(
+            ApiKey.user_id.in_(affected),
+            ApiKey.owner_principal_id == org_id,
+            ApiKey.deleted_at.is_(None),
+        )
+        names = (await session.exec(stmt)).all()
+        if names:
+            shown = ', '.join(f"'{n}'" for n in names[:preview_limit])
+            extra = len(names) - preview_limit
+            if extra > 0:
+                shown = f"{shown} (and {extra} more)"
+            raise ConflictException(
+                message=(
+                    "Cannot remove member because API keys they created "
+                    f"in this organization still exist: {shown}. "
+                    "Delete those API keys first, then retry."
+                )
             )
 
     try:
@@ -356,3 +475,8 @@ async def remove_org_member(
     except Exception as e:
         await session.rollback()
         raise InvalidException(message=f"Failed to remove member: {e}")
+
+    # Existing sessions for these users would otherwise keep hitting the
+    # cached accessible-model set until TTL expiry and continue
+    # resolving the just-removed Org's routes.
+    await delete_accessible_model_cache(*affected)

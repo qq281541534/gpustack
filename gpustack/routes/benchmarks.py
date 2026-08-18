@@ -15,10 +15,11 @@ from gpustack.api.exceptions import (
 from gpustack.api.responses import StreamingResponseWithStatusCode
 from gpustack.api.tenant import (
     bypass_tenant_filter,
-    assert_cluster_resource_visible,
-    cluster_resource_visibility_conditions,
+    assert_resource_visible,
+    tenant_list_conditions,
+    cluster_scoped_system,
+    scoped_cluster_row_visible,
 )
-from gpustack.schemas.clusters import Cluster
 from gpustack.schemas.models import (
     Model,
     ModelInstance,
@@ -115,14 +116,35 @@ async def get_benchmarks(
     )
 
 
-def gpu_summary_filter(data: Benchmark, gpu_summary: Optional[str]) -> bool:
-    if (
-        gpu_summary
-        and data.gpu_summary
-        and gpu_summary.lower() not in data.gpu_summary.lower()
-    ):
+def _fuzzy_contains(value: Optional[str], target: Optional[str]) -> bool:
+    """Return False only when the filter value is set but not contained in target."""
+    if not value:
+        return True
+    if not target:
         return False
-    return True
+    return value.lower() in target.lower()
+
+
+def gpu_summary_filter(data: Benchmark, gpu_summary: Optional[str]) -> bool:
+    return _fuzzy_contains(gpu_summary, data.gpu_summary)
+
+
+def _make_benchmark_visibility_filter(ctx):
+    def _visible(b: Benchmark) -> bool:
+        if cluster_scoped_system(ctx):
+            return scoped_cluster_row_visible(ctx, b)
+        if bypass_tenant_filter(ctx):
+            return True
+        org_id = getattr(b, "owner_principal_id", None)
+        if (
+            ctx.current_principal_id is not None
+            and org_id is not None
+            and org_id == ctx.current_principal_id
+        ):
+            return True
+        return False
+
+    return _visible
 
 
 async def _get_benchmarks(
@@ -139,38 +161,28 @@ async def _get_benchmarks(
     if search:
         fuzzy_fields["name"] = search
 
-    if profile:
-        fuzzy_fields["profile"] = profile
-
     fields = {}
     if state:
         fields["state"] = state
 
-    if model_name:
-        fields["model_name"] = model_name
-
     if dataset_name:
         fields["dataset_name"] = dataset_name
 
-    extra_conditions = list(cluster_resource_visibility_conditions(ctx, Benchmark))
+    extra_conditions = list(tenant_list_conditions(ctx, Benchmark))
     if gpu_summary:
         extra_conditions.append(
-            func.lower(Benchmark.gpu_summary).like(f"%{gpu_summary}%")
+            func.lower(Benchmark.gpu_summary).like(f"%{gpu_summary.lower()}%")
+        )
+    if profile:
+        extra_conditions.append(
+            func.lower(Benchmark.profile).like(f"%{profile.lower()}%")
+        )
+    if model_name:
+        extra_conditions.append(
+            func.lower(Benchmark.model_name).like(f"%{model_name.lower()}%")
         )
 
-    def _benchmark_visible(b: Benchmark) -> bool:
-        if bypass_tenant_filter(ctx):
-            return True
-        org_id = getattr(b, "owner_principal_id", None)
-        if (
-            ctx.current_principal_id is not None
-            and org_id is not None
-            and org_id == ctx.current_principal_id
-        ):
-            return True
-        if getattr(b, "cluster_id", None) in ctx.accessible_cluster_ids:
-            return True
-        return False
+    _benchmark_visible = _make_benchmark_visibility_filter(ctx)
 
     if params.watch:
         return StreamingResponse(
@@ -178,7 +190,9 @@ async def _get_benchmarks(
                 fields=fields,
                 fuzzy_fields=fuzzy_fields,
                 filter_func=lambda data: _benchmark_visible(data)
-                and gpu_summary_filter(data, gpu_summary),
+                and gpu_summary_filter(data, gpu_summary)
+                and _fuzzy_contains(profile, data.profile)
+                and _fuzzy_contains(model_name, data.model_name),
             ),
             media_type="text/event-stream",
         )
@@ -219,7 +233,7 @@ async def get_benchmark(
     id: int,
 ):
     benchmark = await Benchmark.one_by_id(session, id)
-    assert_cluster_resource_visible(
+    assert_resource_visible(
         ctx, benchmark, not_found_message=f"Benchmark {id} not found"
     )
     return benchmark
@@ -293,23 +307,25 @@ async def validate_and_mutate_benchmark_in(
         snapshot.gpus
     )
     mutated.worker_id = instance.worker_id
-    # Derive tenant scope from the benchmark's cluster.
-    if mutated.cluster_id is not None:
-        cluster = await Cluster.one_by_id(session, mutated.cluster_id)
-        if cluster is not None:
-            mutated.owner_principal_id = cluster.owner_principal_id
+    # Server-derive tenant scope from the target instance so client-supplied
+    # cluster_id can't smuggle a benchmark into another tenant, and so the
+    # row is visible to the owning Org via cluster_resource_visibility.
+    mutated.cluster_id = instance.cluster_id
+    mutated.owner_principal_id = instance.owner_principal_id
     return mutated
 
 
-@router.post("", response_model=BenchmarkPublic)
+@router.post(
+    "",
+    response_model=BenchmarkPublic,
+)
 async def create_benchmark(
     session: SessionDep, ctx: TenantContextDep, benchmark_in: BenchmarkCreate
 ):
     existing = await Benchmark.one_by_field(session, "name", benchmark_in.name)
     if existing:
         raise AlreadyExistsException(
-            message=f"Benchmark '{benchmark_in.name}' already exists. "
-            "Please choose a different name or check the existing benchmark."
+            message=f"Benchmark with name '{benchmark_in.name}' already exists."
         )
 
     mutated = await validate_and_mutate_benchmark_in(session, benchmark_in)
@@ -321,7 +337,10 @@ async def create_benchmark(
     return benchmark
 
 
-@router.put("/{id}", response_model=BenchmarkPublic)
+@router.put(
+    "/{id}",
+    response_model=BenchmarkPublic,
+)
 async def update_benchmark(
     session: SessionDep,
     ctx: TenantContextDep,
@@ -329,9 +348,7 @@ async def update_benchmark(
     benchmark_in: BenchmarkUpdate,
 ):
     benchmark = await Benchmark.one_by_id(session, id)
-    assert_cluster_resource_visible(
-        ctx, benchmark, not_found_message="Benchmark not found"
-    )
+    assert_resource_visible(ctx, benchmark, not_found_message="Benchmark not found")
     try:
         await benchmark.update(session, benchmark_in)
     except Exception as e:
@@ -340,7 +357,10 @@ async def update_benchmark(
     return benchmark
 
 
-@router.patch("/{id}/state", response_model=BenchmarkPublic)
+@router.patch(
+    "/{id}/state",
+    response_model=BenchmarkPublic,
+)
 async def update_benchmark_state(
     session: SessionDep,
     ctx: TenantContextDep,
@@ -348,9 +368,7 @@ async def update_benchmark_state(
     state_update: BenchmarkStateUpdate,
 ):
     benchmark = await Benchmark.one_by_id(session, id)
-    assert_cluster_resource_visible(
-        ctx, benchmark, not_found_message="Benchmark not found"
-    )
+    assert_resource_visible(ctx, benchmark, not_found_message="Benchmark not found")
 
     if (
         state_update.state is not None
@@ -412,14 +430,15 @@ async def get_benchmark_snapshot(
     )
 
 
-@router.post("/{id}/metrics", response_model=BenchmarkPublic)
+@router.post(
+    "/{id}/metrics",
+    response_model=BenchmarkPublic,
+)
 async def update_benchmark_metrics(
     session: SessionDep, ctx: TenantContextDep, id: int, metrics: BenchmarkMetrics
 ):
     benchmark = await Benchmark.one_by_id(session, id)
-    assert_cluster_resource_visible(
-        ctx, benchmark, not_found_message="Benchmark not found"
-    )
+    assert_resource_visible(ctx, benchmark, not_found_message="Benchmark not found")
     try:
         await benchmark.update(session, metrics)
     except Exception as e:
@@ -430,12 +449,12 @@ async def update_benchmark_metrics(
     return benchmark
 
 
-@router.delete("/{id}")
+@router.delete(
+    "/{id}",
+)
 async def delete_benchmark(session: SessionDep, ctx: TenantContextDep, id: int):
     benchmark = await Benchmark.one_by_id(session, id)
-    assert_cluster_resource_visible(
-        ctx, benchmark, not_found_message="Benchmark not found"
-    )
+    assert_resource_visible(ctx, benchmark, not_found_message="Benchmark not found")
 
     try:
         await benchmark.delete(session)
@@ -446,26 +465,26 @@ async def delete_benchmark(session: SessionDep, ctx: TenantContextDep, id: int):
 @router.get("/{id}/logs")
 async def get_benchmark_logs(  # noqa: C901
     request: Request,
-    session: SessionDep,
     ctx: TenantContextDep,
     id: int,
     log_options: LogOptionsDep,
 ):
-    benchmark = await Benchmark.one_by_id(session, id)
-    assert_cluster_resource_visible(
-        ctx, benchmark, not_found_message="Benchmark not found"
-    )
+    # Inline session released after the initial lookups so a long-lived
+    # follow-log stream doesn't hold a database connection for its duration.
+    async with async_session() as session:
+        benchmark = await Benchmark.one_by_id(session, id)
+        assert_resource_visible(ctx, benchmark, not_found_message="Benchmark not found")
 
-    worker = await Worker.one_by_id(session, benchmark.worker_id)
-    if not worker:
-        raise NotFoundException(message="Benchmark's worker not found")
+        worker = await Worker.one_by_id(session, benchmark.worker_id)
+        if not worker:
+            raise NotFoundException(message="Benchmark's worker not found")
 
-    if benchmark.state in [
-        BenchmarkStateEnum.ERROR,
-        BenchmarkStateEnum.STOPPED,
-        BenchmarkStateEnum.COMPLETED,
-    ]:
-        log_options.follow = False
+        if benchmark.state in [
+            BenchmarkStateEnum.ERROR,
+            BenchmarkStateEnum.STOPPED,
+            BenchmarkStateEnum.COMPLETED,
+        ]:
+            log_options.follow = False
 
     timeout = aiohttp.ClientTimeout(total=envs.PROXY_TIMEOUT, sock_connect=5)
 
@@ -546,7 +565,7 @@ async def export_benchmarks(
     ]
     extra_conditions = [
         col(Benchmark.id).in_(ids),
-        *cluster_resource_visibility_conditions(ctx, Benchmark),
+        *tenant_list_conditions(ctx, Benchmark),
     ]
     benchmarks: Sequence[Benchmark] = await Benchmark.all_by_fields(
         session, fields={}, extra_conditions=extra_conditions

@@ -22,13 +22,13 @@
 # - HIGRESS_APISERVER_VERSION: Version of Higress API server to use.
 ARG PYTHON_VERSION=3.11
 ARG GPUSTACK_BASE_IMAGE=base
+ARG GPUSTACK_OPERATOR_VERSION=v0.5.4
 ARG GPUSTACK_RUNTIME_ROCM_VERSION=7.0.2
 ARG GPUSTACK_RUNTIME_DOCKER_MIRRORED_NAME_FILTER_LABELS
 ARG HIGRESS_VERSION=2.1.9
 ARG HIGRESS_APISERVER_VERSION=0.0.26
 ARG PROMETHEUS_VERSION=3.5.1
 ARG GRAFANA_VERSION=12.2.4
-ARG ROCM_BASE_PLATFORM=linux/amd64
 
 # Stage Base
 #
@@ -36,6 +36,7 @@ ARG ROCM_BASE_PLATFORM=linux/amd64
 #   docker build --tag=gpustack/gpustack:base --file=pack/Dockerfile --target=base --progress=plain .
 #
 
+FROM gpustack/gpustack-operator:${GPUSTACK_OPERATOR_VERSION} AS gpustack-operator
 FROM gpustack/mirrored-higress-api-server:${HIGRESS_APISERVER_VERSION} AS apiserver
 FROM gpustack/mirrored-higress-higress:${HIGRESS_VERSION} AS controller
 FROM gpustack/mirrored-higress-pilot:${HIGRESS_VERSION} AS pilot
@@ -301,10 +302,10 @@ ENV S6_KEEP_ENV=1 \
 #   docker build --tag=gpustack/gpustack:main --file=pack/Dockerfile --progress=plain .
 #
 
-# Vendor ROCm libraries from ROCm base image,
-# now only linux/amd64 is supported.
-# Must build on linux/amd64 platform.
-FROM --platform=${ROCM_BASE_PLATFORM} rocm/dev-ubuntu-22.04:${GPUSTACK_RUNTIME_ROCM_VERSION} AS rocm-base
+# Vendor ROCm libraries from ROCm base image.
+# Only the linux/amd64 ROCm source image is available, so pin the source
+# platform explicitly; the build host itself can be any platform.
+FROM --platform=linux/amd64 rocm/dev-ubuntu-22.04:${GPUSTACK_RUNTIME_ROCM_VERSION} AS rocm-base
 
 FROM ${GPUSTACK_BASE_IMAGE} AS gpustack
 SHELL ["/bin/bash", "-eo", "pipefail", "-c"]
@@ -353,13 +354,18 @@ RUN <<EOF
         && gosu postgres echo "host  all  root  ::1/128       trust" >> /etc/postgresql/main/pg_hba.conf \
         && gosu postgres echo "host  all  all   0.0.0.0/0     scram-sha-256" >> /etc/postgresql/main/pg_hba.conf
 
+    # Logging: emit one file per calendar day with a readable date name and
+    # disable size-based rotation so a busy day stays in a single file.
+    # Postgres' own rotation never deletes old logs (that is what let them
+    # grow to 18GB, issue #5774) — retention is enforced out-of-band by the
+    # supercronic cleanup job in /var/lib/istio/cron.txt.
     gosu postgres sed -i "s/^data_directory/#data_directory/" "$PGCONFIG_FILE" \
         && gosu postgres sed -i "s/^hba_file/#hba_file/" "$PGCONFIG_FILE" \
         && gosu postgres sed -i "s/^#log_destination/log_destination/" "$PGCONFIG_FILE" \
-        && gosu postgres sed -i "s/^#log_min_messages = warning/log_min_messages = info/" "$PGCONFIG_FILE" \
         && gosu postgres sed -i "s/^#logging_collector = off/logging_collector = on/" "$PGCONFIG_FILE" \
-        && gosu postgres sed -i "s/^#log_filename/log_filename/" "$PGCONFIG_FILE" \
-        && gosu postgres sed -i "s/^#log_rotation_size/log_rotation_size/" "$PGCONFIG_FILE"
+        && gosu postgres sed -i "s|^[# ]*log_filename.*|log_filename = 'postgresql-%Y-%m-%d.log'|" "$PGCONFIG_FILE" \
+        && gosu postgres sed -i "s|^[# ]*log_rotation_age.*|log_rotation_age = 1d|" "$PGCONFIG_FILE" \
+        && gosu postgres sed -i "s|^[# ]*log_rotation_size.*|log_rotation_size = 0|" "$PGCONFIG_FILE"
 
     # Cleanup
     rm -rf /var/tmp/* \
@@ -793,7 +799,11 @@ ENV GPUSTACK_RUNTIME_LOG_EXCEPTION="false" \
     GPUSTACK_RUNTIME_DOCKER_IMAGE_NO_PULL_VISUALIZATION="true" \
     GPUSTACK_RUNTIME_DOCKER_MIRRORED_NAME_FILTER_LABELS="${GPUSTACK_RUNTIME_DOCKER_MIRRORED_NAME_FILTER_LABELS}"
 
+COPY --from=gpustack-operator /usr/bin/gpustack-operator /usr/bin/gpustack-operator
 COPY --chmod=755 pack/entrypoint.sh /usr/bin/entrypoint.sh
+
+## KUBE_FEATURE_WatchListClient=false: Disable WatchListClient to avoid potential issues with Kubernetes API server versions that do not support it.
+ENV KUBE_FEATURE_WatchListClient="false"
 
 WORKDIR /
 ENTRYPOINT [ "/usr/bin/entrypoint.sh" ]

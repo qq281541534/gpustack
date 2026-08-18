@@ -1,6 +1,7 @@
 import re
 import shlex
 from datetime import datetime
+from enum import Enum
 from typing import Dict, List, Optional
 
 from gpustack_runtime.deployer.__utils__ import compare_versions
@@ -11,6 +12,13 @@ from sqlmodel import SQLModel, Field as SQLField
 from gpustack.mixins import BaseModelMixin
 from .common import pydantic_column_type, PaginatedList
 from .models import BackendEnum, BackendSourceEnum
+
+
+class ParameterFormatEnum(str, Enum):
+    """Parameter format for backend parameters."""
+
+    SPACE = "space"  # --key value format
+    EQUAL = "equal"  # --key=value format
 
 
 class ContainerEnvConfig(BaseModel):
@@ -64,6 +72,8 @@ class InferenceBackendBase(SQLModel):
         default_entrypoint: Default entrypoint to replace for the inference server
         description: Backend description
         health_check_path: Path for health check endpoint
+        parameter_format: Parameter format for backend parameters (Optional)
+        common_parameters: List of commonly used parameters for UI hints (Optional)
 
     """
 
@@ -102,6 +112,10 @@ class InferenceBackendBase(SQLModel):
     enabled: Optional[bool] = SQLField(default=None)
     icon: Optional[str] = SQLField(default=None)
     default_env: Optional[Dict[str, str]] = SQLField(
+        sa_column=Column(JSON), default=None
+    )
+    parameter_format: Optional[ParameterFormatEnum] = SQLField(default=None)
+    common_parameters: Optional[List[str]] = SQLField(
         sa_column=Column(JSON), default=None
     )
 
@@ -191,6 +205,8 @@ class InferenceBackendBase(SQLModel):
         port: Optional[int],
         worker_ip: Optional[str] = None,
         model_name: Optional[str] = None,
+        gpu_count: Optional[int] = None,
+        gpu_ids: Optional[List[int]] = None,
         command: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
     ) -> str:
@@ -203,6 +219,12 @@ class InferenceBackendBase(SQLModel):
         command = command.replace("{{port}}", str(port))
         command = command.replace("{{worker_ip}}", worker_ip or "")
         command = command.replace("{{model_name}}", model_name or "")
+        command = command.replace(
+            "{{gpu_count}}", str(gpu_count) if gpu_count is not None else ""
+        )
+        command = command.replace(
+            "{{gpu_ids}}", ",".join(str(i) for i in gpu_ids) if gpu_ids else ""
+        )
 
         # Resolve environment variables using {{VAR_NAME}} syntax
         # Use provided env (from model) if available, otherwise fall back to backend env
@@ -322,6 +344,8 @@ class InferenceBackendListItem(BaseModel):
     enabled: Optional[bool] = Field(None)
     backend_source: Optional[BackendSourceEnum] = Field(None)
     default_env: Optional[Dict[str, str]] = Field(None)
+    parameter_format: Optional[ParameterFormatEnum] = Field(None)
+    common_parameters: Optional[List[str]] = Field(None)
 
 
 class InferenceBackendResponse(BaseModel):

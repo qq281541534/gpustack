@@ -1,6 +1,7 @@
 import logging
 from datetime import datetime, timezone
-from typing import List, Optional, Union, Set, Tuple
+from typing import List, NamedTuple, Optional, Tuple, Union, Set
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import SQLModel, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -25,21 +26,32 @@ from gpustack.schemas.model_routes import (
 )
 from gpustack.schemas.principals import (
     OrgRole,
-    PLATFORM_PRINCIPAL_ID,
     Principal,
     PrincipalMembership,
     PrincipalType,
+    get_platform_principal_id,
+    platform_principal_id,
 )
-from gpustack.schemas.users import User
+from gpustack.schemas.users import AuthProviderEnum, User
 from gpustack.schemas.clusters import Cluster
 from gpustack.schemas.workers import Worker
 from gpustack.server.cache import (
     delete_cache_by_key,
     locked_cached,
 )
+from gpustack.server.worker_allocated_cache import invalidate_workers_allocated
+from gpustack.utils.usage_snapshots import propagate_user_rename
 
 
 logger = logging.getLogger(__name__)
+
+
+class RouteTargetResolution(NamedTuple):
+    """Routing decision for a single ModelRouteTarget."""
+
+    model_id: int
+    overridden_model_name: Optional[str]
+    weight: int
 
 
 class UserService:
@@ -59,33 +71,91 @@ class UserService:
         if result.worker is not None:
             # detach worker to avoid lazy loading
             self.session.expunge(result.worker)
+        if result.cluster is not None:
+            # detach cluster too — the cached User outlives this session
+            # and tenant-context resolution reads cluster.id /
+            # cluster.owner_principal_id on later requests; an instance
+            # still tied to the closed session risks DetachedInstanceError
+            # if anything expires it.
+            self.session.expunge(result.cluster)
         self.session.expunge(result)
         return result
 
     @locked_cached()
     async def get_by_username(self, username: str) -> Optional[User]:
-        result = await User.one_by_field(self.session, "username", username)
+        # ``username`` is the wire-level name for the storage column
+        # ``name`` (k8s-style identifier). The cache key passes
+        # through the legacy parameter name so OAuth2 password
+        # callers don't need to know about the rename.
+        #
+        # Scoped to ``kind == USER``: login is USER-only, and since USER
+        # now has its own name partition a same-named ORG must not be
+        # returned here (it would otherwise shadow a real user login).
+        # Persisted SYSTEM principals never reach this path — they
+        # authenticate via API token (``get_by_id``) or in-memory.
+        #
+        # ``cluster`` / ``worker`` are eager-loaded for parity with
+        # ``get_by_id``; for a USER row they resolve to None.
+        result = await User.one_by_fields(
+            self.session,
+            {"name": username, "kind": PrincipalType.USER},
+            options=[selectinload(User.cluster), selectinload(User.worker)],
+        )
         if result is None:
             return None
         self.session.expunge(result)
         return result
 
-    async def create(self, user: User):
-        return await create_user_with_principal(self.session, user)
+    async def update(
+        self,
+        user: User,
+        source: Union[dict, SQLModel, None] = None,
+        *,
+        auto_commit: bool = True,
+    ):
+        old_name = user.name
+        result = await user.update(self.session, source, auto_commit=False)
+        # Refresh denormalized ``user_name`` snapshots on usage rows so
+        # dashboards reflect the new name. Bundled in the same
+        # transaction as the user-row write so a rollback rolls back
+        # both. See :func:`propagate_user_rename` for scope notes.
+        if user.name != old_name:
+            await propagate_user_rename(self.session, user.id, user.name)
+        # ``auto_commit=False`` defers the commit to the caller so
+        # this write can share a transaction with other writes; the
+        # caller is then also responsible for invoking
+        # :meth:`invalidate_cache` *after* it commits. Invalidating
+        # here would evict the entry while the row write is still
+        # uncommitted, letting a concurrent read refill the cache
+        # from the pre-commit row and leave stale data past the commit.
+        if auto_commit:
+            await self.session.commit()
+            await self.invalidate_cache(user, old_name=old_name)
+        return result
 
-    async def update(self, user: User, source: Union[dict, SQLModel, None] = None):
-        result = await user.update(self.session, source)
+    async def invalidate_cache(
+        self, user: User, *, old_name: Optional[str] = None
+    ) -> None:
+        """Drop this user's read-through cache entries.
+
+        Meant to run after a commit; :meth:`update` calls it inline
+        when ``auto_commit=True``, otherwise the caller invokes it
+        once its enclosing transaction has committed. Accepts the
+        pre-update ``old_name`` so a rename can drop the entry keyed
+        by the previous username too.
+        """
         await delete_cache_by_key(self.get_by_id, user.id)
         await delete_cache_by_key(self.get_user_accessible_model_names, user.id)
-        await delete_cache_by_key(self.get_by_username, user.username)
-        return result
+        await delete_cache_by_key(self.get_by_username, user.name)
+        if old_name and old_name != user.name:
+            await delete_cache_by_key(self.get_by_username, old_name)
 
     async def delete(self, user: User):
         apikeys = await APIKeyService(self.session).get_by_user_id(user.id)
         result = await user.delete(self.session)
         await delete_cache_by_key(self.get_by_id, user.id)
         await delete_cache_by_key(self.get_user_accessible_model_names, user.id)
-        await delete_cache_by_key(self.get_by_username, user.username)
+        await delete_cache_by_key(self.get_by_username, user.name)
         for apikey in apikeys:
             await delete_cache_by_key(
                 APIKeyService.get_by_access_key, apikey.access_key
@@ -122,9 +192,10 @@ class UserService:
     async def get_user_accessible_model_names(self, user_id: int) -> Set[str]:
         # Get all accessible model names for the user. The set holds two
         # forms per route:
-        #   1. Org-effective name (`<slug>/<route>` for non-platform
-        #      Orgs, raw for platform) — matches `/v1/models` output and
-        #      the gateway's ingress header matcher.
+        #   1. Org-effective name (`<owner-name>/<route>` for
+        #      non-platform Orgs, raw for platform) — matches
+        #      `/v1/models` output and the gateway's ingress header
+        #      matcher.
         #   2. Raw `route.name` — matches the post-`modelMapping` value
         #      that Higress's AI proxy hands back via
         #      `x-higress-llm-model` on the auth callback. Without this
@@ -137,7 +208,7 @@ class UserService:
         user: User = await self.get_by_id(user_id)
         if user is None:
             return set()
-        if user.is_admin or user.is_system:
+        if user.is_admin or user.kind == PrincipalType.SYSTEM:
             routes = await ModelRoute.all_by_field(self.session, "deleted_at", None)
         else:
             routes = await MyModel.all_by_fields(
@@ -164,104 +235,219 @@ class UserService:
             names.add(
                 effective_route_name(
                     r.name,
-                    getattr(owner, "slug", None),
-                    getattr(owner, "id", None) == PLATFORM_PRINCIPAL_ID,
+                    getattr(owner, "name", None),
+                    getattr(owner, "id", None) == platform_principal_id(),
                 )
             )
             names.add(r.name)
         return names
 
 
-async def create_user_with_principal(session: AsyncSession, user: User) -> User:
-    """Persist a User together with its 1:1 USER-principal.
-
-    Replaces the bare ``User.create(...)`` call at every user-creation
-    site (local POST /users, SSO callbacks, bootstrap admin, worker
-    registration).
-
-    Why the dance:
-
-    - ``users.principal_id`` is NOT NULL, so the principal row must
-      exist before the user row is inserted.
-    - Callers naturally construct users with relationship attributes
-      (``cluster=cluster``, ``worker=worker``). Those backref-populate
-      the parent's ``cluster_users`` / ``workers`` collections at
-      construction time, before the user is in any session — which
-      both emits a noisy ``SAWarning`` and, more importantly, leaves
-      a dangling ``InstanceState`` reference that crashes the
-      bus-event payload deepcopy at commit time.
-
-    The fix is to (1) ``session.add(user)`` immediately so the
-    pre-construction backref entries point at a session-tracked
-    object, then (2) use the ``user.principal`` relationship attribute
-    so SQLAlchemy's unit of work inserts the principal first and
-    auto-populates ``user.principal_id`` during a single combined
-    flush. The principal's ``slug`` is patched to ``user-{user.id}``
-    afterward, once the auto-generated user id is known.
-
-    Caller commits.
-    """
-    # Step 1 — make the session aware of the user before any flush
-    # touches related collections.
-    session.add(user)
-
-    # Step 2 — link via the relationship attribute so SQLAlchemy
-    # orders ``principal`` before ``user`` and threads the auto-id
-    # through automatically.
-    principal = Principal(
-        kind=PrincipalType.USER,
-        name=user.username,
-        slug=None,
-    )
-    user.principal = principal
-    session.add(principal)
-    await session.flush([principal, user])
-
-    # Step 3 — slug is globally unique among non-NULL values; assign
-    # the canonical ``user-{id}`` form now that the user id is known.
-    principal.slug = f"user-{user.id}"
-    await session.flush([principal])
-
-    return user
-
-
-async def provision_user_principal(session: AsyncSession, user: User) -> Principal:
-    """Backfill a USER-principal for an existing user that lacks one.
-
-    Used by SSO callbacks for users created before the multi-tenancy
-    migration shipped — they exist in the database without
-    ``principal_id``. Fresh user creation goes through
-    ``create_user_with_principal`` instead.
-    """
-    principal = Principal(
-        kind=PrincipalType.USER,
-        name=user.username,
-        slug=f"user-{user.id}",
-    )
-    session.add(principal)
-    await session.flush([principal])
-    user.principal_id = principal.id
-    session.add(user)
-    await session.flush([user])
-    return principal
-
-
 async def provision_bootstrap_admin_orgs(session: AsyncSession, user: User) -> None:
     """Add the bootstrap admin as OWNER of the platform Org.
 
-    Assumes ``user`` already has a ``principal_id`` (created via
-    ``create_user_with_principal``). Caller commits.
+    Caller commits.
     """
     now = datetime.now(timezone.utc).replace(tzinfo=None)
+    platform_id = await get_platform_principal_id(session)
     session.add(
         PrincipalMembership(
-            parent_principal_id=PLATFORM_PRINCIPAL_ID,
-            member_principal_id=user.principal_id,
+            parent_principal_id=platform_id,
+            member_principal_id=user.id,
             role=OrgRole.OWNER,
             created_at=now,
             updated_at=now,
         )
     )
+
+
+async def _insert_group_or_refetch(
+    session: AsyncSession,
+    name: str,
+    provider: AuthProviderEnum,
+    now: datetime,
+) -> Optional[Principal]:
+    """Insert a new GROUP-principal, or re-fetch if a concurrent
+    transaction beat us to it.
+
+    SAVEPOINT-wraps the insert so an IntegrityError from
+    ``uix_principals_group_name`` (PG partial unique; MySQL falls
+    back to a plain index) doesn't roll back the caller's
+    transaction — we re-read the winning row instead.
+
+    Returns ``None`` when the winning row's source disagrees with
+    ``provider`` (cross-source adoption is refused). Raises only if
+    IntegrityError fired but no row is visible on re-read.
+    """
+    grp = Principal(
+        kind=PrincipalType.GROUP,
+        name=name,
+        source=provider,
+        created_at=now,
+        updated_at=now,
+    )
+    try:
+        async with session.begin_nested():
+            session.add(grp)
+            await session.flush([grp])
+        return grp
+    except IntegrityError:
+        existing = (
+            await session.exec(
+                select(Principal).where(
+                    Principal.kind == PrincipalType.GROUP,
+                    Principal.deleted_at.is_(None),
+                    Principal.name == name,
+                )
+            )
+        ).first()
+        if existing is None:
+            raise
+        if existing.source != provider:
+            logger.warning(
+                "Group '%s' exists with source '%s'; refusing to adopt "
+                "for provider '%s' sync.",
+                name,
+                existing.source,
+                provider,
+            )
+            return None
+        return existing
+
+
+async def sync_user_group_memberships(
+    session: AsyncSession,
+    user_principal_id: int,
+    provider: AuthProviderEnum,
+    group_names: List[str],
+) -> None:
+    """Authoritatively reconcile a user's Group memberships from an IdP.
+
+    Called from OIDC / SAML callbacks with the user's group set as the
+    IdP currently sees it. Resolves each name to a Group-principal
+    (creating one with ``kind=GROUP`` for names we've never seen),
+    then diffs against the user's current Group memberships **scoped
+    to** ``source == provider``:
+
+    - Names present in the IdP but not on the user → insert (or revive
+      a soft-deleted row) with ``source=provider``.
+    - Memberships present locally with matching source but absent from
+      the IdP → soft-delete.
+    - Admin-curated memberships (``source=Local``) and memberships
+      sourced by a *different* IdP are never touched. The same group
+      can have one Local membership and one OIDC-sourced membership
+      side by side for the same user; that's how the bookkeeping
+      survives mixed setups.
+
+    Group entities themselves are never deleted by this function — a
+    Group may have outstanding (Org → Group) bindings the admin
+    relies on; lifecycle for Group rows lives on the ``/groups`` admin
+    surface. Provider must be ``OIDC`` or ``SAML``; ``Local`` would
+    be a logic error and is rejected.
+
+    Caller commits.
+    """
+    if provider == AuthProviderEnum.Local:
+        raise InternalServerErrorException(
+            message="sync_user_group_memberships is not for Local provider"
+        )
+
+    # De-dupe + drop blanks. Caller (auth ``_coerce_group_claim``)
+    # already trims and drops empty entries; we defensively re-check
+    # so direct callers of this service (tests, future SCIM endpoint,
+    # ...) can't slip an empty / duplicate name through.
+    wanted_names: List[str] = []
+    seen = set()
+    for name in group_names:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        wanted_names.append(name)
+
+    # Cross-source name matches are refused, not adopted — the IdP
+    # claim is skipped so the user's other groups still sync.
+    desired_group_ids: Set[int] = set()
+    if wanted_names:
+        existing = (
+            await session.exec(
+                select(Principal).where(
+                    Principal.kind == PrincipalType.GROUP,
+                    Principal.deleted_at.is_(None),
+                    Principal.name.in_(wanted_names),
+                )
+            )
+        ).all()
+        existing_by_name = {p.name: p for p in existing}
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        for name in wanted_names:
+            grp = existing_by_name.get(name)
+            if grp is not None and grp.source != provider:
+                logger.warning(
+                    "Skipping group sync for '%s': exists with source "
+                    "'%s' but provider is '%s'.",
+                    name,
+                    grp.source,
+                    provider,
+                )
+                continue
+            if grp is None:
+                grp = await _insert_group_or_refetch(session, name, provider, now)
+                if grp is None:
+                    continue
+            desired_group_ids.add(grp.id)
+
+    # Memberships this sync owns: this user's rows with matching
+    # provider on both the membership and the parent group. The
+    # group-source filter keeps legacy mis-attached rows out of the
+    # diff so first sync after upgrade doesn't silently delete them.
+    user_pm_stmt = (
+        select(PrincipalMembership)
+        .join(Principal, Principal.id == PrincipalMembership.parent_principal_id)
+        .where(
+            PrincipalMembership.member_principal_id == user_principal_id,
+            PrincipalMembership.source == provider,
+            Principal.kind == PrincipalType.GROUP,
+            Principal.source == provider,
+        )
+    )
+    owned_rows: List[PrincipalMembership] = list(
+        (await session.exec(user_pm_stmt)).all()
+    )
+    owned_by_group: dict[int, PrincipalMembership] = {
+        m.parent_principal_id: m for m in owned_rows
+    }
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    # Adds + revives.
+    for gid in desired_group_ids:
+        existing = owned_by_group.get(gid)
+        if existing is None:
+            session.add(
+                PrincipalMembership(
+                    parent_principal_id=gid,
+                    member_principal_id=user_principal_id,
+                    role=None,
+                    source=provider,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        elif existing.deleted_at is not None:
+            existing.deleted_at = None
+            existing.updated_at = now
+            session.add(existing)
+
+    # Removals: anything we own but the IdP no longer claims.
+    for gid, row in owned_by_group.items():
+        if gid in desired_group_ids:
+            continue
+        if row.deleted_at is not None:
+            continue
+        row.deleted_at = now
+        row.updated_at = now
+        session.add(row)
 
 
 class APIKeyService:
@@ -302,6 +488,29 @@ class ClusterService:
     @locked_cached()
     async def get_by_id(self, cluster_id: int) -> Optional[Cluster]:
         result = await Cluster.one_by_id(self.session, cluster_id)
+        if result is None:
+            return None
+        self.session.expunge(result)
+        return result
+
+
+class PrincipalService:
+    """Cached principal (user / org / group) lookups by id.
+
+    Mirrors ``ClusterService`` — an in-memory, TTL'd, coordinator-invalidated
+    cache shared across sessions (the result is expunged so it's detached and
+    safe to hold). Intended for hot paths that only need a principal's ``name``,
+    e.g. the resource-event logger resolving owner / consumer / creator names on
+    every event. Rename staleness is bounded by the cache TTL, which is fine for
+    display / audit names.
+    """
+
+    def __init__(self, session: AsyncSession):
+        self.session = session
+
+    @locked_cached()
+    async def get_by_id(self, principal_id: int) -> Optional[Principal]:
+        result = await Principal.one_by_id(self.session, principal_id)
         if result is None:
             return None
         self.session.expunge(result)
@@ -383,9 +592,10 @@ async def collect_route_cache_names(
     """Names to invalidate when a route's resolution may change.
 
     Callers in routes/openai.py and gateway/auth callbacks key the
-    @locked_cached entries by whatever string they receive — that is the
-    raw route_name for the platform Org and the slug-prefixed effective
-    name for any other Org. Both must be cleared.
+    @locked_cached entries by whatever string they receive — that is
+    the raw route_name for the platform Org and the
+    ``<owner-name>/<route-name>`` effective name for any other Org.
+    Both must be cleared.
     """
     names = {route_name}
     route = await ModelRoute.one_by_id(session, route_id)
@@ -394,7 +604,7 @@ async def collect_route_cache_names(
         if owner:
             names.add(
                 effective_route_name(
-                    route_name, owner.slug, owner.id == PLATFORM_PRINCIPAL_ID
+                    route_name, owner.name, owner.id == platform_principal_id()
                 )
             )
     return names
@@ -405,25 +615,31 @@ class ModelRouteService:
         self.session = session
 
     @locked_cached()
-    async def get_by_name(self, name: str) -> Optional[ModelRoute]:
-        result = await ModelRoute.one_by_field(self.session, "name", name)
-        if result is None:
-            return None
-        self.session.expunge(result)
-        return result
-
-    @locked_cached()
     async def get_model_auth_info_by_name(
         self, name: str
     ) -> Optional[Tuple[AccessPolicyEnum, str]]:
         # Higress's auth callback may hand us either the Org-effective
-        # name (`<slug>/<route>`) or the raw `route.name` depending on
-        # whether `modelMapping` has fired yet. Resolve both forms.
+        # name (`<owner-name>/<route>`) or the raw `route.name`
+        # depending on whether `modelMapping` has fired yet. Resolve
+        # both forms.
         route: Optional[ModelRoute] = None
         if "/" in name:
-            slug, _, rest = name.partition("/")
+            owner_name, _, rest = name.partition("/")
             if rest:
-                owner = await Principal.one_by_field(self.session, "slug", slug)
+                # Route owners are always ORG principals — USER /
+                # SYSTEM / GROUP never own routes. Scope the lookup
+                # accordingly so a same-named non-ORG principal (e.g.
+                # a GROUP under the partitioned name model) can't be
+                # mis-resolved as the URL prefix owner.
+                owner = (
+                    await self.session.exec(
+                        select(Principal).where(
+                            Principal.name == owner_name,
+                            Principal.kind == PrincipalType.ORG,
+                            Principal.deleted_at.is_(None),
+                        )
+                    )
+                ).first()
                 if owner is not None:
                     route = await ModelRoute.one_by_fields(
                         self.session,
@@ -459,25 +675,43 @@ class ModelRouteService:
         return route.access_policy, registration_token
 
     @locked_cached()
-    async def get_model_ids_by_model_route_name(self, name: str) -> List[Model]:
-        # Clients send the principal-prefixed effective name (e.g.
-        # "org1/qwen3-0.6b" or "user-42/qwen3-0.6b"). Targets are stored
-        # keyed by raw ``route_name``, so split off the prefix and
-        # constrain by the route's owning principal. Platform routes
-        # have no prefix — fall back to the legacy lookup.
+    async def resolve_route_targets(self, name: str) -> List[RouteTargetResolution]:
+        """Resolve a request model name to routing decisions, honoring an
+        optional `<owner-name>/<route>` principal prefix.
+        """
         owner_principal_id: Optional[int] = None
         raw_name = name
         if "/" in name:
-            slug, _, rest = name.partition("/")
+            owner_name, _, rest = name.partition("/")
             if rest:
-                owner = await Principal.one_by_field(self.session, "slug", slug)
+                # Route owners are always ORG principals — USER /
+                # SYSTEM / GROUP never own routes. Scope the lookup
+                # accordingly so a same-named non-ORG principal (e.g.
+                # a GROUP under the partitioned name model) can't be
+                # mis-resolved as the URL prefix owner.
+                owner = (
+                    await self.session.exec(
+                        select(Principal).where(
+                            Principal.name == owner_name,
+                            Principal.kind == PrincipalType.ORG,
+                            Principal.deleted_at.is_(None),
+                        )
+                    )
+                ).first()
                 if owner is not None:
                     owner_principal_id = owner.id
                     raw_name = rest
-                # If the slug didn't match a principal, fall through and
+                # If the principal name didn't match, fall through and
                 # try the literal name (handles edge cases like a route
                 # called "literal/with/slashes" before the prefix
                 # convention existed).
+        # A raw (unprefixed) name is the platform Org's namespace by the
+        # effective-route-name scheme; non-platform Orgs are addressed only
+        # via their `<owner-name>/<route>` prefix. Scope an unprefixed lookup
+        # to platform-owned routes so a raw name resolves within the platform
+        # Org rather than a same-named route in another Org.
+        if owner_principal_id is None:
+            owner_principal_id = platform_principal_id()
         target_fields = {
             "route_name": raw_name,
             "state": TargetStateEnum.ACTIVE,
@@ -486,12 +720,10 @@ class ModelRouteService:
         targets = await ModelRouteTarget.all_by_fields(
             self.session,
             fields=target_fields,
-            options=[selectinload(ModelRouteTarget.model)],
         )
-        # When a principal slug was parsed, narrow to that owner's
-        # route by joining through the parent ModelRoute's
-        # ``owner_principal_id``. Avoids an extra round-trip when the
-        # route name is globally unique (the typical single-Org case).
+        # Narrow to the resolved owner's route (the parsed prefix owner, or
+        # the platform Org for a raw name) by joining through the parent
+        # ModelRoute's ``owner_principal_id``.
         if owner_principal_id is not None and len(targets) > 0:
             route_ids = {t.route_id for t in targets if t.route_id is not None}
             owner_routes = await ModelRoute.all_by_fields(
@@ -503,10 +735,51 @@ class ModelRouteService:
             )
             allowed_route_ids = {r.id for r in owner_routes if r.id in route_ids}
             targets = [t for t in targets if t.route_id in allowed_route_ids]
-        models = [target.model for target in targets if target.model is not None]
-        for model in models:
-            self.session.expunge(model)
-        return models
+        return [
+            RouteTargetResolution(
+                model_id=target.model_id,
+                overridden_model_name=target.overridden_model_name,
+                weight=target.weight,
+            )
+            for target in targets
+            if target.model_id is not None
+        ]
+
+    @locked_cached()
+    async def get_by_name(self, name: str) -> Optional[ModelRoute]:
+        """Resolve a request model name to its ``ModelRoute`` row.
+
+        Mirrors the ``<owner-name>/<route>`` prefix handling from
+        :meth:`get_model_auth_info_by_name` so the OpenAI proxy can
+        attribute requests to the route they entered through regardless
+        of whether Higress's ``modelMapping`` has rewritten the name yet.
+        """
+        if "/" in name:
+            owner_name, _, rest = name.partition("/")
+            if rest:
+                owner = (
+                    await self.session.exec(
+                        select(Principal).where(
+                            Principal.name == owner_name,
+                            Principal.kind == PrincipalType.ORG,
+                            Principal.deleted_at.is_(None),
+                        )
+                    )
+                ).first()
+                if owner is not None:
+                    route = await ModelRoute.one_by_fields(
+                        self.session,
+                        {"name": rest, "owner_principal_id": owner.id},
+                    )
+                    if route is not None:
+                        return route
+        # An unprefixed name is the platform Org's namespace, matching
+        # resolve_route_targets — so attribution resolves to the same route
+        # the request was actually routed to.
+        return await ModelRoute.one_by_fields(
+            self.session,
+            {"name": name, "owner_principal_id": platform_principal_id()},
+        )
 
     async def update(
         self,
@@ -520,7 +793,8 @@ class ModelRouteService:
         )
         for name in names:
             await delete_cache_by_key(self.get_model_auth_info_by_name, name)
-            await delete_cache_by_key(self.get_model_ids_by_model_route_name, name)
+            await delete_cache_by_key(self.resolve_route_targets, name)
+            await delete_cache_by_key(self.get_by_name, name)
         return result
 
     async def delete(self, model_route: ModelRoute, auto_commit: bool = True):
@@ -531,7 +805,8 @@ class ModelRouteService:
         result = await model_route.delete(self.session, auto_commit=auto_commit)
         for name in names:
             await delete_cache_by_key(self.get_model_auth_info_by_name, name)
-            await delete_cache_by_key(self.get_model_ids_by_model_route_name, name)
+            await delete_cache_by_key(self.resolve_route_targets, name)
+            await delete_cache_by_key(self.get_by_name, name)
         return result
 
 
@@ -555,16 +830,22 @@ class ModelService:
         self.session.expunge(result)
         return result
 
-    async def update(self, model: Model, source: Union[dict, SQLModel, None] = None):
-        result = await model.update(self.session, source)
+    async def update(
+        self,
+        model: Model,
+        source: Union[dict, SQLModel, None] = None,
+        *,
+        auto_commit: bool = True,
+    ):
+        result = await model.update(self.session, source, auto_commit=auto_commit)
         await delete_cache_by_key(self.get_by_id, model.id)
         await delete_cache_by_key(self.get_by_name, model.name)
         return result
 
     async def delete(self, model: Model):
         # ORM cascade bypasses child service caches; collect ids and route
-        # names (raw + slug-prefixed effective) BEFORE deleting so we can
-        # invalidate them explicitly below.
+        # names (raw + owner-name-prefixed effective) BEFORE deleting so
+        # we can invalidate them explicitly below.
         instance_ids = list(
             (
                 await self.session.exec(
@@ -574,17 +855,19 @@ class ModelService:
         )
         route_names: Set[str] = set()
         stmt = (
-            select(ModelRouteTarget.route_name, Principal.slug, Principal.id)
+            select(ModelRouteTarget.route_name, Principal.name, Principal.id)
             .join(ModelRoute, ModelRoute.id == ModelRouteTarget.route_id)
             .join(Principal, Principal.id == ModelRoute.owner_principal_id)
             .where(ModelRouteTarget.model_id == model.id)
         )
-        for r_name, slug, p_id in (await self.session.exec(stmt)).all():
+        for r_name, owner_name, p_id in (await self.session.exec(stmt)).all():
             if not r_name:
                 continue
             route_names.add(r_name)
             route_names.add(
-                effective_route_name(r_name, slug, p_id == PLATFORM_PRINCIPAL_ID)
+                effective_route_name(
+                    r_name, owner_name, p_id == platform_principal_id()
+                )
             )
 
         result = await model.delete(self.session)
@@ -598,9 +881,7 @@ class ModelService:
 
         route_service = ModelRouteService(self.session)
         for route_name in route_names:
-            await delete_cache_by_key(
-                route_service.get_model_ids_by_model_route_name, route_name
-            )
+            await delete_cache_by_key(route_service.resolve_route_targets, route_name)
             await delete_cache_by_key(
                 route_service.get_model_auth_info_by_name, route_name
             )
@@ -636,6 +917,7 @@ class ModelInstanceService:
     async def create(self, model_instance):
         result = await ModelInstance.create(self.session, model_instance)
         await delete_cache_by_key(self.get_running_instances, model_instance.model_id)
+        await invalidate_workers_allocated([model_instance])
         return result
 
     async def update(
@@ -644,12 +926,14 @@ class ModelInstanceService:
         result = await model_instance.update(self.session, source)
         await delete_cache_by_key(self.get_running_instances, model_instance.model_id)
         await delete_cache_by_key(self.get_by_id, model_instance.id)
+        await invalidate_workers_allocated([model_instance])
         return result
 
     async def delete(self, model_instance: ModelInstance):
         result = await model_instance.delete(self.session)
         await delete_cache_by_key(self.get_running_instances, model_instance.model_id)
         await delete_cache_by_key(self.get_by_id, model_instance.id)
+        await invalidate_workers_allocated([model_instance])
         return result
 
     async def batch_delete(self, model_instances: List[ModelInstance]):
@@ -664,8 +948,15 @@ class ModelInstanceService:
                 ids.add(m.model_id)
             await self.session.commit()
 
+            # delete(auto_commit=False) returns before invalidating cached_all,
+            # so the batch commit must do it. Otherwise subscribe()'s replay
+            # snapshot keeps serving the deleted rows and watch reconnects
+            # resurrect them as ghost CREATED events.
+            await ModelInstance._invalidate_cached_all()
+
             for id in ids:
                 await delete_cache_by_key(self.get_running_instances, id)
+            await invalidate_workers_allocated(model_instances)
 
             return names
         except Exception as e:
@@ -679,6 +970,9 @@ class ModelInstanceService:
         model_instances: List[ModelInstance],
         source: Union[dict, SQLModel, None] = None,
     ):
+        if not model_instances:
+            return []
+
         names = [mi.name for mi in model_instances]
         ids = set()
         try:
@@ -687,8 +981,15 @@ class ModelInstanceService:
                 ids.add(m.model_id)
             await self.session.commit()
 
+            # Per-instance update() invalidates cached_all at flush time, i.e.
+            # before this manual commit — a concurrent read in that window could
+            # repopulate it with pre-commit state. Invalidate again after commit
+            # so the replay snapshot reflects the committed rows.
+            await ModelInstance._invalidate_cached_all()
+
             for id in ids:
                 await delete_cache_by_key(self.get_running_instances, id)
+            await invalidate_workers_allocated(model_instances)
 
             return names
         except Exception as e:
@@ -749,7 +1050,11 @@ async def revoke_model_access_cache(
 ):
     user_ids = set()
     if model is None:
-        result = await session.exec(select(User.id))
+        # Cache-bust everyone — restrict to actual users so we don't
+        # waste time invalidating ORG / GROUP keys that never existed.
+        result = await session.exec(
+            select(User.id).where(User.kind == PrincipalType.USER)
+        )
         user_ids = set(result.all())
     else:
         # Users with a direct grant on this route's ACL — i.e. their
@@ -761,7 +1066,7 @@ async def revoke_model_access_cache(
             select(User.id)
             .join(
                 ModelRoutePrincipalLink,
-                ModelRoutePrincipalLink.principal_id == User.principal_id,
+                ModelRoutePrincipalLink.principal_id == User.id,
             )
             .where(ModelRoutePrincipalLink.route_id == model.id)
         )

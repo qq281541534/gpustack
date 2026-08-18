@@ -29,11 +29,12 @@
 
 ## 概述
 
-GPUStack 是一个开源的 GPU 集群管理器，专为高效的 AI 模型部署而设计。它配置和编排推理引擎（vLLM、SGLang、TensorRT-LLM 或您自定义的引擎），以优化跨 GPU 集群的性能。其核心功能包括：
+GPUStack 是一个开源的 GPU 集群管理器，用于 AI 模型推理服务和 GPU 实例供应。它配置和编排推理引擎（vLLM、SGLang、TensorRT-LLM 或您自定义的引擎），并支持按需启动可通过 SSH 访问的 GPU 实例。其核心功能包括：
 - **多集群 GPU 管理。** 跨多个环境管理 GPU 集群。这包括本地服务器、Kubernetes 集群和云提供商。
 - **可插拔推理引擎。** 自动配置高性能推理引擎，如 vLLM、SGLang 和 TensorRT-LLM。您也可以根据需要添加自定义推理引擎。
 - **Day 0 模型支持。** GPUStack 的可插拔引擎架构使您能够在新模型发布当天即可部署。
 - **性能优化配置。** 提供预调优模式，用于低延迟或高吞吐量。GPUStack 支持扩展的 KV 缓存系统，如 LMCache 和 HiCache，以减少 TTFT。它还包括对推测性解码方法（如 EAGLE3、MTP 和 N-grams）的内置支持。
+- **GPU 实例。** 按需启动可通过 SSH 访问的 GPU 实例，适用于开发、微调和交互式工作负载。
 - **企业级运维能力。** 支持自动故障恢复、负载均衡、监控、认证和访问控制。
 
 ## 架构
@@ -48,7 +49,7 @@ GPUStack 使开发团队、IT 组织和服务提供商能够大规模地提供�
 
 GPUStack 的自动化引擎选择和参数优化可开箱即用地提供强大的推理性能。下图展示了相较于默认 vLLM 配置的吞吐量提升：
 
-![a100-throughput-comparison](docs/assets/a100-throughput-comparison.png)
+![h200-throughput-comparison](docs/assets/h200-throughput-comparison.png)
 
 有关详细的基准测试方法和结果，请访问我们的 [推理性能实验室](https://docs.gpustack.ai/latest/performance-lab/overview/)。
 
@@ -144,22 +145,23 @@ sudo docker exec gpustack cat /var/lib/gpustack/initial_admin_password
 ### 部署模型
 
 1.  在 GPUStack 用户界面中导航到 `Catalog` 页面。
-2.  从可用模型列表中选择 `Qwen3 0.6B` 模型。
-3.  部署兼容性检查通过后，点击 `Save` 按钮部署模型。
+2.  从可用模型列表中选择 `Qwen3.5-0.8B` 模型。
 
 ![从目录部署 qwen3](docs/assets/quick-start/quick-start-qwen3.png)
+
+3.  部署兼容性检查通过后，点击 `Save` 按钮部署模型。
 
 4.  GPUStack 将开始下载模型文件并部署模型。当部署状态显示为 `Running` 时，表示模型已成功部署。
 
 ![模型运行中](docs/assets/quick-start/model-running.png)
 
-5.  点击导航菜单中的 `Playground - Chat`，检查右上角 `Model` 下拉菜单中是否选中了 `qwen3-0.6b` 模型。现在您可以在 UI  playground 中与模型聊天了。
+5.  点击导航菜单中的 `Playground - Chat`，检查右上角 `Model` 下拉菜单中是否选中了 `qwen3.5-0.8b` 模型。现在您可以在 UI  playground 中与模型聊天了。
 
 ![快速聊天](docs/assets/quick-start/quick-chat.png)
 
 ### 通过 API 使用模型
 
-1.  将鼠标悬停在用户头像上，导航到 `API Keys` 页面，然后点击 `New API Key` 按钮。
+1.  导航到 `Access Control` > `API Keys` 页面，然后点击 `New API Key` 按钮。
 2.  填写 `Name` 并点击 `Save` 按钮。
 3.  复制生成的 API 密钥并将其保存在安全的地方。请注意，该密钥仅在创建时可见一次。
 4.  您现在可以使用该 API 密钥访问 GPUStack 提供的 OpenAI 兼容 API 端点。例如，使用 curl 如下所示：
@@ -172,7 +174,7 @@ curl http://your_gpustack_server_url/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $GPUSTACK_API_KEY" \
   -d '{
-    "model": "qwen3-0.6b",
+    "model": "qwen3.5-0.8b",
     "messages": [
       {
         "role": "system",
@@ -193,10 +195,8 @@ curl http://your_gpustack_server_url/v1/chat/completions \
 
 ## 构建
 
-1.  安装 Python（版本 3.10 到 3.12）。
-2.  运行 `make build`。
-
-您可以在 `dist` 目录中找到构建好的 wheel 包。
+1.  安装 [Docker](https://docs.docker.com/engine/install/)。
+2.  运行 `make package`。
 
 ## 贡献
 

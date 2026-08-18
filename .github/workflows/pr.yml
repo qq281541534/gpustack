@@ -15,6 +15,9 @@ on:
       - "**.jpg"
       - "**.gif"
 
+permissions:
+  contents: read
+
 jobs:
   linux-build:
     # Disabled in fork: upstream PR checks not applicable to our custom build workflow

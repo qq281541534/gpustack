@@ -1,5 +1,6 @@
 import pytest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from tests.utils.mock import mock_async_session
 
@@ -12,9 +13,11 @@ from gpustack.schemas.models import (
     ComputedResourceClaim,
     ExtendedKVCacheConfig,
     GPUSelector,
+    LoraListEntry,
     ModelInstanceStateEnum,
     ModelInstanceSubordinateWorker,
     BackendEnum,
+    SourceEnum,
 )
 from tests.fixtures.workers.fixtures import (
     linux_mix_1_nvidia_4080_16gx1_rocm_7800_16gx1,
@@ -35,6 +38,7 @@ from tests.fixtures.workers.fixtures import (
     linux_ascend_1_910b_64gx8,
 )
 from tests.utils.scheduler import compare_candidates
+from gpustack.utils.unit import byte_to_gib
 
 
 def expected_candidate(
@@ -356,7 +360,7 @@ async def test_select_candidates(
     with (
         patch(
             'gpustack.scheduler.scheduler.BackendFrameworkFilter._has_supported_runners',
-            return_value=(True, []),
+            return_value=True,
         ),
         patch(
             'gpustack.schemas.workers.Worker.all',
@@ -422,7 +426,7 @@ async def test_manual_schedule_to_2_worker_2_gpu(config):
     with (
         patch(
             'gpustack.scheduler.scheduler.BackendFrameworkFilter._has_supported_runners',
-            return_value=(True, []),
+            return_value=True,
         ),
         patch(
             'gpustack.schemas.workers.Worker.all',
@@ -504,7 +508,7 @@ async def test_manual_schedule_to_2_worker_4_gpu_select_main_with_most_gpus(
     with (
         patch(
             'gpustack.scheduler.scheduler.BackendFrameworkFilter._has_supported_runners',
-            return_value=(True, []),
+            return_value=True,
         ),
         patch(
             'gpustack.schemas.workers.Worker.all',
@@ -590,7 +594,7 @@ async def test_manual_schedule_to_3_workers_4_gpus(
     with (
         patch(
             'gpustack.scheduler.scheduler.BackendFrameworkFilter._has_supported_runners',
-            return_value=(True, []),
+            return_value=True,
         ),
         patch(
             'gpustack.schemas.workers.Worker.all',
@@ -750,7 +754,7 @@ async def test_auto_schedule_to_2_worker_16_gpu_deepseek_r1(config):
     with (
         patch(
             'gpustack.scheduler.scheduler.BackendFrameworkFilter._has_supported_runners',
-            return_value=(True, []),
+            return_value=True,
         ),
         patch(
             'gpustack.schemas.workers.Worker.all',
@@ -838,7 +842,7 @@ async def test_auto_schedule_embedding_models(config):
     with (
         patch(
             'gpustack.scheduler.scheduler.BackendFrameworkFilter._has_supported_runners',
-            return_value=(True, []),
+            return_value=True,
         ),
         patch(
             'gpustack.schemas.workers.Worker.all',
@@ -1585,6 +1589,93 @@ async def test_output_schedule_msg(config, index, workers, model, expect_msg):
         assert resource_fit_selector._messages == expect_msg
 
 
+@pytest.mark.asyncio
+async def test_lora_vram_claim_in_output_schedule_msg(config):
+    """
+    LoRA weights are included in estimate_model_vram (same as vLLM):
+    int((base + lora) * 1.2) + 2 GiB overhead. The SGLang schedule message reflects
+    the combined claim when VRAM is insufficient on available workers.
+    """
+    base_bytes = 56 * 1024**3
+    lora_bytes = 8 * 1024**3
+    lora_repo = "user/lora-adapter-vram-test"
+    expected_vram = int((base_bytes + lora_bytes) * 1.2) + 2 * 1024**3
+
+    mock_pretrained = SimpleNamespace(
+        architectures=["Qwen2ForCausalLM"],
+        num_attention_heads=64,
+        num_key_value_heads=8,
+        hidden_size=4096,
+        vocab_size=152064,
+        num_hidden_layers=64,
+        torch_dtype="bfloat16",
+        max_position_embeddings=32768,
+    )
+
+    def fake_get_model_weight_size(model, token=None):
+        if model.huggingface_repo_id == lora_repo:
+            return lora_bytes
+        return base_bytes
+
+    workers = [linux_nvidia_4_4080_16gx4()]
+    m = new_model(
+        1,
+        "test_name",
+        1,
+        huggingface_repo_id="Qwen/Qwen3-32B",
+        cpu_offloading=False,
+        backend_parameters=[],
+        lora_list=[
+            LoraListEntry(
+                lora_name="adapter1",
+                lora_repo_name=lora_repo,
+                source=SourceEnum.HUGGING_FACE.value,
+            )
+        ],
+    )
+    mis = []
+
+    resource_fit_selector = SGLangResourceFitSelector(config, m, mis)
+    placement_scorer = PlacementScorer(m, mis)
+
+    with (
+        patch(
+            "gpustack.policies.candidate_selectors.base_candidate_selector.get_pretrained_config_with_workers",
+            new=AsyncMock(return_value=mock_pretrained),
+        ),
+        patch(
+            "gpustack.policies.utils.get_model_weight_size",
+            side_effect=fake_get_model_weight_size,
+        ),
+        patch(
+            "gpustack.schemas.workers.Worker.all",
+            return_value=workers,
+        ),
+        patch(
+            "gpustack.policies.worker_filters.backend_framework_filter.async_session",
+            return_value=mock_async_session(),
+        ),
+        patch(
+            "gpustack.policies.scorers.placement_scorer.async_session",
+            return_value=mock_async_session(),
+        ),
+        patch(
+            "gpustack.policies.scorers.model_file_locality_scorer.async_session",
+            return_value=mock_async_session(),
+        ),
+    ):
+        candidates = await resource_fit_selector.select_candidates(workers)
+        _ = await placement_scorer.score(candidates)
+
+    mf = max(resource_fit_selector._mem_fraction_static_by_gpu_type.values())
+    expect_msg = [
+        f"""- The model requires approximately {byte_to_gib(expected_vram)} GiB of VRAM.
+- With --mem-fraction-static={mf}, all GPUs combined need to provide at least {byte_to_gib(int(expected_vram / mf))} GiB of total VRAM and each GPU needs {int(mf * 100)}% of allocatable VRAM.
+- The largest available worker has 63.97 GiB allocatable VRAM, 4/4 of GPUs meet the VRAM utilization ratio, providing 49.38 GiB of allocatable VRAM."""
+    ]
+    assert resource_fit_selector._messages == expect_msg
+
+
 @pytest.mark.parametrize(
     "case_name, m, workers, expected_candidates, final_candidate_index",
     [
@@ -1800,7 +1891,7 @@ async def test_select_candidates_from_different_gpu_types(
         ),
         patch(
             'gpustack.scheduler.scheduler.BackendFrameworkFilter._has_supported_runners',
-            return_value=(True, []),
+            return_value=True,
         ),
         patch(
             'gpustack.policies.worker_filters.backend_framework_filter.async_session',

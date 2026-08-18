@@ -34,6 +34,8 @@ def create_inference_backend(
     backend_name="vLLM",
     version_configs=None,
     is_built_in=False,
+    id=1,
+    owner_principal_id=None,
 ):
     """Create a test inference backend."""
     if version_configs is None:
@@ -46,11 +48,12 @@ def create_inference_backend(
         }
 
     backend = InferenceBackend(
-        id=1,
+        id=id,
         backend_name=backend_name,
         version_configs=version_configs,
         default_version="0.11.0",
         is_built_in=is_built_in,
+        owner_principal_id=owner_principal_id,
     )
     # Simulate database deserialization - version_configs should be a VersionConfigDict with root attribute
     from gpustack.schemas.inference_backend import VersionConfigDict
@@ -596,6 +599,8 @@ async def test_has_supported_runners_with_list_service_runners():
             assert call_kwargs["backend"] == "cuda"
             assert call_kwargs["service"] == "vllm"
             assert call_kwargs["with_deprecated"] is False
+            # Runtime (CUDA) version is no longer used to gate runners.
+            assert "backend_version" not in call_kwargs
 
 
 @pytest.mark.asyncio
@@ -645,13 +650,16 @@ async def test_cpu_worker_with_built_in_cpu_support():
 
 
 @pytest.mark.asyncio
-async def test_cuda_version_incompatibility():
+async def test_low_cuda_runtime_no_longer_filtered():
     """
-    Test 14: Worker with CUDA 12.4 should be filtered out when runner only supports CUDA 12.8.
+    issue #5674: a worker whose driver only reports CUDA 12.4 must NOT be
+    filtered out when requesting a newer backend version. Runner selection is
+    no longer gated by the detected GPU runtime (CUDA) version, so the worker
+    passes as long as a runner exists for its GPU type.
     """
     model = create_model(backend="vLLM", backend_version="0.13.0")
 
-    # Create a worker with CUDA 12.4 runtime
+    # Worker reports only CUDA 12.4 (a "too old" driver under the old logic).
     worker = linux_nvidia_4_4080_16gx4()
     if worker.status and worker.status.gpu_devices:
         for gpu in worker.status.gpu_devices:
@@ -662,9 +670,122 @@ async def test_cuda_version_incompatibility():
     filter_instance = BackendFrameworkFilter(model)
 
     async def mock_session_exec(statement):
-        # Return None for backend (no version configs in database)
+        # No version configs in database.
         mock_result = MagicMock()
         mock_result.first.return_value = None
+        return mock_result
+
+    with patch(
+        'gpustack.policies.worker_filters.backend_framework_filter.async_session'
+    ) as mock_async_session:
+        mock_session = AsyncMock()
+        mock_session.exec = mock_session_exec
+        mock_async_session.return_value.__aenter__.return_value = mock_session
+
+        with patch(
+            'gpustack.policies.worker_filters.backend_framework_filter.list_service_runners',
+            return_value=[{"version": "0.13.0", "backend": "cuda"}],
+        ) as mock_list:
+            filtered_workers, messages = await filter_instance.filter(workers)
+
+        # Worker passes: the low CUDA runtime no longer gates runner selection.
+        assert len(filtered_workers) == 1
+        assert filtered_workers[0].name == "host-4-4080"
+        assert len(messages) == 0
+
+        # The detected runtime (CUDA) version must not be passed as a filter.
+        assert mock_list.call_count > 0
+        for call in mock_list.call_args_list:
+            assert "backend_version" not in call.kwargs
+
+
+@pytest.mark.asyncio
+async def test_non_cuda_runtime_no_longer_gated():
+    """
+    issue #5674: runner selection is no longer gated by the detected runtime
+    version for any GPU type, ROCm included — backend_version is not passed to
+    list_service_runners.
+    """
+    model = create_model(backend="vLLM", backend_version=None)
+
+    worker = linux_nvidia_4_4080_16gx4()
+    if worker.status and worker.status.gpu_devices:
+        for gpu in worker.status.gpu_devices:
+            gpu.type = "rocm"
+            gpu.vendor = "amd"
+            gpu.runtime_version = "6.2"
+
+    workers = [worker]
+
+    filter_instance = BackendFrameworkFilter(model)
+
+    async def mock_session_exec(statement):
+        mock_result = MagicMock()
+        mock_result.first.return_value = None
+        return mock_result
+
+    with patch(
+        'gpustack.policies.worker_filters.backend_framework_filter.async_session'
+    ) as mock_async_session:
+        mock_session = AsyncMock()
+        mock_session.exec = mock_session_exec
+        mock_async_session.return_value.__aenter__.return_value = mock_session
+
+        with patch(
+            'gpustack.policies.worker_filters.backend_framework_filter.list_service_runners',
+            return_value=[{"version": "0.11.0", "backend": "rocm"}],
+        ) as mock_list:
+            filtered_workers, messages = await filter_instance.filter(workers)
+
+        # ROCm worker passes and the detected runtime version is NOT used as a
+        # filter — backend_version must be absent.
+        assert len(filtered_workers) == 1
+        assert mock_list.call_count > 0
+        for call in mock_list.call_args_list:
+            assert "backend_version" not in call.kwargs
+
+
+@pytest.mark.asyncio
+async def test_org_scoped_backend_version_visible_to_owner():
+    """
+    Test 16: A custom version defined on an Org-scoped backend row must be
+    found when the deploying model belongs to that Org, even though the
+    Platform row of the same backend doesn't carry the version.
+    """
+    org_id = 42
+    model = create_model(
+        backend="vLLM",
+        backend_version="0.11.0-custom",
+        owner_principal_id=org_id,
+    )
+    workers = [linux_nvidia_4_4080_16gx4()]
+
+    platform_row = create_inference_backend(
+        backend_name="vLLM",
+        version_configs={},
+        is_built_in=True,
+        id=1,
+        owner_principal_id=None,
+    )
+    org_row = create_inference_backend(
+        backend_name="vLLM",
+        version_configs={
+            "0.11.0-custom": VersionConfig(
+                image_name="test:0.11.0-custom",
+                built_in_frameworks=None,
+                custom_framework="cuda",
+            )
+        },
+        is_built_in=True,
+        id=2,
+        owner_principal_id=org_id,
+    )
+
+    filter_instance = BackendFrameworkFilter(model)
+
+    async def mock_session_exec(statement):
+        mock_result = MagicMock()
+        mock_result.all.return_value = [platform_row, org_row]
         return mock_result
 
     with patch(
@@ -680,12 +801,197 @@ async def test_cuda_version_incompatibility():
         ):
             filtered_workers, messages = await filter_instance.filter(workers)
 
-        # Worker should be filtered out because available runners don't support CUDA 12.4
-        # (real list_service_runners will return runners with 12.4 and 12.8,
-        # but 12.8 > 12.4 means no backward compatible runner)
-        assert len(filtered_workers) == 0
-        assert len(messages) == 1
-        assert "host-4-4080" in messages[0]
+            assert len(filtered_workers) == 1
+            assert filtered_workers[0].name == "host-4-4080"
+            assert len(messages) == 0
+
+
+@pytest.mark.asyncio
+async def test_model_spec_without_owner_does_not_crash():
+    """The evaluator drives this filter with ModelSpec (no
+    owner_principal_id); it must fall back to Platform-only visibility
+    instead of raising AttributeError."""
+    from gpustack.schemas.model_sets import ModelSpec
+
+    spec = ModelSpec(
+        source="huggingface",
+        huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct",
+        backend="vLLM",
+        backend_version="0.11.0",
+        replicas=1,
+    )
+    workers = [linux_nvidia_4_4080_16gx4()]
+
+    platform_row = create_inference_backend(
+        backend_name="vLLM",
+        version_configs={
+            "0.11.0": VersionConfig(
+                image_name="test:0.11.0",
+                built_in_frameworks=["cuda"],
+                custom_framework="",
+            )
+        },
+        is_built_in=True,
+        id=1,
+        owner_principal_id=None,
+    )
+    org_row = create_inference_backend(
+        backend_name="vLLM",
+        version_configs={
+            "0.11.0-custom": VersionConfig(
+                image_name="test:0.11.0-custom",
+                built_in_frameworks=None,
+                custom_framework="cuda",
+            )
+        },
+        is_built_in=True,
+        id=2,
+        owner_principal_id=42,
+    )
+
+    filter_instance = BackendFrameworkFilter(spec)
+
+    async def mock_session_exec(statement):
+        mock_result = MagicMock()
+        mock_result.all.return_value = [platform_row, org_row]
+        return mock_result
+
+    with patch(
+        'gpustack.policies.worker_filters.backend_framework_filter.async_session'
+    ) as mock_async_session:
+        mock_session = AsyncMock()
+        mock_session.exec = mock_session_exec
+        mock_async_session.return_value.__aenter__.return_value = mock_session
+
+        with patch(
+            'gpustack.policies.worker_filters.backend_framework_filter.list_service_runners',
+            return_value=[],
+        ):
+            filtered_workers, messages = await filter_instance.filter(workers)
+
+            # Platform version visible — worker passes, no crash.
+            assert len(filtered_workers) == 1
+            assert len(messages) == 0
+
+
+@pytest.mark.asyncio
+async def test_model_spec_with_stamped_owner_sees_org_version():
+    """The evaluation route stamps owner_principal_id onto the spec so
+    compatibility checks resolve the same Org-scoped backend versions a
+    real deploy would."""
+    from gpustack.schemas.model_sets import ModelSpec
+
+    spec = ModelSpec(
+        source="huggingface",
+        huggingface_repo_id="Qwen/Qwen2.5-7B-Instruct",
+        backend="vLLM",
+        backend_version="0.11.0-custom",
+        replicas=1,
+        owner_principal_id=42,
+    )
+    workers = [linux_nvidia_4_4080_16gx4()]
+
+    platform_row = create_inference_backend(
+        backend_name="vLLM",
+        version_configs={},
+        is_built_in=True,
+        id=1,
+        owner_principal_id=None,
+    )
+    org_row = create_inference_backend(
+        backend_name="vLLM",
+        version_configs={
+            "0.11.0-custom": VersionConfig(
+                image_name="test:0.11.0-custom",
+                built_in_frameworks=None,
+                custom_framework="cuda",
+            )
+        },
+        is_built_in=True,
+        id=2,
+        owner_principal_id=42,
+    )
+
+    filter_instance = BackendFrameworkFilter(spec)
+
+    async def mock_session_exec(statement):
+        mock_result = MagicMock()
+        mock_result.all.return_value = [platform_row, org_row]
+        return mock_result
+
+    with patch(
+        'gpustack.policies.worker_filters.backend_framework_filter.async_session'
+    ) as mock_async_session:
+        mock_session = AsyncMock()
+        mock_session.exec = mock_session_exec
+        mock_async_session.return_value.__aenter__.return_value = mock_session
+
+        with patch(
+            'gpustack.policies.worker_filters.backend_framework_filter.list_service_runners',
+            return_value=[],
+        ):
+            filtered_workers, messages = await filter_instance.filter(workers)
+
+            assert len(filtered_workers) == 1
+            assert len(messages) == 0
+
+
+@pytest.mark.asyncio
+async def test_org_scoped_backend_version_hidden_from_other_org():
+    """
+    Test 17: A custom version defined on another Org's backend row must NOT
+    be visible to a model owned by a different Org.
+    """
+    model = create_model(
+        backend="vLLM",
+        backend_version="0.11.0-custom",
+        owner_principal_id=7,
+    )
+    workers = [linux_nvidia_4_4080_16gx4()]
+
+    platform_row = create_inference_backend(
+        backend_name="vLLM",
+        version_configs={},
+        is_built_in=True,
+        id=1,
+        owner_principal_id=None,
+    )
+    other_org_row = create_inference_backend(
+        backend_name="vLLM",
+        version_configs={
+            "0.11.0-custom": VersionConfig(
+                image_name="test:0.11.0-custom",
+                built_in_frameworks=None,
+                custom_framework="cuda",
+            )
+        },
+        is_built_in=True,
+        id=2,
+        owner_principal_id=42,
+    )
+
+    filter_instance = BackendFrameworkFilter(model)
+
+    async def mock_session_exec(statement):
+        mock_result = MagicMock()
+        mock_result.all.return_value = [platform_row, other_org_row]
+        return mock_result
+
+    with patch(
+        'gpustack.policies.worker_filters.backend_framework_filter.async_session'
+    ) as mock_async_session:
+        mock_session = AsyncMock()
+        mock_session.exec = mock_session_exec
+        mock_async_session.return_value.__aenter__.return_value = mock_session
+
+        with patch(
+            'gpustack.policies.worker_filters.backend_framework_filter.list_service_runners',
+            return_value=[],
+        ):
+            filtered_workers, messages = await filter_instance.filter(workers)
+
+            assert len(filtered_workers) == 0
+            assert len(messages) == 1
 
 
 @pytest.mark.asyncio

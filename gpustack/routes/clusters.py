@@ -1,7 +1,7 @@
 import math
 import random
 import secrets
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, List, Optional, Union
 from urllib.parse import urlencode
 
 import aiohttp
@@ -9,9 +9,11 @@ from fastapi import APIRouter, Depends, Request, Response, Query
 from fastapi.responses import RedirectResponse, StreamingResponse
 from enum import Enum
 from sqlalchemy.orm import selectinload
+from sqlmodel.ext.asyncio.session import AsyncSession
 
 from gpustack.api.exceptions import (
     AlreadyExistsException,
+    ForbiddenException,
     InternalServerErrorException,
     NotFoundException,
     InvalidException,
@@ -33,7 +35,6 @@ from gpustack.api.tenant import (
 from gpustack.schemas.workers import Worker, WorkerStateEnum
 from gpustack.server.db import async_session
 from gpustack.server.deps import SessionDep, TenantContextDep
-from gpustack.server.services import create_user_with_principal
 from gpustack.server.worker_request import stream_to_worker
 from gpustack.schemas.clusters import (
     ClusterListParams,
@@ -50,16 +51,27 @@ from gpustack.schemas.clusters import (
     WorkerPoolPublic,
     WorkerPool,
     CloudOptions,
+    K8sOptions,
 )
-from gpustack.schemas.organizations import PLATFORM_PRINCIPAL_ID
-from gpustack.schemas.users import User, UserRole, system_name_prefix
+from gpustack.schemas.cluster_access import ClusterAccess
+from gpustack.schemas.gpu_instances import GPUInstance
+from gpustack.schemas.models import Model
+from gpustack.schemas.principals import (
+    PrincipalType,
+    get_authenticated_principal_id,
+    platform_principal_id,
+)
+from gpustack.schemas.users import system_name_prefix
 from gpustack.schemas.api_keys import ApiKey
 from gpustack.security import get_secret_hash, API_KEY_PREFIX
+from gpustack.gpu_instances.cluster_apis_util import (
+    principal_namespace_identifier,
+    get_namespace_name,
+)
 from gpustack.k8s.manifest_template import TemplateConfig
 from gpustack.config.config import (
     get_global_config,
     get_cluster_image_name,
-    get_cluster_operator_image_name,
 )
 from gpustack.utils.grafana import resolve_grafana_base_url
 from gpustack_runtime.detector import ManufacturerEnum
@@ -73,15 +85,23 @@ router = APIRouter()
 
 
 def get_server_url(request: Request, cluster_override: Optional[str]) -> str:
-    """Construct the server URL based on request headers or fallback to default."""
+    """Resolve the worker-facing server URL.
+
+    Priority:
+    1. cluster override
+    2. server_external_url
+    3. request host (scheme + netloc). ForwardedHostPortMiddleware only gates
+       X-Forwarded-Host rewriting by trusted_hosts; a directly supplied Host
+       header still flows into request.url, so this is not full host-injection
+       protection unless the server is reachable only via a trusted proxy.
+    """
     if cluster_override:
-        return cluster_override.strip("/")
-    url = get_global_config().server_external_url
+        return cluster_override.rstrip("/")
+    cfg = get_global_config()
+    url = cfg.server_external_url if cfg else None
     if not url:
-        url = f"{request.url.scheme}://{request.url.hostname}"
-        if request.url.port:
-            url += f":{request.url.port}"
-    return url
+        url = f"{request.url.scheme}://{request.url.netloc}"
+    return url.rstrip("/")
 
 
 def _is_cluster_visible(cluster: Cluster, ctx: TenantContext) -> bool:
@@ -98,14 +118,85 @@ def _is_cluster_visible(cluster: Cluster, ctx: TenantContext) -> bool:
     return False
 
 
+def _is_cluster_manageable(cluster: Cluster, ctx: TenantContext) -> bool:
+    """Manageability mirror: drops cross-Org grants. Bypass for admin
+    in "All" mode (sees everything regardless)."""
+    if bypass_tenant_filter(ctx):
+        return True
+    return (
+        ctx.current_principal_id is not None
+        and cluster.owner_principal_id == ctx.current_principal_id
+    )
+
+
+def _cluster_manageable_conditions(ctx: TenantContext) -> List[Any]:
+    """SQL twin of :func:`_is_cluster_manageable`."""
+    if bypass_tenant_filter(ctx):
+        return []
+    if ctx.current_principal_id is None:
+        return [Cluster.id == -1]
+    return [Cluster.owner_principal_id == ctx.current_principal_id]
+
+
+def _k8s_options_has_gpu_instance_options(k8s_options: Any) -> bool:
+    """Whether a ``k8s_options`` value opts in to GPU-instance handling.
+
+    Mirrors the gateway-side check (``gpu_instances/gateway.py``):
+    ``k8s_options.gpu_instance_options`` being set is the signal. Runs
+    once per cluster on every list/watch tick, so we look at the raw
+    shape instead of re-running ``K8sOptions.model_validate`` — a full
+    nested parse on the hot path would also propagate any future
+    schema drift as a request-level ``ValidationError``. The dict
+    branch tolerates both serialized key forms (snake from
+    ``model_dump``, camel from API/UI submissions).
+    """
+    if isinstance(k8s_options, K8sOptions):
+        return k8s_options.gpu_instance_options is not None
+    if isinstance(k8s_options, dict):
+        return (
+            k8s_options.get("gpu_instance_options") is not None
+            or k8s_options.get("gpuInstanceOptions") is not None
+        )
+    return False
+
+
+def _cluster_has_gpu_instance_options(cluster: Cluster) -> bool:
+    """Whether the cluster opts in to GPU-instance handling."""
+    return _k8s_options_has_gpu_instance_options(cluster.k8s_options)
+
+
 @router.get("", response_model=ClustersPublic, response_model_exclude_none=True)
 async def get_clusters(
-    session: SessionDep,
     ctx: TenantContextDep,
     params: ClusterListParams = Depends(),
     name: str = None,
     search: str = None,
+    mine: bool = False,
+    gpu_instance_enabled: Optional[bool] = Query(
+        None,
+        description=(
+            "Filter by GPU-instance enablement (presence of "
+            "``k8s_options.gpu_instance_options``). ``true`` keeps only "
+            "GPU-service clusters (GPU-instance picker); ``false`` keeps "
+            "only model-deployment clusters (deploy picker). Unset returns "
+            "every visible cluster."
+        ),
+    ),
 ):
+    """List clusters.
+
+    Default visibility is "everything the caller can use" — own-Org
+    clusters plus clusters granted via ``cluster_access``.
+
+    ``mine=true`` restricts to clusters owned by the caller's current
+    principal — drops grants from other Orgs, so management pages
+    don't surface read-only rows the caller can't actually edit.
+    Platform admin still sees everything (bypass).
+
+    ``gpu_instance_enabled`` partitions visible clusters by purpose so
+    the deploy picker and the GPU-instance picker each see only the
+    clusters they can actually target.
+    """
     fuzzy_fields = {}
     if search:
         fuzzy_fields = {"name": search}
@@ -114,13 +205,29 @@ async def get_clusters(
     if name:
         fields = {"name": name}
 
+    extra_conditions = (
+        _cluster_manageable_conditions(ctx)
+        if mine
+        else cluster_visibility_conditions(ctx, Cluster)
+    )
+
+    def _matches_gpu_filter(c: Cluster) -> bool:
+        if gpu_instance_enabled is None:
+            return True
+        return _cluster_has_gpu_instance_options(c) == gpu_instance_enabled
+
     if params.watch:
+        visibility_check = (
+            (lambda c: _is_cluster_manageable(c, ctx))
+            if mine
+            else (lambda c: _is_cluster_visible(c, ctx))
+        )
         return StreamingResponse(
             Cluster.streaming(
                 fields=fields,
                 fuzzy_fields=fuzzy_fields,
                 options=CLUSTER_LOAD_OPTIONS,
-                filter_func=lambda c: _is_cluster_visible(c, ctx),
+                filter_func=lambda c: visibility_check(c) and _matches_gpu_filter(c),
             ),
             media_type="text/event-stream",
         )
@@ -134,8 +241,11 @@ async def get_clusters(
             fields=fields,
             fuzzy_fields=fuzzy_fields,
             options=CLUSTER_LOAD_OPTIONS,
-            extra_conditions=cluster_visibility_conditions(ctx, Cluster),
+            extra_conditions=extra_conditions,
         )
+
+        if gpu_instance_enabled is not None:
+            items = [c for c in items if _matches_gpu_filter(c)]
 
         if not items:
             return PaginatedList[ClusterPublic](
@@ -244,27 +354,101 @@ def create_update_check(
             message=f"server_url is required for provider {provider}"
         )
     if provider == ClusterProvider.Kubernetes:
-        # check for volume mounts
-        if input.k8s_volume_mounts is None or len(input.k8s_volume_mounts) < 1:
+        # check for volume mounts (now nested under k8s_options)
+        volume_mounts = (
+            input.k8s_options.volume_mounts if input.k8s_options is not None else None
+        )
+        if volume_mounts is None or len(volume_mounts) < 1:
             # at least one volume mount is required, and the default one is for gpustack data dir.
             raise InvalidException(
-                message="At least one k8s_volume_mount is required, and the default one is for gpustack data dir."
+                message="At least one k8s_options.volume_mount is required, and the default one is for gpustack data dir."
             )
         if (
-            input.k8s_volume_mounts[0].volume_source is None
-            or input.k8s_volume_mounts[0].volume_source.host_path is None
+            volume_mounts[0].volume_source is None
+            or volume_mounts[0].volume_source.host_path is None
         ):
             raise InvalidException(
-                message="The first k8s_volume_mount must be for gpustack data dir with hostPath volume source."
+                message="The first k8s_options.volume_mount must be for gpustack data dir with hostPath volume source."
+            )
+
+
+def hoist_system_default_container_registry(
+    input: Union[ClusterCreate, ClusterUpdate],
+):
+    """
+    Make ``cluster.system_default_container_registry`` the single source of
+    truth at persistence time.
+
+    If the caller put the value inside ``worker_config`` (the legacy shape),
+    promote it onto the top-level column and null it out in ``worker_config``
+    so downstream image-resolution helpers can read the cluster column
+    exclusively without ever reaching back into ``worker_config``. We don't
+    overwrite the column if the caller already set it.
+    """
+    if input.worker_config is None:
+        return
+    nested = input.worker_config.system_default_container_registry
+    if nested is None:
+        return
+    if not input.system_default_container_registry:
+        input.system_default_container_registry = nested
+    input.worker_config.system_default_container_registry = None
+
+
+async def check_cluster_purpose_switch(
+    session: AsyncSession, cluster: Cluster, input: ClusterUpdate
+) -> None:
+    """Block flipping a cluster's purpose while it still holds
+    incompatible resources.
+
+    ``k8s_options.gpu_instance_options`` being set means the cluster is
+    used for GPU service; unset means it's used for model service. A
+    cluster with models can't be flipped to GPU service; a cluster with
+    GPU instances can't be flipped to model service.
+    """
+    if "k8s_options" not in input.model_fields_set:
+        return
+    existing_enabled = _cluster_has_gpu_instance_options(cluster)
+    new_enabled = _k8s_options_has_gpu_instance_options(input.k8s_options)
+    if existing_enabled == new_enabled:
+        return
+    if new_enabled:
+        model_count = await Model.count_by_fields(
+            session, {"cluster_id": cluster.id, "deleted_at": None}
+        )
+        if model_count > 0:
+            noun = "model" if model_count == 1 else "models"
+            verb = "exists" if model_count == 1 else "exist"
+            raise ConflictException(
+                message=(
+                    f"Cannot switch cluster '{cluster.name}' to GPU service: "
+                    f"{model_count} {noun} still {verb}. "
+                    f"Delete all models first."
+                )
+            )
+    else:
+        instance_count = await GPUInstance.count_by_fields(
+            session, {"cluster_id": cluster.id, "deleted_at": None}
+        )
+        if instance_count > 0:
+            noun = "GPU instance" if instance_count == 1 else "GPU instances"
+            verb = "exists" if instance_count == 1 else "exist"
+            raise ConflictException(
+                message=(
+                    f"Cannot switch cluster '{cluster.name}' to model service: "
+                    f"{instance_count} {noun} still {verb}. "
+                    f"Delete all GPU instances first."
+                )
             )
 
 
 def enforce_data_dir_mounts(input: Union[ClusterCreate, ClusterUpdate]):
     """
-    Assuming the first item of k8s_volume_mounts is for gpustack data dir, enforce that it is always present and has the correct settings.
+    Assuming the first item of k8s_options.volume_mounts is for gpustack data dir,
+    enforce that it is always present and has the correct settings.
     """
     # the first volume must exist as it's validated in create_update_check, and it must be for gpustack data dir, so we enforce it here.
-    data_dir_mount = input.k8s_volume_mounts[0]
+    data_dir_mount = input.k8s_options.volume_mounts[0]
     data_dir_mount.name = "gpustack-data-dir"
     data_dir_mount.mount_path = "/var/lib/gpustack"
     data_dir_mount.read_only = False
@@ -281,7 +465,7 @@ async def create_cluster(
     # caller omitted it: their current Org context, or the platform Org
     # for admin in "All" mode (admin's home is Default).
     if input.owner_principal_id is None:
-        input.owner_principal_id = ctx.current_principal_id or PLATFORM_PRINCIPAL_ID
+        input.owner_principal_id = ctx.current_principal_id or platform_principal_id()
     validate_owner_principal(input.owner_principal_id, ctx, resource_label="cluster")
 
     # Cluster names are unique within their owning Org, not globally —
@@ -295,11 +479,14 @@ async def create_cluster(
         },
     )
     if existing:
-        raise AlreadyExistsException(message=f"cluster {input.name} already exists")
+        raise AlreadyExistsException(
+            message=f"Cluster with name '{input.name}' already exists."
+        )
 
     create_update_check(input.provider, input)
     if input.provider == ClusterProvider.Kubernetes:
         enforce_data_dir_mounts(input)
+    hoist_system_default_container_registry(input)
 
     # Auto-promote the first cluster in an Org to that Org's default so
     # users don't have to flip a separate switch after onboarding.
@@ -326,11 +513,9 @@ async def create_cluster(
             "is_default": auto_default,
         }
     )
-    to_create_user = User(
-        username=f'{system_name_prefix}-{to_create_cluster.hashed_suffix}',
-        is_system=True,
-        role=UserRole.Cluster,
-        hashed_password="",
+    to_create_principal = Principal(
+        name=f'{system_name_prefix}-{to_create_cluster.hashed_suffix}',
+        kind=PrincipalType.SYSTEM,
     )
     to_create_apikey = ApiKey(
         name=f'{system_name_prefix}-{to_create_cluster.hashed_suffix}',
@@ -358,10 +543,27 @@ async def create_cluster(
             await WorkerPool.create(
                 session=session, source=to_create_pool, auto_commit=False
             )
-        to_create_user.cluster = cluster
-        user = await create_user_with_principal(session, to_create_user)
-        to_create_apikey.user_id = user.id
+        cluster_principal = await Principal.create(
+            session, to_create_principal, auto_commit=False
+        )
+        cluster.system_principal_id = cluster_principal.id
+        await cluster.save(session=session, auto_commit=False)
+        to_create_apikey.user_id = cluster_principal.id
         await ApiKey.create(session=session, source=to_create_apikey, auto_commit=False)
+        # Default-Org clusters default to "shared with everyone" — seed
+        # an explicit ClusterAccess grant against ``system/authenticated``
+        # so the policy is visible (and revocable) from the UI's
+        # cluster-access view rather than baked into request resolution.
+        if cluster.owner_principal_id == platform_principal_id():
+            await ClusterAccess.create(
+                session=session,
+                source=ClusterAccess(
+                    cluster_id=cluster.id,
+                    principal_id=await get_authenticated_principal_id(session),
+                    granted_by=ctx.user.id,
+                ),
+                auto_commit=False,
+            )
         await session.commit()
         await session.refresh(cluster)
         return cluster
@@ -381,6 +583,8 @@ async def update_cluster(
     create_update_check(cluster.provider, input)
     if cluster.provider == ClusterProvider.Kubernetes:
         enforce_data_dir_mounts(input)
+        await check_cluster_purpose_switch(session, cluster, input)
+    hoist_system_default_container_registry(input)
 
     try:
         await cluster.update(session=session, source=input)
@@ -441,8 +645,10 @@ async def set_default_cluster(session: SessionDep, ctx: TenantContextDep, id: in
     assert_cluster_writable(ctx, cluster)
 
     try:
-        # Unset any existing default in this cluster's Org. The partial
-        # unique index guarantees there's at most one to begin with.
+        # Unset any existing default in this cluster's Org. Postgres
+        # holds this to one via a partial unique index; MySQL/OceanBase
+        # have no partial-index equivalent, so we tolerate (and clear)
+        # any duplicates instead of relying on the DB.
         existing_defaults = await Cluster.all_by_fields(
             session,
             {
@@ -510,12 +716,10 @@ def get_registration_from_cluster(
         token=cluster.registration_token,
         server_url=get_server_url(request, cluster.server_url),
         image=get_cluster_image_name(
-            cluster.worker_config
+            cluster.worker_config, cluster.system_default_container_registry
         ),  # Default image, can be customized
         env=parse_base_model_to_env_vars(sensitive_registration),
         args=[],
-        # Below fields are used for configure GPUStack Operator.
-        operator_image=get_cluster_operator_image_name(cluster.worker_config),
     )
 
 
@@ -536,19 +740,29 @@ async def get_registration_token(
 async def get_cluster_manifests(
     request: Request,
     session: SessionDep,
+    ctx: TenantContextDep,
     id: int,
-    runtime: Optional[ManufacturerEnum] = Query(
-        None, description="Optional runtime to include in the manifest"
+    runtime: Optional[List[ManufacturerEnum]] = Query(
+        None,
+        description=(
+            "GPU vendor runtimes to include in the manifest. Repeat the "
+            "parameter for multiple vendors (e.g. ?runtime=nvidia&runtime=ascend). "
+            "The CPU worker DaemonSet is always rendered regardless of this "
+            "parameter."
+        ),
     ),
 ):
     cluster = await Cluster.one_by_id(session, id)
     if not cluster or cluster.deleted_at is not None:
         raise NotFoundException(message=f"cluster {id} not found")
+    # The manifest embeds the cluster registration token, a write-class
+    # secret — gate it the same way as the registration-token endpoint.
+    assert_cluster_writable(ctx, cluster)
     if cluster.provider != ClusterProvider.Kubernetes:
         raise InvalidException(
             message=f"Cannot get manifests for cluster {cluster.name}(id: {id}) with provider {cluster.provider}"
         )
-    # TODO: Redundant principal slugs at the cluster level to reduce multiple queries.
+    # TODO: Redundant principal names at the cluster level to reduce multiple queries.
     principal = await Principal.one_by_id(session, cluster.owner_principal_id)
     if not principal:
         raise NotFoundException(
@@ -558,14 +772,35 @@ async def get_cluster_manifests(
             )
         )
 
-    config = TemplateConfig(
-        registration=get_registration_from_cluster(request, cluster),
-        cluster_suffix=cluster.hashed_suffix,
-        cluster_owner_principal_slug=principal.slug,
-        namespace=getattr(cluster.worker_config, "namespace", None),
-        runtime_enum=runtime,
-        k8s_volume_mounts=cluster.k8s_volume_mounts,
-    )
+    # Resolve server-wide defaults onto a copy of k8s_options so the render
+    # model only ever reads k8s_options. Copy (not mutate) the loaded cluster
+    # so we don't risk persisting these derived values back to the DB.
+    cfg = get_global_config()
+    k8s_options = (cluster.k8s_options or K8sOptions()).model_copy()
+    if not k8s_options.namespace:
+        k8s_options.namespace = cfg.namespace
+    if not k8s_options.operator_image:
+        k8s_options.operator_image = cfg.operator_image
+
+    # Only forward worker ports when the cluster explicitly overrides them;
+    # otherwise let TemplateConfig fall back to its own defaults rather than
+    # duplicating the default constants here.
+    worker_config = cluster.worker_config
+    config_kwargs = {
+        "registration": get_registration_from_cluster(request, cluster),
+        "cluster_owner_principal_identifier": principal_namespace_identifier(principal),
+        "runtimes": runtime,
+        "k8s_options": k8s_options,
+        "system_default_container_registry": cluster.system_default_container_registry
+        or cfg.system_default_container_registry,
+    }
+    if worker_config:
+        if worker_config.worker_port is not None:
+            config_kwargs["worker_port"] = worker_config.worker_port
+        if worker_config.worker_metrics_port is not None:
+            config_kwargs["worker_metrics_port"] = worker_config.worker_metrics_port
+
+    config = TemplateConfig(**config_kwargs)
     yaml_content = config.render()
     return Response(
         content=yaml_content,
@@ -623,6 +858,57 @@ _CLUSTER_PROXY_REQUEST_HEADER_SKIP = {
 }
 
 
+# Non-manager callers (usage-grant users, Org members) reach the proxy only
+# for their own workload resources: the UI reads GPU-instance and
+# persistent-volume logs/events under the worker.gpustack.ai API group,
+# scoped to the caller's principal namespace. Everything else — core
+# resources such as Secrets, cluster-scoped reads, other namespaces, and any
+# mutation — stays owner/admin-only.
+_PROXY_READ_METHODS = {"GET", "HEAD", "OPTIONS"}
+_PROXY_WORKLOAD_API_PREFIX = "apis/worker.gpustack.ai/"
+
+
+def _proxy_path_namespace(path: str) -> Optional[str]:
+    """The namespace segment of a Kubernetes API path, or None for a
+    cluster-scoped or all-namespace request."""
+    segments = [s for s in path.split("/") if s]
+    for i, seg in enumerate(segments):
+        if seg == "namespaces" and i + 1 < len(segments):
+            return segments[i + 1]
+    return None
+
+
+async def _assert_workload_proxy_scope(
+    session: AsyncSession, ctx: TenantContext, method: str, path: str
+) -> None:
+    """Confine a non-manager caller to read-only access to the workload API
+    within their own principal namespace. The caller's namespace follows the
+    principal they are acting as — their USER namespace in personal scope, the
+    Org namespace when acting as an Org (Org members share it)."""
+    normalized = path.lstrip("/")
+    if method.upper() not in _PROXY_READ_METHODS or not normalized.startswith(
+        _PROXY_WORKLOAD_API_PREFIX
+    ):
+        raise ForbiddenException(
+            message="Insufficient permission to access this cluster resource"
+        )
+    if ctx.current_is_personal_scope:
+        acting = ctx.user
+    elif ctx.current_principal_id is not None:
+        acting = await Principal.one_by_id(session, ctx.current_principal_id)
+    else:
+        acting = None
+    if acting is None:
+        raise ForbiddenException(
+            message="Insufficient permission to access this cluster resource"
+        )
+    allowed_namespace = get_namespace_name(principal_namespace_identifier(acting))
+    if _proxy_path_namespace(normalized) != allowed_namespace:
+        raise ForbiddenException(
+            message="Insufficient permission to access this cluster resource"
+        )
+
+
 @router.api_route(
     "/{id}/proxy/{path:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
@@ -630,7 +916,7 @@ _CLUSTER_PROXY_REQUEST_HEADER_SKIP = {
 )
 async def cluster_apiserver_proxy(
     request: Request,
-    session: SessionDep,
+    ctx: TenantContextDep,
     id: int,
     path: str,
 ):
@@ -638,28 +924,45 @@ async def cluster_apiserver_proxy(
     Proxy a request to the Kubernetes API server of a Kubernetes-provider
     cluster, by forwarding it through one of the cluster's worker pods. The
     worker uses its in-pod ServiceAccount credentials to call the API server.
-    """
-    cluster = await Cluster.one_by_id(session, id)
-    if not cluster or cluster.deleted_at is not None:
-        raise NotFoundException(message=f"cluster {id} not found")
-    if cluster.provider != ClusterProvider.Kubernetes:
-        raise InvalidException(
-            message=(
-                f"cluster {cluster.name}(id: {id}) provider is "
-                f"{cluster.provider.value}; API server proxy is only supported "
-                "for Kubernetes-provider clusters."
-            )
-        )
 
-    workers = await Worker.all_by_fields(
-        session,
-        fields={"cluster_id": id, "state": WorkerStateEnum.READY},
-    )
-    if not workers:
-        raise ServiceUnavailableException(
-            message=f"No reachable workers in cluster {cluster.name}(id: {id})"
+    Uses an inline session instead of SessionDep so the session is released
+    immediately after the initial lookup, preventing long-lived Kubernetes
+    watch/log streams from holding a database connection.
+    """
+    async with async_session() as session:
+        cluster = await Cluster.one_by_id(session, id)
+        if not cluster or cluster.deleted_at is not None:
+            raise NotFoundException(message=f"cluster {id} not found")
+        # The proxy is a raw Kubernetes API passthrough authenticated with the
+        # worker's in-pod ServiceAccount, so it is a cluster-management
+        # capability. Owners and platform admin get the full passthrough;
+        # everyone who can only use the cluster (a cluster_access grant, e.g.
+        # the Default-Org "Everyone" grant, or an Org member) is confined to
+        # read-only access to their own workload resources.
+        assert_cluster_visible(
+            ctx, cluster, not_found_message=f"cluster {id} not found"
         )
-    worker = random.choice(workers)
+        if not _is_cluster_manageable(cluster, ctx):
+            await _assert_workload_proxy_scope(session, ctx, request.method, path)
+        if cluster.provider != ClusterProvider.Kubernetes:
+            raise InvalidException(
+                message=(
+                    f"cluster {cluster.name}(id: {id}) provider is "
+                    f"{cluster.provider.value}; API server proxy is only supported "
+                    "for Kubernetes-provider clusters."
+                )
+            )
+
+        workers = await Worker.all_by_fields(
+            session,
+            fields={"cluster_id": id, "state": WorkerStateEnum.READY},
+        )
+        if not workers:
+            raise ServiceUnavailableException(
+                message=f"No reachable workers in cluster {cluster.name}(id: {id})"
+            )
+        worker = random.choice(workers)
+        session.expunge(worker)
 
     headers = {
         k: v

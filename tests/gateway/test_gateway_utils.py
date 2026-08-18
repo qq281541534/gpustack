@@ -1,14 +1,25 @@
+from gpustack.gateway import generic_proxy_router_spec_diff
 import re
 
+import pytest
+from fastapi import HTTPException
+
+from gpustack.api.exceptions import NotFoundException
 from gpustack.gateway.utils import (
     RoutePrefix,
-    build_generic_route_header_rule,
-    build_generic_route_path_pattern,
-    cleanup_generic_route_transformer_spec_diff,
+    cleanup_generic_proxy_router_spec_diff,
+    diff_proxies,
+    diff_registries,
     generate_model_ingress,
-    generic_route_transformer_diff_spec,
+    generic_proxy_router_diff_spec,
+    get_instance_id_from_header,
+    lora_registry_name_suffix,
+    model_instance_registry,
+    model_instances_registry_list,
     provider_registry,
+    router_header_key,
 )
+from gpustack.schemas.models import ModelInstance
 from gpustack.gateway.client.extensions_higress_io_v1_api import WasmPluginSpec
 from gpustack.schemas.model_provider import (
     ModelProvider,
@@ -16,7 +27,10 @@ from gpustack.schemas.model_provider import (
     OpenAIConfig,
     OllamaConfig,
 )
-from gpustack.gateway.client.networking_higress_io_v1_api import McpBridgeRegistry
+from gpustack.gateway.client.networking_higress_io_v1_api import (
+    McpBridgeProxy,
+    McpBridgeRegistry,
+)
 
 
 def test_flattened_prefixes():
@@ -142,265 +156,253 @@ def test_ollama_registry():
     assert reg.protocol == "http"
 
 
-# --- Generic route transformer --------------------------------------------
+# --- Generic proxy router -------------------------------------------------
 
 
-def test_generic_route_path_pattern_boundary():
-    """
-    The path pattern must anchor after the id's last digit so that id=1 does
-    not spuriously match /model/proxy/10 or /model/proxy/100/foo.
-    """
-    pat_1 = build_generic_route_path_pattern(1)
-    pat_10 = build_generic_route_path_pattern(10)
-    assert pat_1 == r"^/model/proxy/1(/.*)?$"
-    assert pat_10 == r"^/model/proxy/10(/.*)?$"
-
-    matches_for_1 = [
-        "/model/proxy/1",
-        "/model/proxy/1/",
-        "/model/proxy/1/pooling",
-        "/model/proxy/1/v1/models",
-        "/model/proxy/1/v1/chat/completions",
-    ]
-    non_matches_for_1 = [
-        "/model/proxy/10",
-        "/model/proxy/10/foo",
-        "/model/proxy/100/foo",
-        "/model/proxy/2/foo",
-        "/model/proxy/1bar",
-        "/v1/chat/completions",
-    ]
-    for path in matches_for_1:
-        assert re.match(pat_1, path), f"expected {path!r} to match id=1"
-    for path in non_matches_for_1:
-        assert not re.match(pat_1, path), f"expected {path!r} to NOT match id=1"
-
-
-def test_generic_route_header_value_after_substitution():
-    """
-    Higress transformer's `add` with path_pattern substitutes the match with
-    `value` inside the full :path. We must ensure the resulting header value is
-    the route name alone — not contaminated with the untouched path tail.
-    """
-    rule = build_generic_route_header_rule(1, "qwen3-0.6b")
-    assert rule == {
-        "key": "x-higress-llm-model",
-        "value": "qwen3-0.6b",
-        "path_pattern": r"^/model/proxy/1(/.*)?$",
-    }
-    for path in [
-        "/model/proxy/1",
-        "/model/proxy/1/",
-        "/model/proxy/1/pooling",
-        "/model/proxy/1/v1/models",
-    ]:
-        header_value = re.sub(rule["path_pattern"], rule["value"], path)
-        assert (
-            header_value == "qwen3-0.6b"
-        ), f"path {path!r} must reduce to route name; got {header_value!r}"
-
-
-def _empty_transformer_spec() -> WasmPluginSpec:
-    """Match the shape produced by generic_route_transformer_plugin(cfg)."""
+def _empty_router_spec() -> WasmPluginSpec:
+    """Match the shape produced by generic_proxy_router_plugin(cfg)."""
     return WasmPluginSpec(
-        defaultConfig={"reqRules": []},
+        defaultConfig={
+            "prefix": "/model/proxy/",
+            "targetHeader": "x-higress-llm-model",
+            "aliasNameMapping": {},
+        },
         defaultConfigDisable=False,
     )
 
 
-def _first_add_headers(spec: WasmPluginSpec):
-    rules = spec.defaultConfig.get("reqRules", [])
-    add_block = next((r for r in rules if r.get("operate") == "add"), None)
-    return add_block.get("headers", []) if add_block else []
+def _alias_mapping(spec: WasmPluginSpec):
+    return spec.defaultConfig.get("aliasNameMapping") or {}
 
 
 def test_diff_spec_add_first_route():
-    spec = _empty_transformer_spec()
-    rule = build_generic_route_header_rule(1, "route-one")
+    spec = _empty_router_spec()
 
-    spec = generic_route_transformer_diff_spec(
-        spec,
-        expected_header_rules=[rule],
-        operating_path_pattern=build_generic_route_path_pattern(1),
-    )
+    spec = generic_proxy_router_diff_spec(spec, route_id=1, route_name="route-one")
 
     assert spec.defaultConfigDisable is False
-    assert _first_add_headers(spec) == [rule]
+    assert _alias_mapping(spec) == {"1": "route-one"}
 
 
 def test_diff_spec_preserves_other_routes():
-    spec = _empty_transformer_spec()
-    rule_1 = build_generic_route_header_rule(1, "route-one")
-    rule_2 = build_generic_route_header_rule(2, "route-two")
+    spec = _empty_router_spec()
 
-    spec = generic_route_transformer_diff_spec(
-        spec, [rule_1], build_generic_route_path_pattern(1)
-    )
-    spec = generic_route_transformer_diff_spec(
-        spec, [rule_2], build_generic_route_path_pattern(2)
-    )
+    spec = generic_proxy_router_diff_spec(spec, 1, "route-one")
+    spec = generic_proxy_router_diff_spec(spec, 2, "route-two")
 
-    headers = _first_add_headers(spec)
-    assert rule_1 in headers
-    assert rule_2 in headers
-    # Sort is deterministic by path_pattern so diff-equal checks are stable.
-    assert headers == sorted(headers, key=lambda h: h["path_pattern"])
+    assert _alias_mapping(spec) == {"1": "route-one", "2": "route-two"}
 
 
 def test_diff_spec_update_in_place():
-    """Changing a route's name replaces its rule, not appends a duplicate."""
-    spec = _empty_transformer_spec()
-    spec = generic_route_transformer_diff_spec(
-        spec,
-        [build_generic_route_header_rule(1, "route-one")],
-        build_generic_route_path_pattern(1),
-    )
-    spec = generic_route_transformer_diff_spec(
-        spec,
-        [build_generic_route_header_rule(1, "route-one-renamed")],
-        build_generic_route_path_pattern(1),
-    )
+    """Changing a route's name replaces its entry, not appends a duplicate."""
+    spec = _empty_router_spec()
+    spec = generic_proxy_router_diff_spec(spec, 1, "route-one")
+    spec = generic_proxy_router_diff_spec(spec, 1, "route-one-renamed")
 
-    headers = _first_add_headers(spec)
-    assert len(headers) == 1
-    assert headers[0]["value"] == "route-one-renamed"
+    assert _alias_mapping(spec) == {"1": "route-one-renamed"}
 
 
 def test_diff_spec_remove_route_keeps_siblings():
-    spec = _empty_transformer_spec()
-    spec = generic_route_transformer_diff_spec(
-        spec,
-        [build_generic_route_header_rule(1, "route-one")],
-        build_generic_route_path_pattern(1),
-    )
-    spec = generic_route_transformer_diff_spec(
-        spec,
-        [build_generic_route_header_rule(2, "route-two")],
-        build_generic_route_path_pattern(2),
-    )
-    # route 1's generic_proxy turned off → expected_header_rules is empty
-    spec = generic_route_transformer_diff_spec(
-        spec, [], build_generic_route_path_pattern(1)
-    )
+    spec = _empty_router_spec()
+    spec = generic_proxy_router_diff_spec(spec, 1, "route-one")
+    spec = generic_proxy_router_diff_spec(spec, 2, "route-two")
+    # route 1's generic_proxy turned off → route_name=None
+    spec = generic_proxy_router_diff_spec(spec, 1, None)
 
-    headers = _first_add_headers(spec)
-    assert len(headers) == 1
-    assert headers[0]["value"] == "route-two"
+    assert _alias_mapping(spec) == {"2": "route-two"}
+
+
+def test_diff_spec_remove_missing_route_is_noop():
+    """Removing a route that isn't in the mapping must not raise or affect others."""
+    spec = _empty_router_spec()
+    spec = generic_proxy_router_diff_spec(spec, 1, "route-one")
+    spec = generic_proxy_router_diff_spec(spec, 99, None)
+
+    assert _alias_mapping(spec) == {"1": "route-one"}
 
 
 def test_diff_spec_does_not_flip_default_config_disable():
     """
     Toggling defaultConfigDisable rewrites Envoy's filter chain and tears down
     in-flight connections, so the diff must leave the flag alone regardless of
-    whether any rules remain.
+    whether any entries remain.
     """
-    spec = _empty_transformer_spec()
-    # Add then remove everything — flag must stay False the whole way.
-    spec = generic_route_transformer_diff_spec(
-        spec,
-        [build_generic_route_header_rule(1, "route-one")],
-        build_generic_route_path_pattern(1),
-    )
+    spec = _empty_router_spec()
+    spec = generic_proxy_router_diff_spec(spec, 1, "route-one")
     assert spec.defaultConfigDisable is False
-    spec = generic_route_transformer_diff_spec(
-        spec, [], build_generic_route_path_pattern(1)
-    )
+    spec = generic_proxy_router_diff_spec(spec, 1, None)
     assert spec.defaultConfigDisable is False
-    assert spec.defaultConfig == {"reqRules": []}
+    assert _alias_mapping(spec) == {}
 
 
 def test_diff_spec_passes_through_none():
     """Plugin doesn't exist yet → diff returns None so ensure_wasm_plugin can skip."""
-    assert (
-        generic_route_transformer_diff_spec(
-            None, [], build_generic_route_path_pattern(1)
-        )
-        is None
-    )
+    assert generic_proxy_router_diff_spec(None, 1, "route-one") is None
+    assert generic_proxy_router_diff_spec(None, 1, None) is None
 
 
-def test_diff_spec_preserves_unrelated_req_rules():
+def test_diff_spec_preserves_unrelated_default_config_keys():
     """
-    Diff must coexist with foreign reqRules — a future contributor may add
-    another `operate: rename` block or a separate `add` block with non-generic
-    headers to the same plugin. Our logic identifies generic-route rules by
-    path_pattern shape and leaves everything else alone.
+    Diff must coexist with other defaultConfig keys (prefix, targetHeader, and
+    any future config a contributor adds). Only aliasNameMapping is mutated.
     """
-    spec = _empty_transformer_spec()
-    foreign_rename_block = {
-        "operate": "rename",
-        "headers": [{"oldKey": "a", "newKey": "b"}],
-    }
-    foreign_add_header = {
-        "key": "x-other",
-        "value": "v",
-        "path_pattern": "^/other/path",
-    }
-    spec.defaultConfig = {
-        "reqRules": [
-            foreign_rename_block,
-            {"operate": "add", "headers": [foreign_add_header]},
-        ],
-    }
+    spec = _empty_router_spec()
+    spec.defaultConfig["customKey"] = "preserve-me"
 
-    spec = generic_route_transformer_diff_spec(
-        spec,
-        [build_generic_route_header_rule(1, "route-one")],
-        build_generic_route_path_pattern(1),
-    )
+    spec = generic_proxy_router_diff_spec(spec, 1, "route-one")
 
-    rules = spec.defaultConfig["reqRules"]
-    # Foreign rename block untouched.
-    assert foreign_rename_block in rules
-    # Foreign add header preserved (may be in its own block).
-    assert any(
-        r.get("operate") == "add" and foreign_add_header in r.get("headers", [])
-        for r in rules
-    )
-    # Generic-route rule landed in an add block of its own.
-    assert any(
-        r.get("operate") == "add"
-        and any(h.get("value") == "route-one" for h in r.get("headers", []))
-        for r in rules
-    )
+    assert spec.defaultConfig["prefix"] == "/model/proxy/"
+    assert spec.defaultConfig["targetHeader"] == "x-higress-llm-model"
+    assert spec.defaultConfig["customKey"] == "preserve-me"
+    assert _alias_mapping(spec) == {"1": "route-one"}
 
 
 def test_cleanup_spec_diff_prunes_orphans():
-    spec = _empty_transformer_spec()
-    # Seed with two routes, then run cleanup expecting only route 2 to survive.
-    spec = generic_route_transformer_diff_spec(
-        spec,
-        [build_generic_route_header_rule(1, "route-one")],
-        build_generic_route_path_pattern(1),
-    )
-    spec = generic_route_transformer_diff_spec(
-        spec,
-        [build_generic_route_header_rule(2, "route-two")],
-        build_generic_route_path_pattern(2),
-    )
+    spec = _empty_router_spec()
+    spec = generic_proxy_router_diff_spec(spec, 1, "route-one")
+    spec = generic_proxy_router_diff_spec(spec, 2, "route-two")
 
-    spec = cleanup_generic_route_transformer_spec_diff(
-        spec, expected_path_patterns={build_generic_route_path_pattern(2)}
-    )
+    spec = cleanup_generic_proxy_router_spec_diff(spec, expected_route_ids={2})
 
-    headers = _first_add_headers(spec)
-    assert len(headers) == 1
-    assert headers[0]["value"] == "route-two"
+    assert _alias_mapping(spec) == {"2": "route-two"}
     assert spec.defaultConfigDisable is False
 
 
 def test_cleanup_spec_diff_empties_when_no_routes_remain():
-    spec = _empty_transformer_spec()
-    spec = generic_route_transformer_diff_spec(
-        spec,
-        [build_generic_route_header_rule(1, "route-one")],
-        build_generic_route_path_pattern(1),
-    )
-    spec = cleanup_generic_route_transformer_spec_diff(
-        spec, expected_path_patterns=set()
-    )
-    assert spec.defaultConfig == {"reqRules": []}
+    spec = _empty_router_spec()
+    spec = generic_proxy_router_diff_spec(spec, 1, "route-one")
+
+    spec = cleanup_generic_proxy_router_spec_diff(spec, expected_route_ids=set())
+
+    assert _alias_mapping(spec) == {}
+    assert spec.defaultConfig["prefix"] == "/model/proxy/"
     assert spec.defaultConfigDisable is False
+
+
+# --- Generic proxy router init-time spec diff -----------------------------
+
+
+def _expected_router_spec() -> WasmPluginSpec:
+    """Match the shape produced by generic_proxy_router_plugin(cfg)."""
+    return WasmPluginSpec(
+        defaultConfig={
+            "prefix": "/model/proxy/",
+            "targetHeader": "x-higress-llm-model",
+            "enableOnPathSuffix": ["/v1/chat/completions", "/v1/messages"],
+            "aliasNameMapping": {},
+        },
+        defaultConfigDisable=False,
+        phase="AUTHN",
+        priority=900,
+        url="http://plugin-server/gpustack-generic-proxy-router/1.0.0/plugin.wasm",
+    )
+
+
+def test_init_diff_passes_through_when_plugin_missing():
+    """No live spec → factory expected_spec is returned untouched (no live state to merge)."""
+    expected = _expected_router_spec()
+    result = generic_proxy_router_spec_diff(None, expected)
+    assert result is expected
+
+
+def test_init_diff_preserves_live_alias_name_mapping():
+    """Controller-managed mapping must survive a restart even though every other field is refreshed."""
+    expected = _expected_router_spec()
+    live = _expected_router_spec()
+    live.defaultConfig = {
+        # stale defaultConfig as if an older release wrote it
+        "prefix": "/old/prefix/",
+        "targetHeader": "x-old-header",
+        "aliasNameMapping": {"1": "route-one", "2": "route-two"},
+    }
+
+    result = generic_proxy_router_spec_diff(live, expected)
+
+    # refreshed from expected
+    assert result.defaultConfig["prefix"] == "/model/proxy/"
+    assert result.defaultConfig["targetHeader"] == "x-higress-llm-model"
+    assert result.defaultConfig["enableOnPathSuffix"] == [
+        "/v1/chat/completions",
+        "/v1/messages",
+    ]
+    # preserved from live
+    assert result.defaultConfig["aliasNameMapping"] == {
+        "1": "route-one",
+        "2": "route-two",
+    }
+
+
+def test_init_diff_preserves_operator_max_body_bytes():
+    """``maxBodyBytes`` isn't set by the factory; if the operator set it on the live spec, keep it."""
+    expected = _expected_router_spec()
+    live = _expected_router_spec()
+    live.defaultConfig = {
+        "aliasNameMapping": {"1": "route-one"},
+        "maxBodyBytes": 10 * 1024 * 1024,
+    }
+
+    result = generic_proxy_router_spec_diff(live, expected)
+
+    assert result.defaultConfig["maxBodyBytes"] == 10 * 1024 * 1024
+    assert result.defaultConfig["aliasNameMapping"] == {"1": "route-one"}
+
+
+def test_init_diff_drops_live_default_config_keys_outside_preserve_list():
+    """
+    Anything in the live defaultConfig that isn't on the preserve list (e.g. an
+    operator's ad-hoc ``enableOnPathSuffix`` override) gets overwritten by the
+    factory's value on restart.
+    """
+    expected = _expected_router_spec()
+    live = _expected_router_spec()
+    live.defaultConfig = {
+        "enableOnPathSuffix": ["/operator-tweaked"],
+        "autoRouting": {"enable": True},
+        "aliasNameMapping": {"1": "route-one"},
+    }
+
+    result = generic_proxy_router_spec_diff(live, expected)
+
+    assert result.defaultConfig["enableOnPathSuffix"] == [
+        "/v1/chat/completions",
+        "/v1/messages",
+    ]
+    assert "autoRouting" not in result.defaultConfig
+    assert result.defaultConfig["aliasNameMapping"] == {"1": "route-one"}
+
+
+def test_init_diff_treats_none_values_as_unset():
+    """A live key explicitly set to None falls through to the factory's value."""
+    expected = _expected_router_spec()
+    live = _expected_router_spec()
+    live.defaultConfig = {
+        "aliasNameMapping": None,
+        "maxBodyBytes": None,
+    }
+
+    result = generic_proxy_router_spec_diff(live, expected)
+
+    # factory's {} wins because live value was None
+    assert result.defaultConfig["aliasNameMapping"] == {}
+    # maxBodyBytes wasn't in the factory either → stays unset
+    assert "maxBodyBytes" not in result.defaultConfig
+
+
+def test_init_diff_does_not_mutate_expected_spec():
+    """
+    The diff is built with ``partial(spec_diff, expected_spec=plugin_spec)`` —
+    if it mutated ``expected_spec.defaultConfig`` in place, state would leak
+    across hypothetical re-invocations.
+    """
+    expected = _expected_router_spec()
+    expected_config_before = dict(expected.defaultConfig)
+    live = _expected_router_spec()
+    live.defaultConfig = {"aliasNameMapping": {"1": "route-one"}}
+
+    generic_proxy_router_spec_diff(live, expected)
+
+    assert expected.defaultConfig == expected_config_before
+    assert expected.defaultConfig["aliasNameMapping"] == {}
 
 
 # --- Main ingress path rules ----------------------------------------------
@@ -440,3 +442,157 @@ def test_included_proxy_route_off_has_no_proxy_paths():
     )
     paths = [p.path for p in ingress.spec.rules[0].http.paths]
     assert not any("model/proxy" in p for p in paths)
+
+
+def test_lora_registry_name_suffix_stable_distinct_and_safe():
+    suffix = lora_registry_name_suffix("qwen3-0.6b:french")
+    # Stable: same LoRA route name always yields the same suffix.
+    assert lora_registry_name_suffix("qwen3-0.6b:french") == suffix
+    # Distinct: different LoRA route names do not collide.
+    assert lora_registry_name_suffix("qwen3-0.6b:german") != suffix
+    # RFC1123 label safe (lowercase alphanumeric + hyphen, starts/ends alnum).
+    assert re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", suffix)
+
+
+def test_model_instance_registry_name_suffix_static():
+    instance = ModelInstance(id=12, model_id=5, worker_ip="1.2.3.4", port=8000)
+    base = model_instance_registry(instance)
+    suffix = lora_registry_name_suffix("qwen3-0.6b:french")
+    alias = model_instance_registry(instance, name_suffix=suffix)
+    # Distinct service name, same upstream address/port/type.
+    assert base.name == "model-5-12"
+    assert alias.name == f"model-5-12-{suffix}"
+    assert alias.get_service_name() != base.get_service_name()
+    assert alias.domain == base.domain == "1.2.3.4:8000"
+    assert alias.port == base.port == 80
+    assert alias.type == base.type == "static"
+
+
+def test_model_instance_registry_name_suffix_dns():
+    instance = ModelInstance(
+        id=7, model_id=3, worker_ip="worker.example.com", port=8001
+    )
+    base = model_instance_registry(instance)
+    alias = model_instance_registry(instance, name_suffix="labcdef12")
+    assert base.type == "dns"
+    assert alias.name == "model-3-7-labcdef12"
+    assert alias.domain == base.domain == "worker.example.com"
+    assert alias.port == base.port == 8001
+    assert alias.type == "dns"
+
+
+def test_get_instance_id_from_header_base_and_lora_alias():
+    # Base service name: instance id is the second numeric segment.
+    assert get_instance_id_from_header({router_header_key: "model-1-2.static"}) == 2
+    # LoRA alias service name (extra -l<hash> segment) must still resolve to the
+    # underlying instance id, not the alias.
+    suffix = lora_registry_name_suffix("qwen3-0.6b:french")
+    assert (
+        get_instance_id_from_header({router_header_key: f"model-1-2-{suffix}.static"})
+        == 2
+    )
+    # Multi-digit model/instance ids.
+    assert (
+        get_instance_id_from_header({router_header_key: "model-10-234-labcdef12.dns"})
+        == 234
+    )
+
+
+def test_get_instance_id_from_header_invalid():
+    with pytest.raises(HTTPException):
+        get_instance_id_from_header({})
+    with pytest.raises(NotFoundException):
+        get_instance_id_from_header({router_header_key: "cluster-gateway.static"})
+
+
+def test_model_instances_registry_list_threads_suffix():
+    instances = [
+        ModelInstance(id=1, model_id=5, worker_ip="1.2.3.4", port=8000),
+        ModelInstance(id=2, model_id=5, worker_ip="1.2.3.5", port=8000),
+    ]
+    suffix = lora_registry_name_suffix("qwen3-0.6b:french")
+    dests = model_instances_registry_list(
+        instances,
+        downstream_model_name="qwen3-0.6b:french",
+        registry_name_suffix=suffix,
+    )
+    assert [model_name for _, model_name, _ in dests] == [
+        "qwen3-0.6b:french",
+        "qwen3-0.6b:french",
+    ]
+    assert [registry.name for _, _, registry in dests] == [
+        f"model-5-1-{suffix}",
+        f"model-5-2-{suffix}",
+    ]
+
+
+def _reg(name: str) -> McpBridgeRegistry:
+    return McpBridgeRegistry(name=name, domain="127.0.0.1", type="dns", port=80)
+
+
+def test_diff_registries_prefix_deletes_matching_prefix():
+    existing = [_reg("provider-1"), _reg("provider-10"), _reg("model-5-1")]
+    need_update, result = diff_registries(
+        existing, desired=[], to_delete_prefix="provider-"
+    )
+    assert need_update is True
+    assert {r.name for r in result} == {"model-5-1"}
+
+
+def test_diff_registries_exact_name_avoids_prefix_collision():
+    # Deleting provider id "1" must NOT drop "provider-10"/"provider-11".
+    existing = [
+        _reg("provider-1"),
+        _reg("provider-10"),
+        _reg("provider-11"),
+        _reg("model-5-1"),
+    ]
+    need_update, result = diff_registries(
+        existing, desired=[], to_delete_names=["provider-1"]
+    )
+    assert need_update is True
+    assert {r.name for r in result} == {"provider-10", "provider-11", "model-5-1"}
+
+
+def test_diff_registries_no_delete_targets_keeps_all():
+    existing = [_reg("provider-1"), _reg("provider-10")]
+    need_update, result = diff_registries(existing, desired=[])
+    assert need_update is False
+    assert {r.name for r in result} == {"provider-1", "provider-10"}
+
+
+def test_diff_registries_nameless_entry_is_kept_not_crashed():
+    # name is Optional[str]; a nameless existing entry must not raise on the
+    # prefix check and should be preserved as unrelated.
+    nameless = McpBridgeRegistry(domain="127.0.0.1", type="dns", port=80)
+    existing = [nameless, _reg("provider-1")]
+    need_update, result = diff_registries(
+        existing, desired=[], to_delete_prefix="provider-"
+    )
+    assert need_update is True
+    assert result == [nameless]
+
+
+def _proxy(name: str) -> McpBridgeProxy:
+    return McpBridgeProxy(
+        name=name, serverAddress="127.0.0.1", serverPort=80, type="HTTP"
+    )
+
+
+def test_diff_proxies_exact_name_deletes_only_target():
+    existing = [_proxy("provider-1-proxy"), _proxy("provider-10-proxy")]
+    need_update, result = diff_proxies(
+        existing, desired=[], to_delete_names=["provider-1-proxy"]
+    )
+    assert need_update is True
+    assert {p.name for p in result} == {"provider-10-proxy"}
+
+
+def test_diff_proxies_nameless_entry_is_kept_not_crashed():
+    nameless = McpBridgeProxy(serverAddress="127.0.0.1", serverPort=80, type="HTTP")
+    existing = [nameless, _proxy("provider-1-proxy")]
+    need_update, result = diff_proxies(
+        existing, desired=[], to_delete_prefix="provider-"
+    )
+    assert need_update is True
+    assert result == [nameless]

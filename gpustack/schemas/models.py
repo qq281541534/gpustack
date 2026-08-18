@@ -4,9 +4,10 @@ from enum import Enum
 import hashlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, List, Optional, Union
-from pydantic import BaseModel, ConfigDict, model_validator
-from sqlalchemy import JSON, Column, ForeignKey, Integer
-from sqlmodel import Field, Relationship, SQLModel, Text
+from pydantic import BaseModel, ConfigDict, field_serializer, model_validator
+from sqlalchemy import JSON, Column, ForeignKey, Integer, UniqueConstraint
+from sqlalchemy.orm import selectinload
+from sqlmodel import Field, Relationship, SQLModel, Text, select
 
 from gpustack.schemas.common import (
     ListParams,
@@ -25,7 +26,7 @@ from gpustack.schemas.model_routes import (
     ModelRouteTarget,
     AccessPolicyEnum,
 )
-from gpustack.schemas.principals import PLATFORM_PRINCIPAL_ID
+from gpustack.schemas.principals import _platform_principal_id
 
 if TYPE_CHECKING:
     from gpustack.schemas.model_files import ModelFile
@@ -79,6 +80,32 @@ class GPUSelector(BaseModel):
     # format of each element: "worker_name:device:gpu_index", example: "worker1:cuda:0"
     gpu_ids: Optional[List[str]] = None
     gpus_per_replica: Optional[int] = None
+
+
+class LoraListEntry(BaseModel):
+    """
+    One LoRA adapter configured on a base Model (download + runtime + optional route).
+    """
+
+    lora_name: str = Field(..., min_length=1)
+    """Fully-qualified LoRA id in the form "<base_model_name>:<suffix>". The API
+    strips the prefix on the way out (see ModelPublic._strip_lora_prefix), so
+    clients only ever see/enter the bare short name."""
+
+    lora_repo_name: Optional[str] = None
+    """HuggingFace repo id, ModelScope model id, or absolute filesystem path
+    (used as a fallback when source=local_path and local_path is empty)."""
+
+    source: str = SourceEnum.HUGGING_FACE.value
+    huggingface_filename: Optional[str] = None
+    model_scope_file_path: Optional[str] = None
+    local_path: Optional[str] = None
+
+    # Runtime fields populated when mounted on an instance.
+    path: Optional[str] = None
+    """Resolved filesystem path when mounted on an instance."""
+    model_file_id: Optional[int] = None
+    """ID of the ModelFile record backing this adapter."""
 
 
 class ExtendedKVCacheConfig(BaseModel):
@@ -189,7 +216,7 @@ class SpeculativeConfig(BaseModel):
 
 
 class ModelSpecBase(SQLModel, ModelSource):
-    name: str = Field(index=True, unique=True)
+    name: str = Field(index=True)
     description: Optional[str] = Field(
         sa_type=Text,
         nullable=True,
@@ -231,6 +258,11 @@ class ModelSpecBase(SQLModel, ModelSource):
     # is migrated to ModelAccess. Keeping this field for backward compatibility
     generic_proxy: Optional[bool] = Field(default=False)
 
+    lora_list: Optional[List[LoraListEntry]] = Field(
+        default=None,
+        sa_column=Column(pydantic_column_type(List[LoraListEntry]), nullable=True),
+    )
+
     @model_validator(mode="after")
     def set_defaults(self):
         backend = get_backend(self)
@@ -247,7 +279,7 @@ class ModelSpecBase(SQLModel, ModelSource):
 class ModelBase(ModelSpecBase):
     cluster_id: Optional[int] = Field(default=None, foreign_key="clusters.id")
     owner_principal_id: int = Field(
-        default=PLATFORM_PRINCIPAL_ID,
+        default_factory=_platform_principal_id,
         sa_column=Column(
             Integer,
             ForeignKey("principals.id", ondelete="CASCADE"),
@@ -260,6 +292,13 @@ class ModelBase(ModelSpecBase):
 
 class Model(ModelBase, BaseModelMixin, table=True):
     __tablename__ = 'models'
+    __table_args__ = (
+        # Model names are unique within their owning Org — two Orgs
+        # can each have a "qwen3-0.6b" without colliding.
+        UniqueConstraint(
+            'owner_principal_id', 'name', name='uix_models_name_per_owner'
+        ),
+    )
     id: Optional[int] = Field(default=None, primary_key=True)
 
     instances: list["ModelInstance"] = Relationship(
@@ -317,6 +356,23 @@ class ModelPublic(
     id: int
     created_at: datetime
     updated_at: datetime
+    # Populated only by the detail endpoint; None on list responses.
+    has_stale_lora_instances: Optional[bool] = None
+
+    @field_serializer("lora_list")
+    def _strip_lora_prefix(self, lora_list, _info):
+        """Hide the internal "<base>:" prefix; clients only see the short name."""
+        if not lora_list:
+            return lora_list
+        prefix = f"{self.name}:"
+        out = []
+        for entry in lora_list:
+            data = entry.model_dump() if isinstance(entry, BaseModel) else dict(entry)
+            name = data.get("lora_name") or ""
+            if name.startswith(prefix):
+                data["lora_name"] = name[len(prefix) :]
+            out.append(data)
+        return out
 
 
 ModelsPublic = PaginatedList[ModelPublic]
@@ -497,12 +553,17 @@ class ModelInstanceBase(SQLModel, ModelSource):
 
     cluster_id: Optional[int] = Field(default=None, foreign_key="clusters.id")
     owner_principal_id: int = Field(
-        default=PLATFORM_PRINCIPAL_ID,
+        default_factory=_platform_principal_id,
         sa_column=Column(
             Integer,
             ForeignKey("principals.id", ondelete="CASCADE"),
             nullable=False,
         ),
+    )
+
+    mounted_loras: Optional[List[LoraListEntry]] = Field(
+        default=None,
+        sa_column=Column(pydantic_column_type(List[LoraListEntry]), nullable=True),
     )
 
     def get_deployment_metadata(
@@ -581,6 +642,27 @@ class ModelInstance(ModelInstanceBase, BaseModelMixin, table=True):
         back_populates="cluster_model_instances",
         sa_relationship_kwargs={"lazy": "noload"},
     )
+
+    @classmethod
+    async def one_by_id_with_model_files(
+        cls,
+        session,
+        instance_id: int,
+        populate_existing: bool = True,
+    ) -> Optional["ModelInstance"]:
+        """Load a model instance with primary/LoRA + draft model_files and model spec eagerly loaded."""
+        stmt = (
+            select(cls)
+            .where(cls.id == instance_id)
+            .options(
+                selectinload(cls.model_files),
+                selectinload(cls.draft_model_files),
+                selectinload(cls.model),
+            )
+        )
+        if populate_existing:
+            stmt = stmt.execution_options(populate_existing=True)
+        return (await session.exec(stmt)).first()
 
     # overwrite the hash to use in uniquequeue
     def __hash__(self):

@@ -1,26 +1,27 @@
 import logging
 import math
-from copy import deepcopy
 from typing import List, Tuple, Optional, Dict
 
 import yaml
 from fastapi import APIRouter, Body
-from gpustack_runner.runner import ServiceVersionedRunner, ServiceRunner
-from gpustack_runtime.deployer.__utils__ import compare_versions
+from gpustack_runner.runner import ServiceVersionedRunner
 from pydantic import ValidationError
 from starlette.responses import StreamingResponse
 
 from gpustack.api.exceptions import (
+    AlreadyExistsException,
     InternalServerErrorException,
     NotFoundException,
     BadRequestException,
 )
 from gpustack.api.tenant import (
     assert_org_owned_writable,
+    cluster_scoped_system,
     validate_owner_principal,
 )
 from gpustack.schemas import Worker
 from gpustack.schemas.common import Pagination
+from gpustack.schemas.principals import PrincipalType
 from gpustack.schemas.inference_backend import (
     InferenceBackend,
     InferenceBackendCreate,
@@ -121,55 +122,8 @@ async def check_backend_in_use(
         return False, []
 
 
-def get_lower_version_runners(
-    runners: list[ServiceRunner], backend_version: str
-) -> list[ServiceRunner]:
-    """
-    Filter runners whose version is less than or equal to the given backend_version.
-    Rebuilds the list[ServiceRunner] structure with only the matching elements.
-
-    Args:
-        runners: List of ServiceRunner objects to filter
-        backend_version: The version to compare against (only runners with versions <= this will be kept)
-
-    Returns:
-        List of ServiceRunner objects with filtered versions/backends
-    """
-    filtered_runners = []
-    for runner in runners:
-        # Create a new runner with filtered structure
-        new_runner = deepcopy(runner)
-
-        # Filter versions in backends
-        for version in new_runner.versions:
-            for backend in version.backends:
-                # Filter backend versions that are <= backend_version
-                backend.versions = [
-                    bv
-                    for bv in backend.versions
-                    if compare_versions(bv.version, backend_version) <= 0
-                ]
-
-        # Remove backends with no matching versions
-        for version in new_runner.versions:
-            version.backends = [
-                backend for backend in version.backends if backend.versions
-            ]
-
-        # Remove versions with no matching backends
-        new_runner.versions = [
-            version for version in new_runner.versions if version.backends
-        ]
-
-        # Only add runner if it has matching versions
-        if new_runner.versions:
-            filtered_runners.append(new_runner)
-
-    return filtered_runners
-
-
 def get_runner_versions_and_configs(
-    backend_name: str, backend_version: Optional[str], **kwargs
+    backend_name: str, **kwargs
 ) -> Tuple[Dict[str, ServiceVersionedRunner], VersionConfigDict, Optional[str]]:
     """
     Get runner versions and version configs for a given backend.
@@ -188,8 +142,6 @@ def get_runner_versions_and_configs(
         service=backend_name.lower(),
         **kwargs,
     )
-    if backend_version:
-        runners_list = get_lower_version_runners(runners_list, backend_version)
     runner_versions: Dict[str, ServiceVersionedRunner] = {}
     version_configs = VersionConfigDict()
     default_version = None
@@ -270,24 +222,22 @@ def merge_list_runners(  # noqa: C901
                 if gpu.vendor == ManufacturerEnum.ASCEND and gpu.arch_family:
                     variant = get_ascend_cann_variant(gpu.arch_family).lower()
 
-                # Add (type, runtime_version, variant) tuple to set
-                # Use None for runtime_version if not available
-                query_conditions.add((gpu.type, gpu.runtime_version, variant))
+                query_conditions.add((gpu.type, variant))
 
     merged_runner_versions: Dict[str, List[ServiceVersionedRunner]] = {}
     merged_version_configs = VersionConfigDict()
     merged_default_version = None
 
     # Loop through each unique query condition
-    for idx, (gpu_type, runtime_version, variant) in enumerate(query_conditions):
+    for idx, (gpu_type, variant) in enumerate(query_conditions):
         # Build kwargs for get_runner_versions_and_configs
         kwargs = {"backend": gpu_type}
         if variant:
             kwargs["backend_variant"] = variant
 
-        # Get runner versions and configs for this condition
+        # List all versions regardless of the detected runtime version.
         runner_versions, version_configs, default_version = (
-            get_runner_versions_and_configs(backend_name, runtime_version, **kwargs)
+            get_runner_versions_and_configs(backend_name, **kwargs)
         )
 
         # For the first condition, use its results as base
@@ -357,7 +307,7 @@ async def list_backend_configs(  # noqa: C901
         #   Platform rows (NULL) + their own Org's rows. The merge below
         #   collapses these into one entry per backend_name with Org keys
         #   winning on collisions.
-        # - Bypass mode (admin "All", system users): there's no single Org
+        # - Bypass mode (admin "All", system principals): there's no single Org
         #   to merge with, so we fall back to Platform-only. Merging across
         #   multiple Org rows for the same backend_name would be
         #   ill-defined (last-Org-wins), and the response model
@@ -368,7 +318,10 @@ async def list_backend_configs(  # noqa: C901
         bypass_filter = (
             ctx is None
             or (ctx.is_platform_admin and ctx.current_principal_id is None)
-            or getattr(getattr(ctx, "user", None), "is_system", False)
+            or (
+                getattr(ctx, "user", None) is not None
+                and ctx.user.kind == PrincipalType.SYSTEM
+            )
         )
         if bypass_filter:
             visible_rows = [b for b in all_rows if b.owner_principal_id is None]
@@ -458,6 +411,8 @@ async def list_backend_configs(  # noqa: C901
                     enabled=True,
                     backend_source=BackendSourceEnum.BUILT_IN,
                     default_env=backend.default_env,
+                    parameter_format=backend.parameter_format,
+                    common_parameters=backend.common_parameters,
                 )
             else:
                 if (
@@ -475,6 +430,8 @@ async def list_backend_configs(  # noqa: C901
                     enabled=backend.enabled,
                     backend_source=backend.backend_source,
                     default_env=backend.default_env,
+                    parameter_format=backend.parameter_format,
+                    common_parameters=backend.common_parameters,
                 )
 
             items.append(backend_item)
@@ -506,9 +463,13 @@ def _hybrid_backend_conditions(ctx) -> List:
     Org rows are visible to:
     - their own Org's members (current_principal_id matches)
     - platform admin in "All" mode (no current_principal_id) — full bypass
-    - system users (worker / cluster service accounts) — full bypass,
-      since they need every Org's overrides to actually run a deploy
-      whose backend version was customised at the Org level
+    - cluster-bound system principals (worker / cluster service
+      accounts) — Platform rows plus the cluster's owner Org's rows.
+      Model deployments aren't shared across Orgs (cluster_access
+      sharing serves GPU instances), so the owner Org is the only Org
+      whose backend overrides this cluster ever serves.
+    - the legacy ``config.token`` system principal (no cluster
+      linkage) — full bypass
     Platform admin in act-as mode (current_principal_id is set) follows the
     same scope as a non-admin caller in that Org: Platform NULL +
     that Org's rows only. They DON'T see other Orgs' rows while
@@ -516,11 +477,19 @@ def _hybrid_backend_conditions(ctx) -> List:
     """
     if ctx is None:
         return []
-    if getattr(ctx.user, "is_system", False):
+    from sqlalchemy import or_
+
+    if cluster_scoped_system(ctx):
+        return [
+            or_(
+                InferenceBackend.owner_principal_id.is_(None),
+                InferenceBackend.owner_principal_id == ctx.scoped_cluster_owner_id,
+            )
+        ]
+    if ctx.user is not None and ctx.user.kind == PrincipalType.SYSTEM:
         return []
     if ctx.is_platform_admin and ctx.current_principal_id is None:
         return []
-    from sqlalchemy import or_
 
     or_clauses = [InferenceBackend.owner_principal_id.is_(None)]
     if ctx.current_principal_id is not None:
@@ -548,7 +517,6 @@ def _enrich_built_in_with_runner_versions(
     """Layer runner-discovered versions on top of the DB row in place."""
     _, runner_versions, default_version = get_runner_versions_and_configs(
         backend_name,
-        backend_version=None,
         with_deprecated=with_deprecated,
     )
     for runner_version, version_config in runner_versions.root.items():
@@ -614,23 +582,24 @@ def _collapse_by_backend_name(
         # `existing` is the public copy of whatever we saw first; `backend`
         # is the new ORM row. Decide which side is the Org row and merge.
         if backend.owner_principal_id is not None:
-            org_versions = backend.version_configs
-            other_versions = existing.version_configs
-            org_enabled = bool(backend.enabled)
-            other_enabled = bool(existing.enabled)
-            target = InferenceBackendPublic(**backend.model_dump())
+            org_row = backend
+            platform_row = existing
+            target = InferenceBackendPublic(**org_row.model_dump())
         else:
-            org_versions = existing.version_configs
-            other_versions = backend.version_configs
-            org_enabled = bool(existing.enabled)
-            other_enabled = bool(backend.enabled)
-            target = existing
+            org_row = existing
+            platform_row = backend
+            target = org_row
         merged_versions = {
-            **(other_versions.root if other_versions else {}),
-            **(org_versions.root if org_versions else {}),
+            **(
+                platform_row.version_configs.root
+                if platform_row.version_configs
+                else {}
+            ),
+            **(org_row.version_configs.root if org_row.version_configs else {}),
         }
         target.version_configs = VersionConfigDict(root=merged_versions)
-        target.enabled = org_enabled or other_enabled
+        target.enabled = bool(org_row.enabled) or bool(platform_row.enabled)
+        target.icon = platform_row.icon
         by_name[backend.backend_name] = target
     return list(by_name.values())
 
@@ -661,8 +630,19 @@ async def merge_runner_versions_to_db(
     # independently). Admin act-as mode behaves like the Org member —
     # they're acting *inside* that Org and want the collapsed
     # single-card UX too.
-    is_admin_view = ctx is None or (
-        ctx.is_platform_admin and ctx.current_principal_id is None
+    # System principals (worker / cluster service accounts) also get
+    # uncollapsed rows: they serve deploys for every Org and resolve
+    # the Platform-vs-Org scope per model themselves — collapsing all
+    # Orgs' rows into one entry here would lose that scoping.
+    is_system = (
+        ctx is not None
+        and ctx.user is not None
+        and ctx.user.kind == PrincipalType.SYSTEM
+    )
+    is_admin_view = (
+        ctx is None
+        or is_system
+        or (ctx.is_platform_admin and ctx.current_principal_id is None)
     )
     if is_admin_view:
         publics = [
@@ -765,7 +745,6 @@ def _filter_community_backends(
 
 @router.get("", response_model=InferenceBackendsPublic)
 async def get_inference_backends(  # noqa: C901
-    session: SessionDep,
     ctx: TenantContextDep,
     params: ListParamsDep,
     search: str = None,
@@ -777,7 +756,6 @@ async def get_inference_backends(  # noqa: C901
     Get paginated list of inference backends with optional search and filters.
 
     Args:
-        session: Database session
         params: List parameters (page, perPage, watch, sort_by)
         search: Search keyword for backend_name and description
         include_deprecated: Include deprecated versions
@@ -796,11 +774,17 @@ async def get_inference_backends(  # noqa: C901
                 ctx.is_platform_admin and ctx.current_principal_id is None
             ):
                 return True
-            # System users (worker / cluster) need every Org's overrides
-            # because they actually run the deploys.
-            if getattr(getattr(ctx, "user", None), "is_system", False):
+            org_id = b.owner_principal_id
+            # Cluster-bound service accounts (worker / cluster
+            # bootstrap) serve only their cluster's owner Org, so
+            # Platform rows + that Org's rows suffice — mirrors
+            # _hybrid_backend_conditions.
+            if cluster_scoped_system(ctx):
+                return org_id is None or org_id == ctx.scoped_cluster_owner_id
+            # The legacy config.token system principal has no cluster
+            # linkage and keeps the full cross-Org stream.
+            if ctx.user is not None and ctx.user.kind == PrincipalType.SYSTEM:
                 return True
-            org_id = getattr(b, "owner_principal_id", None)
             if org_id is None:
                 return True
             return (
@@ -1046,8 +1030,8 @@ async def create_inference_backend(
         },
     )
     if existing:
-        raise BadRequestException(
-            message=f"Inference backend with name '{backend_in.backend_name}' already exists",
+        raise AlreadyExistsException(
+            message=f"Inference backend with name '{backend_in.backend_name}' already exists.",
         )
 
     # Validate version names for custom backends before creating
@@ -1069,6 +1053,8 @@ async def create_inference_backend(
             default_env=backend_in.default_env,
             enabled=backend_in.enabled,
             backend_source=backend_in.backend_source,
+            parameter_format=backend_in.parameter_format,
+            common_parameters=backend_in.common_parameters,
             owner_principal_id=target_org_id,
         )
         backend = await InferenceBackend.create(session, backend)
@@ -1115,9 +1101,22 @@ async def _redirect_global_edit_to_org_row(
     # extends: an Org-scoped vLLM is still vLLM (a BUILT_IN backend),
     # not a freshly invented custom backend. That keeps suffix-validation
     # and other built-in-aware code paths firing identically.
+    #
+    # version_configs also inherits the Platform row's versions, with the
+    # payload layered on top. A bare "enable" carries no versions, so the
+    # catalog versions (community rows keep them here, tagged with
+    # built_in_frameworks) would otherwise be lost — leaving the Org row
+    # empty and its version blank in the uncollapsed "All" view, where the
+    # disabled Platform row is filtered out and can't fill the gap.
+    seed_version_configs = VersionConfigDict(
+        root={
+            **(backend.version_configs.root if backend.version_configs else {}),
+            **(backend_in.version_configs.root if backend_in.version_configs else {}),
+        }
+    ).model_copy(deep=True)
     new_row = InferenceBackend(
         backend_name=backend_in.backend_name,
-        version_configs=backend_in.version_configs,
+        version_configs=seed_version_configs,
         default_version=backend_in.default_version,
         default_backend_param=backend_in.default_backend_param,
         default_run_command=backend_in.default_run_command,
@@ -1128,6 +1127,9 @@ async def _redirect_global_edit_to_org_row(
         enabled=True,
         is_built_in=backend.is_built_in,
         backend_source=backend.backend_source,
+        parameter_format=backend_in.parameter_format,
+        common_parameters=backend_in.common_parameters,
+        icon=backend.icon,
         owner_principal_id=ctx.current_principal_id,
     )
     return await InferenceBackend.create(session, new_row)
@@ -1199,6 +1201,8 @@ async def update_inference_backend(  # noqa: C901
             "description": backend_in.description,
             "default_env": backend_in.default_env,
             "backend_source": backend_in.backend_source,
+            "parameter_format": backend_in.parameter_format,
+            "common_parameters": backend_in.common_parameters,
         }
         if backend_in.backend_source == BackendSourceEnum.COMMUNITY:
             if backend_in.enabled is not None:
@@ -1321,8 +1325,8 @@ async def create_inference_backend_from_yaml(  # noqa: C901
             },
         )
         if existing:
-            raise BadRequestException(
-                message=f"Inference backend with name '{req_yaml_data['backend_name']}' already exists",
+            raise AlreadyExistsException(
+                message=f"Inference backend with name '{req_yaml_data['backend_name']}' already exists.",
             )
 
         allowed_keys = [
@@ -1331,11 +1335,14 @@ async def create_inference_backend_from_yaml(  # noqa: C901
             "default_version",
             "default_backend_param",
             "default_run_command",
+            "default_entrypoint",
             "health_check_path",
             "description",
             "default_env",
             "enabled",
             "backend_source",
+            "parameter_format",
+            "common_parameters",
         ]
         yaml_data = {k: req_yaml_data[k] for k in allowed_keys if k in req_yaml_data}
 
@@ -1424,6 +1431,8 @@ async def update_inference_backend_from_yaml(  # noqa: C901
             "default_env",
             "enabled",
             "backend_source",
+            "parameter_format",
+            "common_parameters",
         ]
         if not is_built_in_backend(backend.backend_name):
             allowed_keys.append("default_version")

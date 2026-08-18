@@ -49,7 +49,7 @@ class ClusterAccess(BaseModelMixin, SQLModel, table=True):
         default=None,
         sa_column=Column(
             Integer,
-            ForeignKey("users.id", ondelete="SET NULL"),
+            ForeignKey("principals.id", ondelete="SET NULL"),
             nullable=True,
         ),
     )
@@ -66,9 +66,15 @@ class ClusterAccessPublic(SQLModel):
     # second principals lookup. Resolved server-side from the principals
     # row.
     principal_type: PrincipalType
-    # Human-readable label for the principal — username for USER,
-    # name for ORG / GROUP. Same rationale: server has the join cheaply.
+    # Stable identifier and human label, taken verbatim from the
+    # principals row. The UI renders ``display_name`` when set and
+    # falls back to ``name`` otherwise (e.g. GROUP rows commonly have
+    # only ``name``, ORG rows may have only ``name``). Both are sent
+    # so the UI can render them side-by-side ("Engineering @eng-team"
+    # style) or use ``name`` to disambiguate when ``display_name``
+    # collides.
     principal_name: Optional[str] = None
+    principal_display_name: Optional[str] = None
     # For GROUP principals, the parent ORG. NULL for USER and ORG.
     principal_parent_id: Optional[int] = None
     granted_by: Optional[int] = None

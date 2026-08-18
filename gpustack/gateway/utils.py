@@ -1,11 +1,23 @@
 import re
+import hashlib
 import logging
 import copy
 import math
 from urllib.parse import urlparse
 from dataclasses import dataclass
 from functools import partial
-from typing import List, Optional, Tuple, Union, Dict, Any, Literal, Callable, Set
+from typing import (
+    List,
+    Optional,
+    Tuple,
+    Union,
+    Dict,
+    Any,
+    Literal,
+    Callable,
+    Set,
+    Mapping,
+)
 from tenacity import retry, stop_after_attempt, wait_fixed
 from fastapi import HTTPException
 from starlette.datastructures import Headers
@@ -56,7 +68,7 @@ logger = logging.getLogger(__name__)
 default_mcp_bridge_name = "default"
 gpustack_ai_proxy_name = "gpustack-ai-proxy"
 gpustack_model_mapper_name = "gpustack-model-mapper"
-gpustack_generic_route_transformer_name = "gpustack-generic-route-transformer"
+gpustack_generic_proxy_router_name = "gpustack-model-router"
 model_ingress_prefix = "ai-route-model-"
 model_route_ingress_prefix = "ai-route-route-"
 provider_id_prefix = "provider-"
@@ -107,6 +119,7 @@ class RoutePrefix:
         ]
 
 
+# Paths routed like OpenAI (model-name resolution / same ingress); includes vLLM extras.
 openai_model_prefixes: List[RoutePrefix] = [
     RoutePrefix(
         [
@@ -223,11 +236,27 @@ def model_instance_prefix(
     return f"{model_prefix(model_instance.model_id)}{model_instance.id}"
 
 
+def lora_registry_name_suffix(lora_route_name: str) -> str:
+    """Stable RFC1123-safe suffix identifying a LoRA adapter's aliased registry.
+
+    Derived from the LoRA route name (``<base>:<lora>``) by hashing, so the same
+    LoRA always yields the same suffix regardless of position in ``lora_list`` or
+    of characters in the LoRA name. Both the McpBridge registration side and the
+    destination side compute it independently and must agree, otherwise the alias
+    service would dangle (503).
+    """
+    digest = hashlib.sha256(lora_route_name.encode("utf-8")).hexdigest()[:8]
+    return f"l{digest}"
+
+
 def model_instance_registry(
     model_instance: Union[ModelInstance, ModelInstancePublic],
     worker: Optional[Worker] = None,
+    name_suffix: Optional[str] = None,
 ) -> Optional[McpBridgeRegistry]:
     name = model_instance_prefix(model_instance)
+    if name_suffix:
+        name = f"{name}-{name_suffix}"
     if worker is not None:
         if worker.proxy_mode == ModelInstanceProxyModeEnum.WORKER:
             return _worker_reserve_proxy_registry(worker, name)
@@ -328,6 +357,10 @@ def provider_registry_name(id: int) -> str:
     return f"{provider_id_prefix}{id}"
 
 
+def provider_proxy_name(id: int) -> str:
+    return f"{provider_registry_name(id)}-proxy"
+
+
 def provider_registry(provider: ModelProvider) -> Optional[McpBridgeRegistry]:
     provider_url = provider.config.get_base_url()
     if provider_url is None:
@@ -369,7 +402,7 @@ def provider_proxy(provider: ModelProvider) -> Optional[McpBridgeProxy]:
     # timeout in seconds
     connection_timeout = provider.proxy_timeout or 5
     return McpBridgeProxy(
-        name=f"{provider_registry_name(provider.id)}-proxy",
+        name=provider_proxy_name(provider.id),
         serverAddress=proxy_url.hostname,
         serverPort=port,
         type=scheme.upper(),
@@ -428,17 +461,23 @@ def diff_registries(
     existing: List[McpBridgeRegistry],
     desired: List[McpBridgeRegistry],
     to_delete_prefix: Optional[str] = None,
+    to_delete_names: Optional[List[str]] = None,
 ) -> Tuple[bool, List[McpBridgeRegistry]]:
     desired_map = {
         reg.name: idx for idx, reg in enumerate(desired) if reg.name is not None
     }
+    to_delete_name_set = set(to_delete_names or [])
     total_list = []
     need_update = False
     for registry in existing:
-        if registry.name not in desired_map:
-            # delete registries that are not in the current list
-            if to_delete_prefix is not None and registry.name.startswith(
-                to_delete_prefix
+        name = registry.name
+        if name not in desired_map:
+            # delete registries that match the delete prefix or an exact name.
+            # ``name`` is Optional[str]; a nameless entry matches nothing and
+            # is kept as unrelated.
+            if name is not None and (
+                (to_delete_prefix is not None and name.startswith(to_delete_prefix))
+                or name in to_delete_name_set
             ):
                 need_update = True
             else:
@@ -446,7 +485,7 @@ def diff_registries(
                 total_list.append(registry)
         else:
             # update existing registries
-            idx = desired_map.pop(registry.name)
+            idx = desired_map.pop(name)
             if registry != desired[idx]:
                 need_update = True
                 registry = desired[idx]
@@ -464,23 +503,31 @@ def diff_proxies(
     existing: List[McpBridgeProxy],
     desired: List[McpBridgeProxy],
     to_delete_prefix: Optional[str] = None,
+    to_delete_names: Optional[List[str]] = None,
 ) -> Tuple[bool, List[McpBridgeProxy]]:
     desired_map = {
         reg.name: idx for idx, reg in enumerate(desired) if reg.name is not None
     }
+    to_delete_name_set = set(to_delete_names or [])
     total_list = []
     need_update = False
     for proxy in existing:
-        if proxy.name not in desired_map:
-            # delete registries that are not in the current list
-            if to_delete_prefix is not None and proxy.name.startswith(to_delete_prefix):
+        name = proxy.name
+        if name not in desired_map:
+            # delete proxies that match the delete prefix or an exact name.
+            # ``name`` is Optional[str]; a nameless entry matches nothing and
+            # is kept as unrelated.
+            if name is not None and (
+                (to_delete_prefix is not None and name.startswith(to_delete_prefix))
+                or name in to_delete_name_set
+            ):
                 need_update = True
             else:
                 # keep unrelated proxies
                 total_list.append(proxy)
         else:
             # update existing proxies
-            idx = desired_map.pop(proxy.name)
+            idx = desired_map.pop(name)
             if proxy != desired[idx]:
                 need_update = True
                 proxy = desired[idx]
@@ -501,8 +548,10 @@ async def ensure_mcp_bridge(
     mcp_bridge_name: str,
     desired_registries: List[McpBridgeRegistry],
     to_delete_prefix: Optional[str] = None,
+    to_delete_names: Optional[List[str]] = None,
     desired_proxies: List[McpBridgeProxy] = None,
     to_delete_proxies_prefix: Optional[str] = None,
+    to_delete_proxies_names: Optional[List[str]] = None,
 ):
     existing_bridge = None
     try:
@@ -530,6 +579,7 @@ async def ensure_mcp_bridge(
             existing=existing_bridge.spec.registries or [],
             desired=desired_registries,
             to_delete_prefix=to_delete_prefix,
+            to_delete_names=to_delete_names,
         )
         proxy_need_update = False
         proxy_list = existing_bridge.spec.proxies or []
@@ -538,6 +588,7 @@ async def ensure_mcp_bridge(
                 existing=existing_bridge.spec.proxies or [],
                 desired=desired_proxies,
                 to_delete_prefix=to_delete_proxies_prefix,
+                to_delete_names=to_delete_proxies_names,
             )
 
         if registry_need_update or proxy_need_update:
@@ -568,13 +619,14 @@ def generate_model_ingress(
     ingress_class_name: str = "higress",
 ) -> k8s_client.V1Ingress:
     retry_policies = "error,timeout,http_503,http_502,non_idempotent"
+    matcher_op = "exact"
     annotations = {
         "higress.io/rewrite-target": "/$1$3",
         "higress.io/destination": destinations,
         "higress.io/ignore-path-case": 'true',
         "higress.io/proxy-next-upstream-tries": '2',
         "higress.io/proxy-next-upstream": retry_policies,
-        **higress_http_header_matcher("exact", "x-higress-llm-model", route_name),
+        **higress_http_header_matcher(matcher_op, "x-higress-llm-model", route_name),
     }
     if extra_annotations is not None:
         annotations.update(extra_annotations)
@@ -754,6 +806,8 @@ def hamilton_calculate_weight(
 def model_instances_registry_list(
     model_instances: List[Union[ModelInstance, ModelInstancePublic]],
     workers: Optional[Dict[int, Worker]] = None,
+    downstream_model_name: Optional[str] = None,
+    registry_name_suffix: Optional[str] = None,
 ) -> DestinationTupleList:
     registries: DestinationTupleList = []
     for model_instance in model_instances:
@@ -762,9 +816,13 @@ def model_instances_registry_list(
             if model_instance.worker_id
             else None
         )
-        registry = model_instance_registry(model_instance, worker=worker)
+        registry = model_instance_registry(
+            model_instance, worker=worker, name_suffix=registry_name_suffix
+        )
         if registry is not None:
-            registries.append((1, model_instance.model_name, registry))
+            registries.append(
+                (1, downstream_model_name or model_instance.model_name, registry)
+            )
     return registries
 
 
@@ -1009,9 +1067,16 @@ async def ensure_model_mcp_bridge(
     namespace: str,
     cluster_id: int,
     workers: Optional[Dict[int, Worker]] = None,
+    lora_route_names: Optional[List[str]] = None,
 ) -> List[McpBridgeRegistry]:
     desired_registry: List[McpBridgeRegistry] = []
     to_delete_prefix: Optional[str] = model_prefix(model_id)
+    # Each LoRA gets its own registry aliasing the same instance address under a
+    # distinct service name, so the gateway can weight traffic across LoRAs and the
+    # model-mapper can rewrite per LoRA (both key on service). See calculate_model_destinations.
+    name_suffixes = [None] + [
+        lora_registry_name_suffix(name) for name in lora_route_names or []
+    ]
     if event_type != EventType.DELETED:
         for model_instance in model_instances:
             worker = (
@@ -1019,9 +1084,12 @@ async def ensure_model_mcp_bridge(
                 if model_instance.worker_id
                 else None
             )
-            registry = model_instance_registry(model_instance, worker=worker)
-            if registry is not None:
-                desired_registry.append(registry)
+            for name_suffix in name_suffixes:
+                registry = model_instance_registry(
+                    model_instance, worker=worker, name_suffix=name_suffix
+                )
+                if registry is not None:
+                    desired_registry.append(registry)
     await ensure_mcp_bridge(
         client=networking_higress_api,
         namespace=namespace,
@@ -1318,191 +1386,83 @@ async def cleanup_ai_proxy_config(
         raise
 
 
-def build_generic_route_path_pattern(route_id: int) -> str:
-    """Path pattern matching /model/proxy/<id> and /model/proxy/<id>/<anything>.
+# Generic-proxy router plugin: defaultConfig.aliasNameMapping is a flat
+# ``{str(route_id): effective_model_name}`` dict. The plugin extracts the alias
+# id between ``prefix`` and the next ``/`` in :path, looks it up in the
+# mapping, and writes the resolved name into ``targetHeader``. The reconcilers
+# below mutate that mapping per route; other keys in defaultConfig (prefix,
+# targetHeader, any future config) are preserved verbatim.
 
-    The Higress transformer plugin treats `add` + `path_pattern` + `value` as a
-    regex substitution: the portion of :path that matches path_pattern is
-    replaced by value, and the resulting string is written to the target header.
-    So the pattern MUST consume the entire path — otherwise the unmatched tail
-    gets concatenated onto the header value (e.g. `<route_name>v1/models`).
 
-    The `(/.*)?$` tail keeps the `/` boundary after <id> so `/model/proxy/10`
-    doesn't spuriously match id=1.
+def generic_proxy_router_diff_spec(
+    current_spec: Optional[WasmPluginSpec],
+    route_id: int,
+    route_name: Optional[str],
+) -> Optional[WasmPluginSpec]:
     """
-    return f"^/model/proxy/{route_id}(/.*)?$"
+    Set or remove ``aliasNameMapping[str(route_id)]`` on the plugin spec.
+    Other entries stay untouched. Returns None if the plugin doesn't exist yet
+    — init handles that.
 
+    Pass ``route_name=None`` to remove the alias for this route (e.g. when
+    generic_proxy is toggled off or the route is deleted).
 
-def build_generic_route_header_rule(route_id: int, route_name: str) -> Dict[str, Any]:
-    """HeaderRule dict injecting x-higress-llm-model when /model/proxy/<id>/ is hit.
-
-    Example for ``route_id=1, route_name="qwen3-0.6b"``::
-
-        {
-            "key": "x-higress-llm-model",
-            "value": "qwen3-0.6b",
-            "path_pattern": "^/model/proxy/1(/.*)?$",
-        }
-
-    At runtime Higress substitutes the portion of ``:path`` that matches
-    ``path_pattern`` with ``value`` and writes the result to ``key``.
-    ``path_pattern`` anchors both ends so every matched path reduces to just
-    ``value`` — see build_generic_route_path_pattern for why.
+    Do NOT touch defaultConfigDisable here — flipping it rewrites Envoy's
+    filter chain and tears down every live connection. Only the mapping
+    changes between reconciliations; the enable flag is locked at plugin
+    creation (see generic_proxy_router_plugin).
     """
-    return {
-        "key": "x-higress-llm-model",
-        "value": route_name,
-        "path_pattern": build_generic_route_path_pattern(route_id),
-    }
-
-
-# Generic-route rules are identified by the shape of their path_pattern — this
-# lets the diff/cleanup code coexist with other reqRules blocks a future
-# contributor might add for unrelated purposes, instead of assuming the
-# generic-route block is the only `add` block in the plugin.
-_GENERIC_ROUTE_PATH_PATTERN_RE = re.compile(r"^\^/model/proxy/\d+")
-
-
-def _is_generic_route_header(header: Dict[str, Any]) -> bool:
-    return bool(_GENERIC_ROUTE_PATH_PATTERN_RE.match(header.get("path_pattern", "")))
-
-
-def _split_generic_route_req_rules(
-    req_rules: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Partition existing reqRules into (blocks_to_preserve, generic_route_headers).
-
-    - Any ``add`` block contributes generic-route headers (identified by
-      path_pattern shape) to the second list. Non-generic headers from the same
-      block are retained verbatim in the first list, so mixed ownership is safe.
-    - Blocks with any other ``operate`` (rename, remove, map, ...) are preserved
-      untouched.
-    """
-    preserve: List[Dict[str, Any]] = []
-    generic_headers: List[Dict[str, Any]] = []
-    for rule in req_rules:
-        if rule.get("operate") != "add":
-            preserve.append(rule)
-            continue
-        foreign_headers: List[Dict[str, Any]] = []
-        for header in rule.get("headers", []):
-            if _is_generic_route_header(header):
-                generic_headers.append(header)
-            else:
-                foreign_headers.append(header)
-        if foreign_headers:
-            preserve.append({**rule, "headers": foreign_headers})
-    return preserve, generic_headers
-
-
-def _set_generic_route_headers(
-    current_spec: WasmPluginSpec, headers: List[Dict[str, Any]]
-) -> WasmPluginSpec:
-    # Do NOT touch defaultConfigDisable here — flipping it rewrites Envoy's
-    # filter chain and tears down every live connection. Only the reqRules
-    # list changes between reconciliations; the enable flag is locked at
-    # plugin creation (see generic_route_transformer_plugin).
-    default_config = current_spec.defaultConfig or {}
-    preserve, _ = _split_generic_route_req_rules(default_config.get("reqRules", []))
-    new_req_rules: List[Dict[str, Any]] = list(preserve)
-    if headers:
-        sorted_headers = sorted(headers, key=lambda h: h.get("path_pattern", ""))
-        new_req_rules.append({"operate": "add", "headers": sorted_headers})
-    current_spec.defaultConfig = {"reqRules": new_req_rules}
+    if current_spec is None:
+        return current_spec
+    default_config = dict(current_spec.defaultConfig or {})
+    mapping = dict(default_config.get("aliasNameMapping") or {})
+    key = str(route_id)
+    if route_name is None:
+        mapping.pop(key, None)
+    else:
+        mapping[key] = route_name
+    default_config["aliasNameMapping"] = mapping
+    current_spec.defaultConfig = default_config
     return current_spec
 
 
-def generic_route_transformer_diff_spec(
+def cleanup_generic_proxy_router_spec_diff(
     current_spec: Optional[WasmPluginSpec],
-    expected_header_rules: List[Dict[str, Any]],
-    operating_path_pattern: str,
+    expected_route_ids: Set[int],
 ) -> Optional[WasmPluginSpec]:
     """
-    Merge expected_header_rules into the current spec, replacing any existing rule
-    whose path_pattern equals operating_path_pattern. Other routes' rules stay
-    untouched, as do unrelated reqRules blocks added by other subsystems.
-    Returns None if the plugin doesn't exist yet — init handles that.
-
-    Example — reconciling route id=2 renamed to "route-two-renamed" while route
-    id=1 is already registered:
-
-        # current_spec.defaultConfig.reqRules (before)
-        [{"operate": "add", "headers": [
-            {"key": "x-higress-llm-model", "value": "route-one",
-             "path_pattern": "^/model/proxy/1(/.*)?$"},
-            {"key": "x-higress-llm-model", "value": "route-two",
-             "path_pattern": "^/model/proxy/2(/.*)?$"},
-        ]}]
-
-        # call
-        generic_route_transformer_diff_spec(
-            current_spec,
-            expected_header_rules=[build_generic_route_header_rule(2, "route-two-renamed")],
-            operating_path_pattern="^/model/proxy/2(/.*)?$",
-        )
-
-        # current_spec.defaultConfig.reqRules (after)
-        [{"operate": "add", "headers": [
-            {"key": "x-higress-llm-model", "value": "route-one",
-             "path_pattern": "^/model/proxy/1(/.*)?$"},
-            {"key": "x-higress-llm-model", "value": "route-two-renamed",
-             "path_pattern": "^/model/proxy/2(/.*)?$"},
-        ]}]
-
-    Pass expected_header_rules=[] to remove the rule for this route (e.g. when
-    generic_proxy is toggled off or the route is deleted).
+    Drop aliasNameMapping entries whose key is not in ``expected_route_ids``.
+    Used on startup to prune entries for routes that were deleted or had
+    generic_proxy toggled off while the server was down.
     """
     if current_spec is None:
         return current_spec
-    req_rules = (current_spec.defaultConfig or {}).get("reqRules", [])
-    _, generic_headers = _split_generic_route_req_rules(req_rules)
-    retained = [
-        h for h in generic_headers if h.get("path_pattern") != operating_path_pattern
-    ]
-    return _set_generic_route_headers(current_spec, retained + expected_header_rules)
+    default_config = dict(current_spec.defaultConfig or {})
+    mapping = default_config.get("aliasNameMapping") or {}
+    expected_keys = {str(rid) for rid in expected_route_ids}
+    retained = {k: v for k, v in mapping.items() if k in expected_keys}
+    default_config["aliasNameMapping"] = retained
+    current_spec.defaultConfig = default_config
+    return current_spec
 
 
-def cleanup_generic_route_transformer_spec_diff(
-    current_spec: Optional[WasmPluginSpec],
-    expected_path_patterns: Set[str],
-) -> Optional[WasmPluginSpec]:
-    """
-    Drop generic-route HeaderRules whose path_pattern is not in
-    expected_path_patterns. Non-generic rules (any shape that doesn't look like
-    ``^/model/proxy/<id>``) are left untouched. Used on startup to prune rules
-    for routes that were deleted or had generic_proxy toggled off while the
-    server was down.
-    """
-    if current_spec is None:
-        return current_spec
-    req_rules = (current_spec.defaultConfig or {}).get("reqRules", [])
-    _, generic_headers = _split_generic_route_req_rules(req_rules)
-    retained = [
-        h for h in generic_headers if h.get("path_pattern") in expected_path_patterns
-    ]
-    return _set_generic_route_headers(current_spec, retained)
-
-
-async def cleanup_generic_route_transformer(
+async def cleanup_generic_proxy_router(
     routes: List[ModelRoute],
     k8s_config: k8s_client.Configuration,
     namespace: str,
 ):
-    """Prune generic-route transformer rules to those for existing generic_proxy routes."""
-    expected_patterns = {
-        build_generic_route_path_pattern(route.id)
-        for route in routes
-        if getattr(route, "generic_proxy", False)
+    """Prune generic-proxy router entries to those for existing generic_proxy routes."""
+    expected_route_ids = {
+        route.id for route in routes if getattr(route, "generic_proxy", False)
     }
     api = ExtensionsHigressIoV1Api(k8s_client.ApiClient(k8s_config))
     await ensure_wasm_plugin(
         api=api,
-        name=gpustack_generic_route_transformer_name,
+        name=gpustack_generic_proxy_router_name,
         namespace=namespace,
         spec_diff=partial(
-            cleanup_generic_route_transformer_spec_diff,
-            expected_path_patterns=expected_patterns,
+            cleanup_generic_proxy_router_spec_diff,
+            expected_route_ids=expected_route_ids,
         ),
     )
 
@@ -1574,26 +1534,30 @@ def ai_proxy_diff_spec(
     return current_spec
 
 
-def get_instance_id_from_header(headers: Headers) -> int:
+def get_instance_id_from_header(headers: Mapping[str, str]) -> int:
     """Parse the model instance ID from the ``x-gpustack-model-instance`` routing header.
 
-    The header value follows the pattern ``model-<model_id>-<instance_id>.<suffix>``
-    injected by the API gateway. The instance ID is the last numeric segment
-    before the first dot.
+    The header value follows the pattern
+    ``model-<model_id>-<instance_id>[-l<lora>].<type>`` injected by the API
+    gateway. The instance ID is the second numeric segment; LoRA targets append
+    an extra ``-l<hash>`` alias segment (see ``lora_registry_name_suffix``) which
+    must be skipped.
 
     Raises:
         HTTPException (400): if the header is absent.
         NotFoundException: if the header value does not match the expected pattern.
     """
-    model_destination = headers.get(router_header_key, None)
+    if not isinstance(headers, Headers):
+        headers = Headers(headers)
+    model_destination = headers.get(router_header_key)
     if model_destination is None:
         raise HTTPException(
             status_code=400, detail=f"Missing {router_header_key} header"
         )
 
-    # Match pattern: model-<model_id>-<instance_id>.suffix
-    # instance_id is the last numeric segment before the first dot
-    match = re.match(r'^model-.*-(\d+)\..+', model_destination)
+    # Match pattern: model-<model_id>-<instance_id>[-<alias>].<type>
+    # instance_id is the second numeric segment, optionally followed by a LoRA alias.
+    match = re.match(r'^model-\d+-(\d+)(?:-[^.]+)?\..+', model_destination)
     if not match:
         raise NotFoundException(
             message=f"Invalid model destination format: {model_destination}"

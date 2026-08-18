@@ -4,9 +4,22 @@ import os
 
 # Database configuration
 DB_ECHO = os.getenv("GPUSTACK_DB_ECHO", "false").lower() == "true"
+# Diagnostic: when non-empty, every executed SQL whose text contains this
+# substring gets its Python call stack logged once per distinct call site
+# (deduplicated), so a high-frequency query can be attributed to its caller
+# without drowning the log. Empty (default) disables the check entirely.
+DB_TRACE_SQL_SUBSTR = os.getenv("GPUSTACK_DB_TRACE_SQL_SUBSTR", "")
 DB_POOL_SIZE = int(os.getenv("GPUSTACK_DB_POOL_SIZE", 30))
 DB_MAX_OVERFLOW = int(os.getenv("GPUSTACK_DB_MAX_OVERFLOW", 20))
 DB_POOL_TIMEOUT = int(os.getenv("GPUSTACK_DB_POOL_TIMEOUT", 30))
+# Backstop against leaked/long-held sessions accumulating as Postgres
+# "idle in transaction" connections and exhausting the pool (#5678). Only
+# fires while a transaction is open and idle -- an actively-running query,
+# however long, is never affected. 0 disables it. Ignored for non-Postgres
+# backends.
+DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_SECONDS = int(
+    os.getenv("GPUSTACK_DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT_SECONDS", 8 * 3600)
+)
 
 # Proxy configuration
 PROXY_TIMEOUT = int(os.getenv("GPUSTACK_PROXY_TIMEOUT_SECONDS", 1800))
@@ -60,12 +73,53 @@ WORKER_UNREACHABLE_CHECK_MODE = os.getenv(
     "GPUSTACK_WORKER_UNREACHABLE_CHECK_MODE", "auto"
 ).lower()
 
+# Opt-in (default off): drop a runner image's bundled cuda-compat and use the host
+# driver so consumer GPUs can run images built for a newer CUDA minor (same major).
+# Overridable per-model via the same env name in the model's env.
+ENABLE_CUDA_MINOR_VERSION_COMPATIBILITY_ENV = (
+    "GPUSTACK_ENABLE_CUDA_MINOR_VERSION_COMPATIBILITY"
+)
+ENABLE_CUDA_MINOR_VERSION_COMPATIBILITY = os.getenv(
+    ENABLE_CUDA_MINOR_VERSION_COMPATIBILITY_ENV, "false"
+).lower() in ["true", "1"]
+
+# GPU instance configuration
+# Interval at which the controller re-observes a still-transitioning (non-
+# settled) GPU instance via an in-memory requeue, instead of writing its own
+# status back to the DB to self-trigger the next poll. Ready-row drift is
+# picked up by the downstream watch, so only transitioning rows re-observe on
+# this cadence. The PV / PVT finalize controllers reuse this cadence to re-probe
+# a still-finalizing row, which is just another transitioning row. Clamped to
+# >= 1s at use to avoid a busy loop.
+GPU_INSTANCE_TRANSITIONING_REQUEUE_INTERVAL = int(
+    os.getenv("GPUSTACK_GPU_INSTANCE_TRANSITIONING_REQUEUE_INTERVAL", 15)
+)  # in seconds
+# Optional low-frequency fallback sweep: with the Ready-row reconfirm chain
+# retired, a settled Ready row's worker-side drift flows back only via the
+# downstream watch. If the watch misses an event across a reconnect gap, this
+# opt-in sweep periodically re-observes Ready rows so the drift is eventually
+# reconciled. 0 (default) disables it; set a low frequency (seconds) only if a
+# watch-gap coverage hole is observed.
+GPU_INSTANCE_READY_SWEEP_INTERVAL = int(
+    os.getenv("GPUSTACK_GPU_INSTANCE_READY_SWEEP_INTERVAL", 0)
+)  # in seconds
+
 # Model instance configuration
 MODEL_INSTANCE_RESCHEDULE_GRACE_PERIOD = int(
     os.getenv("GPUSTACK_MODEL_INSTANCE_RESCHEDULE_GRACE_PERIOD", 300)
 )  # 5 minutes in seconds
 MODEL_INSTANCE_HEALTH_CHECK_INTERVAL = int(
     os.getenv("GPUSTACK_MODEL_INSTANCE_HEALTH_CHECK_INTERVAL", 3)
+)
+# Period, in seconds, for forcing an authoritative (uncached) DB reconciliation
+# of locally-tracked model instances in the worker state sync. 0 disables it,
+# leaving the sync purely cache-backed. It exists only as a backstop for a
+# watch cache that silently diverged from DB truth without a reconnect (e.g. a
+# coordinator dropping a DELETED on a live stream); enabling it reintroduces one
+# uncached full SELECT per worker per period, so keep it well above the health
+# check interval when set.
+MODEL_INSTANCE_STATE_RECONCILE_INTERVAL = int(
+    os.getenv("GPUSTACK_MODEL_INSTANCE_STATE_RECONCILE_INTERVAL", 0)
 )
 DISABLE_OS_FILELOCK = os.getenv("GPUSTACK_DISABLE_OS_FILELOCK", "false").lower() in [
     "true",
@@ -147,6 +201,27 @@ USAGE_ESTIMATED_TOKENS_PER_OUTPUT_CHUNK = max(
     1, int(os.getenv("GPUSTACK_USAGE_ESTIMATED_TOKENS_PER_OUTPUT_CHUNK", 1))
 )
 
+# Platform-wide timezone for calendar-based rollups and time-of-day display.
+# It buckets the ``model_usages.date`` daily rollup (and the matching
+# ``model_usage_details.date`` audit column), the ``metered_usage`` GPU/storage
+# time buckets, and renders Last Active / resource-event times — and is the
+# canonical calendar for any other feature that needs an operator-chosen
+# timezone. Empty (default) ⇒ use the operating system's local timezone
+# (resolved from ``TZ`` env var / ``/etc/localtime``). Set to an IANA name
+# (``Asia/Shanghai``, ``UTC``, ...) to override — useful when the server
+# container runs in UTC but operators expect a different region's calendar.
+#
+# ``GPUSTACK_USAGE_ROLLUP_TIMEZONE`` is the pre-rename name, kept as a
+# deprecated alias: ``GPUSTACK_TIMEZONE`` wins when both are set; otherwise the
+# legacy value is honored. ``USING_DEPRECATED_TIMEZONE`` records that the value
+# came from the legacy var so ``resolve_rollup_tz`` can emit a one-time
+# deprecation warning — deferred out of import time, since this module loads
+# before logging is configured (logging here is a Python anti-pattern).
+_timezone = os.getenv("GPUSTACK_TIMEZONE", "")
+_legacy_rollup_timezone = os.getenv("GPUSTACK_USAGE_ROLLUP_TIMEZONE", "")
+USING_DEPRECATED_TIMEZONE = bool(_legacy_rollup_timezone and not _timezone)
+TIMEZONE = _timezone or _legacy_rollup_timezone
+
 # Usage details archival.
 # Rows in ``model_usage_details`` older than the retention threshold (anchored
 # on COALESCE(completed_at, created_at)) are moved to
@@ -177,6 +252,49 @@ USAGE_DETAILS_BUFFER_MAX_SIZE = int(
     os.getenv("GPUSTACK_USAGE_DETAILS_BUFFER_MAX_SIZE", 100000)
 )
 
+# ``resource_events`` hot/cold archival — same shape as the model_usage_details
+# pair above. The events table grows much slower (lifecycle events, not per
+# request), so the defaults are conservative.
+USAGE_EVENTS_RETENTION_MONTHS = int(
+    os.getenv("GPUSTACK_USAGE_EVENTS_RETENTION_MONTHS", 13)
+)
+USAGE_EVENTS_ARCHIVE_CRON = os.getenv(
+    "GPUSTACK_USAGE_EVENTS_ARCHIVE_CRON", "30 3 * * *"
+)
+USAGE_EVENTS_ARCHIVE_BATCH_SIZE = int(
+    os.getenv("GPUSTACK_USAGE_EVENTS_ARCHIVE_BATCH_SIZE", 5000)
+)
+
+# ``metered_usage`` hot/cold archival — hourly rollup rows older than the
+# retention window move to ``metered_usage_archive``. Retention must stay far
+# larger than the collector's settlement horizon (hours) so a still-being-
+# written bucket is never archived; 13 months is safe by orders of magnitude.
+METERED_USAGE_RETENTION_MONTHS = int(
+    os.getenv("GPUSTACK_METERED_USAGE_RETENTION_MONTHS", 13)
+)
+METERED_USAGE_ARCHIVE_CRON = os.getenv(
+    "GPUSTACK_METERED_USAGE_ARCHIVE_CRON", "0 4 * * *"
+)
+METERED_USAGE_ARCHIVE_BATCH_SIZE = int(
+    os.getenv("GPUSTACK_METERED_USAGE_ARCHIVE_BATCH_SIZE", 5000)
+)
+
+# metered_usage collector tick — periodic safety net that flushes accumulated
+# seconds for long-running metered resources that haven't had a lifecycle
+# event since the last tick.
+RESOURCE_USAGE_TICK_SECONDS = int(
+    os.getenv("GPUSTACK_RESOURCE_USAGE_TICK_SECONDS", 300)
+)
+STORAGE_USAGE_TICK_SECONDS = int(os.getenv("GPUSTACK_STORAGE_USAGE_TICK_SECONDS", 300))
+
+# Grace window before an elapsed hour-bucket is sealed (finalized for billing).
+# A bucket is sealed once now >= bucket_end + grace, so this absorbs late events
+# / clock skew; keep it comfortably larger than the tick interval. After sealing
+# a bucket is immutable — late segments for it are dropped (and logged).
+METERED_USAGE_SEAL_GRACE_SECONDS = int(
+    os.getenv("GPUSTACK_METERED_USAGE_SEAL_GRACE_SECONDS", 900)
+)
+
 DEFAULT_CLUSTER_KUBERNETES = (
     os.getenv("GPUSTACK_DEFAULT_CLUSTER_KUBERNETES", "false").lower() == "true"
 )
@@ -189,3 +307,14 @@ BENCHMARK_DATASET_SHAREGPT_PATH = os.getenv(
 BENCHMARK_REQUEST_TIMEOUT = int(
     os.getenv("GPUSTACK_BENCHMARK_REQUEST_TIMEOUT", 3600)  # 1 hour
 )  # in seconds
+
+# Usage breakdown configuration
+# Upper bound on the number of buckets a single no-pagination (page=-1)
+# breakdown request may return — the trend charts and exports fetch the whole
+# series unpaginated. A request whose grouping × date range would exceed this
+# is rejected (HTTP 400) rather than silently truncated, so the caller narrows
+# the range or adds filters. Tune up for very wide dashboards, or down to cap
+# memory/payload more aggressively.
+USAGE_BREAKDOWN_MAX_NO_PAGINATION_ROWS = int(
+    os.getenv("GPUSTACK_USAGE_BREAKDOWN_MAX_NO_PAGINATION_ROWS", 50000)
+)

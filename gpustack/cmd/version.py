@@ -1,5 +1,9 @@
 import argparse
-from gpustack import __version__, __git_commit__
+import logging
+
+from gpustack.extension import resolve_version_info
+
+logger = logging.getLogger(__name__)
 
 
 def setup_version_cmd(subparsers: argparse._SubParsersAction):
@@ -18,7 +22,8 @@ def setup_version_cmd(subparsers: argparse._SubParsersAction):
 
 
 def run(args):
+    version, git_commit = resolve_version_info()
     if args.short:
-        print(__version__)
+        print(version)
     else:
-        print(f"{__version__} ({__git_commit__})")
+        print(f"{version} ({git_commit})")

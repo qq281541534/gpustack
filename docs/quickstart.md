@@ -1,6 +1,6 @@
 # Quickstart
 
-This guide will walk you through running GPUStack on your own self-hosted GPU servers. To use [cloud GPUs](./tutorials/adding-gpucluster-using-digitalocean.md), or integrating with an [existing Kubernetes cluster](./tutorials/adding-gpucluster-using-kubernetes.md), see the relevant tutorials.
+This guide walks you through running GPUStack on self-hosted GPU servers. To use [cloud GPUs](./tutorials/adding-gpucluster-using-digitalocean.md) or to integrate with an [existing Kubernetes cluster](./tutorials/adding-gpucluster-using-kubernetes.md), see the relevant tutorials.
 
 !!! info "Prerequisites"
 
@@ -82,7 +82,7 @@ sudo docker run -d --name gpustack-worker \
 
 1. Navigate to the `Catalog` page in the GPUStack UI.
 
-2. Select the `Qwen3-0.6B` model from the list of available models.
+2. Select the `Qwen3.5-0.8B` model from the list of available models.
 
 3. After the deployment compatibility checks pass, click the `Save` button to deploy the model.
 
@@ -96,13 +96,13 @@ sudo docker run -d --name gpustack-worker \
 
 ![model is running](assets/quick-start/model-running.png)
 
-5. Click `Playground - Chat` in the navigation menu, check that the model `qwen3-0.6b` is selected from the top-right `Model` dropdown. Now you can chat with the model in the UI playground.
+5. Click `Playground - Chat` in the navigation menu, check that the model `qwen3.5-0.8b` is selected from the top-right `Model` dropdown. Now you can chat with the model in the UI playground.
 
 ![quick chat](assets/quick-start/quick-chat.png)
 
 ## Use the model via API
 
-1. Hover over the user avatar and navigate to the `API Keys` page, then click the `New API Key` button.
+1. Navigate to the `Access Control` > `API Keys` page, then click the `New API Key` button.
 
 2. Fill in the `Name` and click the `Save` button.
 
@@ -118,7 +118,7 @@ curl http://your_gpustack_server_url/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $GPUSTACK_API_KEY" \
   -d '{
-    "model": "qwen3-0.6b",
+    "model": "qwen3.5-0.8b",
     "messages": [
       {
         "role": "system",

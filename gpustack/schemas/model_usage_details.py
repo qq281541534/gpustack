@@ -2,7 +2,7 @@ from datetime import date, datetime
 from typing import ClassVar, Optional
 
 from pydantic import ConfigDict
-from sqlalchemy import BigInteger, Column, Integer
+from sqlalchemy import BigInteger, Boolean, Column, Integer, false
 from sqlmodel import Field, SQLModel
 
 from gpustack.mixins import BaseModelMixin
@@ -43,6 +43,13 @@ class ModelUsageDetails(SQLModel, BaseModelMixin, table=True):
     model_name: str = Field(default=...)
     model_route_id: Optional[int] = Field(default=None, sa_column=Column(Integer))
     model_route_name: Optional[str] = Field(default=None)
+    # Tenant scope snapshot. FK-less for the same audit-survival reason
+    # as the other id columns — see class docstring.
+    owner_principal_id: Optional[int] = Field(default=None, sa_column=Column(Integer))
+    # Consumer tenant scope snapshot, denormalized from the API key owner.
+    consumer_principal_id: Optional[int] = Field(
+        default=None, sa_column=Column(Integer)
+    )
     provider_id: Optional[int] = Field(default=None, sa_column=Column(Integer))
     provider_name: Optional[str] = Field(default=None)
     provider_type: Optional[str] = Field(default=None)
@@ -61,6 +68,17 @@ class ModelUsageDetails(SQLModel, BaseModelMixin, table=True):
     )
     prompt_cached_token_count: int = Field(
         default=0, sa_column=Column(BigInteger, nullable=False, default=0)
+    )
+    # True iff the canonical usage chunk was observed before the stream
+    # ended (token counts above are authoritative). False means the request
+    # was interrupted and the token counts are server-side estimates (see
+    # ``_estimate_partial_usage``). Billing reads this to gate per-request
+    # charges — image / tts / stt are billed per request and have no token
+    # fallback, so an interrupted one must not be charged — and to flag
+    # estimated token-billed rows for reconciliation / transparency.
+    completed: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=false()),
     )
     operation: Optional[OperationEnum] = Field(default=None)
     # Wall-clock anchors reported by the proxy (UnixMilli on the wire,
@@ -97,6 +115,13 @@ class ModelUsageDetailsArchive(SQLModel, BaseModelMixin, table=True):
     model_name: str = Field(default=...)
     model_route_id: Optional[int] = Field(default=None, sa_column=Column(Integer))
     model_route_name: Optional[str] = Field(default=None)
+    # Tenant scope snapshot. FK-less for the same audit-survival reason
+    # as the other id columns — see class docstring.
+    owner_principal_id: Optional[int] = Field(default=None, sa_column=Column(Integer))
+    # Consumer tenant scope snapshot, denormalized from the API key owner.
+    consumer_principal_id: Optional[int] = Field(
+        default=None, sa_column=Column(Integer)
+    )
     provider_id: Optional[int] = Field(default=None, sa_column=Column(Integer))
     provider_name: Optional[str] = Field(default=None)
     provider_type: Optional[str] = Field(default=None)
@@ -115,6 +140,17 @@ class ModelUsageDetailsArchive(SQLModel, BaseModelMixin, table=True):
     )
     prompt_cached_token_count: int = Field(
         default=0, sa_column=Column(BigInteger, nullable=False, default=0)
+    )
+    # True iff the canonical usage chunk was observed before the stream
+    # ended (token counts above are authoritative). False means the request
+    # was interrupted and the token counts are server-side estimates (see
+    # ``_estimate_partial_usage``). Billing reads this to gate per-request
+    # charges — image / tts / stt are billed per request and have no token
+    # fallback, so an interrupted one must not be charged — and to flag
+    # estimated token-billed rows for reconciliation / transparency.
+    completed: bool = Field(
+        default=False,
+        sa_column=Column(Boolean, nullable=False, server_default=false()),
     )
     operation: Optional[OperationEnum] = Field(default=None)
     started_at: Optional[datetime] = Field(

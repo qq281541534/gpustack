@@ -1,3 +1,4 @@
+import re
 import secrets
 from urllib.parse import urlparse
 from enum import Enum
@@ -39,7 +40,7 @@ from gpustack.schemas.common import (
 if TYPE_CHECKING:
     from gpustack.schemas.models import Model, ModelInstance
     from gpustack.schemas.workers import Worker
-    from gpustack.schemas.users import User
+    from gpustack.schemas.principals import Principal
 
 
 class WorkerPoolUpdate(SQLModel):
@@ -69,6 +70,32 @@ class Volume(BaseModel):
         if not all(c in allowed_chars for c in v):
             raise ValueError("Volume name contains invalid characters")
         return v
+
+
+class ImageCredential(BaseModel):
+    """
+    A docker registry credential. At manifest render time each entry is
+    materialized into a ``kubernetes.io/dockerconfigjson`` Secret named
+    ``gpustack-image-pull-secret-<index>`` in the worker namespace, which
+    every worker DaemonSet then references via ``imagePullSecrets``.
+
+    ``username`` / ``password`` are optional so a credential entry can act
+    as a placeholder Secret for a public or pre-configured registry — the
+    rendered ``.dockerconfigjson`` falls back to an empty ``{"auths":{}}``
+    payload when either is missing, matching the gpustack Helm chart
+    convention.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    registry: str = PydanticField(
+        ...,
+        description="Docker registry host (e.g. docker.io, registry.example.com).",
+    )
+    username: Optional[str] = None
+    password: Optional[str] = PydanticField(
+        default=None,
+        description="Registry password / access token. Stored as-is — handle as a secret.",
+    )
 
 
 class HostPathVolumeSource(BaseModel):
@@ -137,8 +164,6 @@ class K8sVolumeMount(BaseModel):
             return v
         if len(v) > 63:
             raise ValueError("Volume name must be less than 64 characters")
-        import re
-
         if not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", v):
             raise ValueError(
                 "Volume name must be a valid DNS-1123 label (e.g. 'my-name', or '123-abc'); "
@@ -146,6 +171,112 @@ class K8sVolumeMount(BaseModel):
                 "and must start and end with an alphanumeric character."
             )
         return v
+
+
+class GpuInstanceOptions(BaseModel):
+    """
+    GPU-instance support knobs for the operator. Its mere presence on
+    ``k8s_options.gpu_instance_options`` signals "GPU instances enabled"
+    for this cluster — leaving the field unset opts the cluster out, so
+    no separate boolean flag is needed.
+
+    Not wired into manifest rendering yet; persisted so the operator /
+    future render paths can pick it up without another schema change.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    gpu_instances_access_static_address: Optional[str] = PydanticField(
+        default=None,
+        alias="gpuInstancesAccessStaticAddress",
+        description=(
+            "Static address surfaced to the operator for accessing GPU "
+            "instances in this cluster (e.g. LoadBalancer VIP)."
+        ),
+    )
+
+
+class OperatorOptions(BaseModel):
+    """
+    Operator-specific deployment options. Nested under ``k8s_options.operator``
+    so operator concerns are isolated from worker process configuration.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    env: Optional[Dict[str, str]] = PydanticField(
+        default=None,
+        alias="env",
+        description=(
+            "Additional environment variables injected into the operator "
+            "container. Keys are env var names, values are literal strings."
+        ),
+    )
+
+
+class K8sOptions(BaseModel):
+    """
+    All Kubernetes-side deployment knobs for a cluster's worker DaemonSets:
+    pod spec primitives (imageCredentials, nodeSelector, volumeMounts). The
+    base ``nodeSelector`` applies to every rendered worker DaemonSet; each
+    per-runtime DaemonSet additionally gets a vendor PCI-presence label merged
+    on top at render time (see ``manifest_template``). Top-level on the cluster
+    (parallel to ``worker_config``) so K8s deployment concerns are isolated
+    from worker process behaviour; structure mirrors how Helm chart values are
+    usually organised under ``worker.*`` for future chart migration.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    image_credentials: Optional[List[ImageCredential]] = PydanticField(
+        default=None,
+        alias="imageCredentials",
+        description=(
+            "Docker registry credentials. Each entry becomes a "
+            "kubernetes.io/dockerconfigjson Secret named "
+            "``gpustack-image-pull-secret-<index>`` in the worker namespace "
+            "and is referenced from every worker DaemonSet's imagePullSecrets."
+        ),
+    )
+    node_selector: Optional[Dict[str, str]] = PydanticField(
+        default=None,
+        alias="nodeSelector",
+        description="Pod spec nodeSelector labels applied to manifests rendered for the cluster.",
+    )
+    volume_mounts: Optional[List[K8sVolumeMount]] = PydanticField(
+        default=None,
+        alias="volumeMounts",
+        description=(
+            "Pod spec volumes and volumeMounts applied to every worker "
+            "DaemonSet. The first entry is reserved for the gpustack data "
+            "dir; the route layer enforces that invariant."
+        ),
+    )
+    operator_image: Optional[str] = PydanticField(
+        default=None,
+        alias="operatorImage",
+        description=(
+            "Override for the gpustack-operator container image. Falls back "
+            "to the server's GPUSTACK_OPERATOR_IMAGE / built-in default when unset."
+        ),
+    )
+    gpu_instance_options: Optional[GpuInstanceOptions] = PydanticField(
+        default=None,
+        alias="gpuInstanceOptions",
+        description=(
+            "GPU-instance support knobs. Presence of this field enables GPU "
+            "instance handling for the cluster; absence opts the cluster out."
+        ),
+    )
+    namespace: Optional[str] = PydanticField(
+        default=None,
+        description=(
+            "Kubernetes namespace this cluster's manifests render into. "
+            "Falls back to ``gpustack-system`` at render time when unset."
+        ),
+    )
+    operator: Optional[OperatorOptions] = PydanticField(
+        default=None,
+        alias="operator",
+        description="Operator-specific deployment options for the cluster.",
+    )
 
 
 class CloudOptions(BaseModel):
@@ -321,6 +452,14 @@ class ClusterUpdate(SQLModel):
     description: Optional[str] = None
     gateway_endpoint: Optional[str] = None
     server_url: Optional[str] = None
+    # Per-cluster default container registry. Promoted out of worker_config
+    # so it can be referenced/overridden independently of the worker process
+    # config (image rendering, registration token, worker config response
+    # all read this directly). Falls back to the server's
+    # GPUSTACK_SYSTEM_DEFAULT_CONTAINER_REGISTRY when unset.
+    system_default_container_registry: Optional[str] = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
     worker_config: Optional[PredefinedConfigNoDefaults] = Field(
         default=None,
         sa_column=Column(
@@ -332,11 +471,11 @@ class ClusterUpdate(SQLModel):
             )
         ),
     )
-    k8s_volume_mounts: Optional[List[K8sVolumeMount]] = Field(
+    k8s_options: Optional[K8sOptions] = Field(
         default=None,
         sa_column=Column(
             pydantic_column_type(
-                List[K8sVolumeMount],
+                K8sOptions,
                 exclude_none=True,
                 exclude_unset=True,
                 exclude_defaults=True,
@@ -352,6 +491,7 @@ class ClusterUpdate(SQLModel):
             parsed = urlparse(v)
             if not parsed.scheme or not parsed.netloc:
                 raise ValueError("Invalid server_url format")
+            return v.rstrip("/")
         return v
 
 
@@ -381,6 +521,20 @@ class ClusterBase(ClusterCreateBase):
     )
     reported_gateway_endpoint: Optional[str] = None
     is_default: bool = Field(default=False)
+    # SYSTEM principal that represents this cluster's bootstrap
+    # account. Nullable so a cluster can be created before its service
+    # principal is provisioned; SET NULL on principal delete so an
+    # orphaned bootstrap row doesn't drag the cluster down with it.
+    # UNIQUE: at most one cluster claims a given SYSTEM principal.
+    system_principal_id: Optional[int] = Field(
+        default=None,
+        sa_column=Column(
+            sa.Integer,
+            sa.ForeignKey("principals.id", ondelete="SET NULL"),
+            nullable=True,
+            unique=True,
+        ),
+    )
 
 
 class Cluster(ClusterBase, BaseModelMixin, table=True):
@@ -414,8 +568,22 @@ class Cluster(ClusterBase, BaseModelMixin, table=True):
     cluster_model_instances: List["ModelInstance"] = Relationship(
         sa_relationship_kwargs={"lazy": "noload"}, back_populates="cluster"
     )
-    cluster_users: list["User"] = Relationship(
-        sa_relationship_kwargs={"cascade": "delete", "lazy": "noload"},
+    # The SYSTEM principal this cluster's bootstrap token authenticates
+    # as. 1:1 via the UNIQUE ``system_principal_id`` FK above. Back-
+    # populated from :attr:`Principal.cluster`. ``cascade="delete"``
+    # restores the prior cluster→principal cleanup semantic: the
+    # legacy schema had ``principals.cluster_id ON DELETE CASCADE``,
+    # so deleting a cluster also dropped its bootstrap principal. The
+    # inverted FK can't express that cascade at the DB level
+    # (``ON DELETE SET NULL`` only fires the other direction), so the
+    # ORM-level cascade in :class:`BaseModelMixin` re-creates it.
+    system_principal: Optional["Principal"] = Relationship(
+        sa_relationship_kwargs={
+            "cascade": "delete",
+            "lazy": "noload",
+            "uselist": False,
+            "foreign_keys": "[Cluster.system_principal_id]",
+        },
         back_populates="cluster",
     )
     cluster_workers: List["Worker"] = Relationship(
@@ -536,9 +704,6 @@ class ClusterRegistrationTokenPublic(BaseModel):
     image: str
     env: Dict[str, str]
     args: List[str]
-
-    # Below fields are used for configure GPUStack Operator.
-    operator_image: str
 
 
 class CredentialType(str, Enum):

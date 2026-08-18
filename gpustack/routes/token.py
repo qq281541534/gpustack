@@ -15,12 +15,11 @@ from gpustack.schemas.users import User
 from gpustack.schemas.models import AccessPolicyEnum
 from gpustack.server.deps import SessionDep
 from gpustack.api.auth import (
-    GATEWAY_AUTH_TOKEN_HEADER,
     api_key_header_auth,
     basic_auth,
     cookie_auth,
     bearer_auth,
-    get_current_user,
+    authenticate_request,
     credentials_exception,
     gateway_token_auth,
     inference_scope,
@@ -82,13 +81,13 @@ async def server_auth(
     cookie_token = await cookie_auth(request)
     x_api_key = await api_key_header_auth(request)
     try:
-        user = await get_current_user(
+        user = await authenticate_request(
             request=request,
-            session=session,
             basic_credentials=await basic_auth(request),
             bearer_token=await bearer_auth(request),
             x_api_key=x_api_key,
             cookie_token=cookie_token,
+            session=session,
         )
         api_key = getattr(request.state, "api_key", None)
         access_key = None if api_key is None else api_key.access_key
@@ -102,10 +101,7 @@ async def server_auth(
         raise e
 
     if user is None:
-        gateway_token_auth(
-            request,
-            token=request.headers.get(GATEWAY_AUTH_TOKEN_HEADER),
-        )
+        gateway_token_auth(request)
 
     model_name = request.headers.get("x-higress-llm-model")
     if model_name is None or model_name == "":
@@ -138,7 +134,7 @@ async def server_auth(
             api_key=api_key,
         ):
             raise ForbiddenException(
-                message=f"Api key not allowed to access model {model_name}"
+                message=f"Not allowed to access model {model_name}"
             )
     cache_token = jwt_manager.create_token(
         {"consumer": consumer, "token": registration_token, "model": model_name},

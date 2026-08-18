@@ -4,12 +4,22 @@ import importlib
 import json
 import logging
 import math
-from typing import Any, AsyncGenerator, Callable, Iterable, List, Optional, Union, Tuple
+from typing import (
+    Any,
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Iterable,
+    List,
+    Optional,
+    Union,
+    Tuple,
+)
 
 import anyio
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy import func, event as sa_event, inspect
-from sqlmodel import SQLModel, and_, asc, col, desc, or_, select, text
+from sqlmodel import SQLModel, and_, asc, col, desc, or_, select, text, exists
 from sqlmodel.ext.asyncio.session import AsyncSession
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
@@ -136,6 +146,18 @@ class ActiveRecordMixin:
         return await cls.one_by_fields(session, {field: value}, options=options)
 
     @classmethod
+    async def exist_by_field(
+        cls,
+        session: AsyncSession,
+        field: str,
+        value: Any,
+        options: Optional[List] = None,
+    ) -> bool:
+        """Return True if the object with the given field and value exists."""
+
+        return await cls.exist_by_fields(session, {field: value}, options=options)
+
+    @classmethod
     async def first_by_fields(cls, session: AsyncSession, fields: dict):
         """
         Return the first object with the given fields and values.
@@ -166,6 +188,23 @@ class ActiveRecordMixin:
         return result.first()
 
     @classmethod
+    async def exist_by_fields(
+        cls, session: AsyncSession, fields: dict, options: Optional[List] = None
+    ) -> bool:
+        """Return True if the object with the given fields and values exists."""
+
+        statement = select(cls)
+        for key, value in fields.items():
+            statement = statement.where(getattr(cls, key) == value)
+
+        if options:
+            statement = statement.options(*options)
+
+        exists_statement = select(exists(statement))
+        result = await session.exec(exists_statement)
+        return result.one_or_none() or False
+
+    @classmethod
     async def all_by_field(
         cls, session: AsyncSession, field: str, value: Any, for_update: bool = False
     ):
@@ -184,7 +223,7 @@ class ActiveRecordMixin:
     async def all_by_fields(
         cls,
         session: AsyncSession,
-        fields: dict = {},
+        fields: Optional[dict] = None,
         fuzzy_fields: Optional[dict] = None,
         extra_conditions: Optional[List] = None,
         options: Optional[List] = None,
@@ -193,7 +232,8 @@ class ActiveRecordMixin:
         Return all objects with the given fields and values.
         Return an empty list if not found.
         """
-
+        if fields is None:
+            fields = {}
         statement = select(cls)
         for key, value in fields.items():
             statement = statement.where(getattr(cls, key) == value)
@@ -384,7 +424,7 @@ class ActiveRecordMixin:
                     f"COALESCE(jsonb_array_length(({column_name}->{json_path_str})::jsonb), 0)"
                 )
             else:
-                # Build PGSQL JSON path like '(status#>>{"memory","utilization_rate"})::numeric'
+                # Build PGSQL JSON path like '(status#>>'{"memory","utilization_rate"}')::numeric'
                 json_path_str = ",".join([f'"{part}"' for part in json_path_parts])
                 if not cast_type:
                     cast_type = "numeric"
@@ -525,13 +565,14 @@ class ActiveRecordMixin:
     async def count_by_fields(
         cls,
         session: AsyncSession,
-        fields: dict = {},
+        fields: Optional[dict] = None,
         extra_conditions: Optional[List] = None,
     ) -> int:
         """
         Return the number of records matching the given fields and conditions.
         """
-
+        if fields is None:
+            fields = {}
         statement = select(func.count(cls.id))
         for key, value in fields.items():
             statement = statement.where(getattr(cls, key) == value)
@@ -802,6 +843,7 @@ class ActiveRecordMixin:
         fuzzy_fields: Optional[dict] = None,
         filter_func: Optional[Callable[[Any], bool]] = None,
         options: Optional[List] = None,
+        event_transform: Optional[Callable[[Event], Awaitable[None]]] = None,
     ) -> AsyncGenerator[str, None]:
         """Stream events matching the given criteria as JSON strings.
 
@@ -810,6 +852,12 @@ class ActiveRecordMixin:
             fuzzy_fields: Fuzzy match filters
             filter_func: Optional filter function to apply to event data
             options: SQLAlchemy options for eager loading relationships (e.g., selectinload)
+            event_transform: Optional async hook called with the public Event
+                right before serialization. May mutate ``event.data`` in
+                place to inject fields derived from outside the raw
+                subscribe payload — used e.g. by /v2/workers to inject
+                allocated computed from current ModelInstance bindings so
+                the watch stream matches the REST response.
         """
         try:
             async for event in cls.subscribe(source="streaming", options=options):
@@ -832,11 +880,20 @@ class ActiveRecordMixin:
                     changed_fields=event.changed_fields,
                     id=event.id,
                 )
+                if event_transform is not None:
+                    try:
+                        await event_transform(public_event)
+                    except Exception as e:
+                        logger.error(
+                            f"event_transform failed for {cls.__name__} "
+                            f"event {event.id}: {e}"
+                        )
                 formatted = cls._format_event(public_event)
                 if formatted is not None:
                     yield formatted
         except asyncio.CancelledError:
-            pass
+            # Re-raise to ensure proper structured concurrency cancellation state
+            raise
         except Exception as e:
             logger.error(f"Error in streaming {cls.__name__}: {e}")
 
