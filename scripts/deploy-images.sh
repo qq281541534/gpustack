@@ -10,7 +10,7 @@ IMAGE_NAMESPACE="${IMAGE_NAMESPACE:-lmzjai}"
 IMAGE_REPOSITORY="${IMAGE_REPOSITORY:-${ACR_REPOSITORY:-gpustack-custom}}"
 PROD_DEPLOY_PATH="${PROD_DEPLOY_PATH:-/opt/gpustack/docker-compose}"
 COMPOSE_FILES="${COMPOSE_FILES:-docker-compose.server.yaml}"
-HEALTHCHECK_BASE_URL="${HEALTHCHECK_BASE_URL:-http://127.0.0.1}"
+HEALTHCHECK_BASE_URL="${HEALTHCHECK_BASE_URL:-http://127.0.0.1:8080}"
 CURRENT_TAG_FILE="${CURRENT_TAG_FILE:-.lmzj-current-image-tag}"
 
 if [[ ! "${IMAGE_TAG}" =~ ^[0-9a-f]{40}$ ]]; then
