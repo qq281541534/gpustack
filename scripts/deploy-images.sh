@@ -47,8 +47,22 @@ echo "Deploying ${IMAGE_REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_REPOSITORY}:${IMAGE
 docker compose "${compose_args[@]}" pull gpustack-server
 docker compose "${compose_args[@]}" up -d --no-build gpustack-server
 
-curl --fail --silent --show-error "${HEALTHCHECK_BASE_URL%/}/healthz" >/dev/null
-curl --fail --silent --show-error "${HEALTHCHECK_BASE_URL%/}/readyz" >/dev/null
+# The server takes ~60-90s to boot (embedded postgres + migrations + uvicorn);
+# poll until healthy instead of failing on the first refused connection.
+health_wait() {
+  local endpoint="$1" waited=0
+  while [ "${waited}" -lt 300 ]; do
+    if curl --fail --silent --max-time 5 "${HEALTHCHECK_BASE_URL%/}${endpoint}" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 10
+    waited=$((waited + 10))
+  done
+  echo "ERROR: ${endpoint} did not become healthy within 300s." >&2
+  return 1
+}
+health_wait "/healthz"
+health_wait "/readyz"
 
 printf '%s\n' "${IMAGE_TAG}" > "${CURRENT_TAG_FILE}"
 
