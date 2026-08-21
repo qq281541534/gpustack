@@ -4,7 +4,7 @@
 >
 > **Fork 仓库**: https://github.com/qq281541534/gpustack.git  
 > **上游仓库**: https://github.com/gpustack/gpustack.git  
-> **维护方式**: 手动 Sync Fork（方式一）
+> **维护方式**: 受控合并同步（遵循 `AGENTS.md` 的 ai-issue-to-production 流程）
 
 ---
 
@@ -82,46 +82,32 @@ git remote -v
 | 日常维护 | 建议每周检查一次 |
 | 开始新的二开功能前 | **必须同步**，避免后续大量冲突 |
 
-### 3.2 同步步骤（GitHub Web 界面）
+### 3.2 同步步骤（受控合并，唯一允许的方式）
 
-**步骤 1**: 打开你的 Fork 仓库页面  
-`https://github.com/qq281541534/gpustack`
-
-**步骤 2**: 如果上游有更新，页面会显示提示：
-```
-This branch is N commits behind gpustack:main.
-[Sync fork]
-```
-
-**步骤 3**: 点击 **"Sync fork"** → **"Update branch"**
-
-**步骤 4**: 等待同步完成，页面会显示：
-```
-This branch is up to date with gpustack:main.
-```
-
-**步骤 5**: 本地拉取更新
-```bash
-git pull origin main
-```
-
-### 3.3 同步步骤（命令行方式）
-
-如果习惯用命令行，也可以不通过 Web 界面：
+上游同步必须走完整交付链路（先建 GitHub Issue，详见 `AGENTS.md`）。
+**禁止使用 GitHub 的 "Sync fork" 按钮**——它会绕过 PR 审查和减功能红线
+检查，且在 fork 已分叉时提供 "Discard commits" 之类的破坏性选项。
 
 ```bash
-# 1. 切换到 main 分支
-git checkout main
+# 1. 从最新 dev 创建同步分支
+git switch dev && git pull --ff-only origin dev
+git switch -c sync/upstream-v<version>
 
-# 2. 拉取上游更新
+# 2. 合并上游（保留完整 merge commit，禁止 squash/rebase 同步 PR）
 git fetch upstream
+git merge upstream/main   # 或指定的上游版本 tag
 
-# 3. 合并上游 main 分支到本地 main
-git merge upstream/main
-
-# 4. 推送到自己的 Fork
-git push origin main
+# 3. 解决冲突后先做『减功能/商业化 diff』评估（见 5.3），再推送
+git push -u origin sync/upstream-v<version>
 ```
+
+PR body 使用 `Refs #<issue>` 并附评估报告；合并时必须选择
+"Create a merge commit"——squash 会破坏 merge-base，导致后续同步评估
+失真（v2.2.3 同步时已因此返工，PR #18 修复）。
+
+### 3.3 同步频率
+
+按 3.1 的场景表判断；每次同步前先完成减功能红线评估再动手合并。
 
 ---
 
@@ -169,7 +155,7 @@ git push origin feature/my-custom-feature
 如果官方更新和你的二开代码有冲突：
 
 ```bash
-# 1. 同步上游
+# 1. 同步上游（在 3.2 创建的 sync 分支上）
 git fetch upstream
 git merge upstream/main
 
@@ -183,8 +169,8 @@ git add gpustack/config/config.py
 # 4. 完成合并
 git commit -m "merge: sync upstream and resolve conflicts"
 
-# 5. 推送
-git push origin main
+# 5. 推送同步分支并创建 PR 到 dev（不要直接 push main/dev）
+git push -u origin sync/upstream-v<version>
 ```
 
 ---
@@ -206,6 +192,11 @@ https://github.com/gpustack/gpustack/releases
 1. 在本地测试环境先合并验证
 2. 检查官方 Release Notes
 3. 确保二开代码兼容后再推送到生产分支
+4. 完成『减功能/商业化 diff』评估（AGENTS.md 上游同步减功能红线）：
+   枚举被删除或收缩的后端路由、数据库表、schema 字段、UI 页面/菜单/入口，
+   逐项核对是否在用（证据以生产库实际数据和当前前端代码引用为准）；
+   UI 入口从可用变为禁用/企业版提示/升级推销同样视为减功能；
+   任何在用功能被移除即一票否决——先在 fork 恢复或放弃本次同步。
 
 ### 5.4 文档维护
 
