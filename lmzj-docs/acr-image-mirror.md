@@ -21,9 +21,8 @@ runner 按版本覆盖镜像为推理后端 `VersionConfig.image_name` 官方字
 
 ## 二、节点添加命令模板（客户/新 worker 用）
 
-从 UI 集群页生成后，确认包含以下要点再执行。`runner`/`runtime` 仓库已设为公开，
-**无需任何镜像凭证**（gpustack-custom 仍为私有：执行前先 `docker login
-registry.cn-chengdu.aliyuncs.com`，或将其也设为公开后免去此步）：
+从 UI 集群页生成后，确认包含以下要点再执行。三个镜像仓库（`runner`/`runtime`/
+`gpustack-custom`）均已设为公开，**全程无需任何镜像凭证**：
 
 ```bash
 sudo docker run -d --name gpustack-worker \
@@ -68,8 +67,7 @@ docker push registry.cn-chengdu.aliyuncs.com/lmzjai/runner:<tag>
 - **端到端验证一**（认证）：凭证 env 下从 ACR 拉取 → vLLM → 推理 200 ✓
 - **端到端验证二**（冷启动 + 匿名）：删除本地镜像全部数据 → 重启实例 → 匿名拉取 46.8G（约 4 分钟）→ RUNNING → 推理 200 ✓
 
-## 五、仓库可见性现状
+## 五、仓库可见性现状（2026-08-29 负责人确认）
 
-- `lmzjai/runner`、`lmzjai/runtime`：**公开**（匿名拉取已验证）
-- `lmzjai/gpustack-custom`：私有（CLI 拉取前需 `docker login`；如需完全免凭证可在控制台改公开）
-- 历史遗留：`lmzjai/gpustack-runtime` 为早期命名，已被 `lmzjai/runtime` 取代，可在控制台删除
+- `lmzjai/runner`、`lmzjai/runtime`、`lmzjai/gpustack-custom`：**全部公开**，镜像拉取零凭证
+- 历史遗留：`lmzjai/gpustack-runtime` 为早期命名，已被 `lmzjai/runtime` 取代，待负责人在 ACR 控制台删除
