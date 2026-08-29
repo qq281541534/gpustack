@@ -184,7 +184,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             UI_DOWNLOAD=true
-            VERSION=v0.0.0
+            VERSION=${{ steps.release.outputs.sha }}
             GIT_COMMIT=${{ steps.release.outputs.sha }}
             GPUSTACK_PACKAGE_EXTRAS=${{ steps.release.outputs.package_extras }}
           cache-from: type=gha,scope=gpustack-image-linux-amd64-${{ steps.release.outputs.package_extras || 'none' }}
