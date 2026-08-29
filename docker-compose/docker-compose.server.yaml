@@ -5,6 +5,11 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    # 集群「添加节点」命令的镜像引用由此覆盖：始终指向当前部署的
+    # 完整 SHA 镜像（GPUSTACK_TAG 由 deploy-images.sh 注入），避免
+    # worker 落到官方 quay.io dev 镜像造成版本错位（Issue #31）。
+    environment:
+      GPUSTACK_IMAGE_NAME_OVERRIDE: "${IMAGE_REGISTRY:-registry.cn-chengdu.aliyuncs.com}/${IMAGE_NAMESPACE:-lmzjai}/${IMAGE_REPOSITORY:-gpustack-custom}:${GPUSTACK_TAG}"
     volumes:
       - gpustack-data:/var/lib/gpustack
     ports:
