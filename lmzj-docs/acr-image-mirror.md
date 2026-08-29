@@ -21,18 +21,14 @@ runner 按版本覆盖镜像为推理后端 `VersionConfig.image_name` 官方字
 
 ## 二、节点添加命令模板（客户/新 worker 用）
 
-从 UI 集群页生成后，确认包含以下要点再执行。注意：runtime 镜像由 gpustack_runtime
-经 Docker SDK 拉取，**不读取 docker login 凭证**，私有仓库必须通过
-`GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_USERNAME/PASSWORD` 显式传凭证
-（若 ACR 仓库设为公开则可省略这两个 env）：
+从 UI 集群页生成后，确认包含以下要点再执行。`runner`/`runtime` 仓库已设为公开，
+**无需任何镜像凭证**（gpustack-custom 仍为私有：执行前先 `docker login
+registry.cn-chengdu.aliyuncs.com`，或将其也设为公开后免去此步）：
 
 ```bash
 sudo docker run -d --name gpustack-worker \
   -e "GPUSTACK_RUNTIME_DEPLOY_MIRRORED_NAME=gpustack-worker" \
   -e "GPUSTACK_TOKEN=<UI 生成的集群 token>" \
-  -e "GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY=registry.cn-chengdu.aliyuncs.com" \
-  -e "GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_USERNAME=<ACR 用户名>" \
-  -e "GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY_PASSWORD=<ACR 密码>" \
   -e "GPUSTACK_RUNTIME_DOCKER_PAUSE_IMAGE=registry.cn-chengdu.aliyuncs.com/lmzjai/runtime:pause" \
   -e "GPUSTACK_RUNTIME_DOCKER_UNHEALTHY_RESTART_IMAGE=registry.cn-chengdu.aliyuncs.com/lmzjai/runtime:health" \
   --restart=unless-stopped --privileged --network=host \
@@ -48,6 +44,9 @@ sudo docker run -d --name gpustack-worker \
 
 检查点：镜像必须是完整 SHA；模型目录挂载不可漏（LOCAL_PATH 模型必需）；
 server→worker 10150 端口必须可达（安全组放行给 server IP）。
+注意：若仓库改回私有，gpustack_runtime 的 SDK 拉取不读 docker login 凭证，
+必须追加 `GPUSTACK_RUNTIME_DEPLOY_DEFAULT_CONTAINER_REGISTRY(_USERNAME/_PASSWORD)`
+env（官方配置项）。
 
 ## 三、新推理后端版本入库流程
 
@@ -66,9 +65,11 @@ docker push registry.cn-chengdu.aliyuncs.com/lmzjai/runner:<tag>
 
 - `lmzjai/runtime:pause|health`、`lmzjai/runner:cuda12.8-vllm0.11.2` 已入库（46.8G runner 从 worker 推送）
 - vLLM 0.11.2 `version_configs.image_name` 已指向 ACR；集群 `system_default_container_registry = registry.cn-chengdu.aliyuncs.com`
-- **端到端验证**：摘除本地 runner 标签 → 实例重启 → 凭证 env 认证下从 ACR 网络拉取 → vLLM 加载 → 推理 200 ✓
+- **端到端验证一**（认证）：凭证 env 下从 ACR 拉取 → vLLM → 推理 200 ✓
+- **端到端验证二**（冷启动 + 匿名）：删除本地镜像全部数据 → 重启实例 → 匿名拉取 46.8G（约 4 分钟）→ RUNNING → 推理 200 ✓
 
-## 五、待决事项
+## 五、仓库可见性现状
 
-- ACR 仓库（runner/runtime/gpustack-custom）当前为私有。若设为公开，节点命令可省略
-  凭证两个 env，客户交付更简；是否公开由负责人在 ACR 控制台决定。
+- `lmzjai/runner`、`lmzjai/runtime`：**公开**（匿名拉取已验证）
+- `lmzjai/gpustack-custom`：私有（CLI 拉取前需 `docker login`；如需完全免凭证可在控制台改公开）
+- 历史遗留：`lmzjai/gpustack-runtime` 为早期命名，已被 `lmzjai/runtime` 取代，可在控制台删除
