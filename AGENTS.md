@@ -130,6 +130,10 @@ Issue
 - `AGENTS.md`、`CLAUDE.md`、`.claude/**`、`.trae/**`、`.cursor/**`、`README*`、`docs/**`、`lmzj-docs/**`、
   `skills/**`、`.github/workflows/**`、Issue template、PR template、deploy script、production
   compose/manifest 和纯 process/lint 脚本变更属于 non-runtime，不得构建或 push 生产镜像。
+- 镜像引用自持体系（compose 的 `GPUSTACK_IMAGE_NAME_OVERRIDE`、推理后端
+  `version_configs.image_name`、worker 的 runtime pause/health env）指向 `lmzjai` ACR，
+  **不得移除或改回 quay.io/docker.io**——中国网络下外网源不可达，且版本号含 `+` 后
+  添加节点命令必须依赖 override。详见 `lmzj-docs/acr-image-mirror.md`。
 
 ## Secret 规则
 
