@@ -70,4 +70,4 @@ docker push registry.cn-chengdu.aliyuncs.com/lmzjai/runner:<tag>
 ## 五、仓库可见性现状（2026-08-29 负责人确认）
 
 - `lmzjai/runner`、`lmzjai/runtime`、`lmzjai/gpustack-custom`：**全部公开**，镜像拉取零凭证
-- 历史遗留：`lmzjai/gpustack-runtime` 为早期命名，已被 `lmzjai/runtime` 取代，待负责人在 ACR 控制台删除
+- 历史遗留：`lmzjai/gpustack-runtime`（早期命名，已被 `lmzjai/runtime` 取代）已于 2026-08-29 从 ACR 删除
