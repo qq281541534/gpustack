@@ -16,7 +16,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       scope: ${{ steps.scope.outputs.scope }}
-      needs_app_check: ${{ steps.scope.outputs.needs_app_check }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
