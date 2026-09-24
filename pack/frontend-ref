@@ -1,0 +1,3 @@
+# qq281541534/gpustack-ui commit baked into the production image.
+# Update it through a PR to dev: the backend SHA image tag then pins the UI too.
+1a7e0fbcb365da4bcf807141ef95e78bdad008fd

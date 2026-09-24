@@ -1,227 +1,119 @@
-# GPUStack AI Issue-to-Production 发布流程
+# GPUStack 构建与发布流程
 
-本文档是 LMZJ 维护 GPUStack 二开 fork 的 AI 交付执行源。GPUStack upstream 原有
-`docs/` 目录保持为上游产品文档目录，LMZJ 专属的 CI/CD、release、deployment、
-rollback 文档统一放在 `lmzj-docs/`。
+LMZJ 维护的 GPUStack 二开 fork 的构建、发布、部署和回滚入口。项目画像、持续授权范围和
+平台门禁见根目录 `AGENTS.md`；通用交付流程见公司级 skill `ai-issue-to-production`。
+GPUStack upstream 原有 `docs/` 保持为上游产品文档目录，LMZJ 专属流程文档放在
+`lmzj-docs/`。
 
-## 项目画像
+## 发布链路
 
-```yaml
-project_type: secondary_development
-repository_visibility: public
-release_source_branch: dev
-feature_branch_base: dev
-pr_target_branch: dev
-image_build_branch: dev
-governance_level: L4 platform-enforced
-docs_directory: lmzj-docs/
-registry: registry.cn-chengdu.aliyuncs.com/lmzjai
-image_names:
-  - gpustack-custom
-production_image_profile: slim-server
-production_package_extras: audio
-frontend_repository: qq281541534/gpustack-ui
-frontend_default_ref: dev
-deploy_workflow: .github/workflows/deploy-production.yml
-deploy_inputs:
-  image_tag: full_commit_sha
-verification:
-  - GET /healthz
-  - GET /readyz
-rollback:
-  strategy: deploy_previous_full_sha
-issue_closure: ai_allowed_after_verified_release
+```text
+普通文档 / 流程修改：PR → PR check passed → 合并 → 完成（不构建、不部署）
+
+runtime 改动：Issue → 分支 → PR（Refs #issue）→ PR check passed → 合并
+  → build-images.yml（push 自动触发）→ deploy-production.yml
+  → /healthz、/readyz、公网 UI 验证 → release-log.md 记录 → 关闭 Issue
 ```
 
-## Public Repo L4 平台门禁
+改动范围由 `scripts/classify_change_scope.py` 判定，PR 检查和合并后构建使用同一份规则：
 
-本仓库是 public repository，治理级别为 `L4 platform-enforced`。这意味着生产发布
-关口必须由 GitHub 平台强制，而不是只靠聊天确认、文档约束或补偿性 CI 检查。
+| Scope | 典型路径 | Issue | 构建 |
+|---|---|---|---|
+| `docs-only` | `README*`、`docs/**`、`lmzj-docs/**`、其他普通 Markdown/图片 | 不需要 | 否 |
+| `process-only` | `AGENTS.md`、`CLAUDE.md`、`.trae/**`、PR/Issue 模板、process lint 及其测试 | 系统性改造才需要 | 否 |
+| `release-governance` | `.github/workflows/**`、`scripts/deploy-images.sh`、`docker-compose/*.yaml`、`charts/**` | 系统性改造才需要 | 否 |
+| `runtime` | `gpustack/**`、`pack/**`、`hack/**`、`static/**`、`docker-compose/grafana/**`、依赖文件、`tests/**` | 需要 | 镜像输入才构建（`tests/**` 不构建） |
+| `unknown` | 未映射路径 | 需要 | 是 |
 
-人类负责人需要在 GitHub UI 中完成以下配置：
-
-- 对 release source branch `dev` 配置 branch protection 或 ruleset。
-- 启用 Require a pull request before merging。
-- 启用 Require status checks to pass / required status checks，至少要求
-  `pr-check.yml` 对应检查通过。
-- 启用 Require approvals，至少 1 个非作者 human approval。
-- 启用 Dismiss stale approvals when new commits are pushed。
-- 创建 `production` environment。
-- `production` environment 必须存在并保存生产 secrets；多人维护时启用 required
-  reviewers 和 prevent self-review。
-- 单人维护 bootstrap 阶段可关闭 production required reviewers，避免“对话确认部署”
-  和 GitHub UI 审批重复；此时必须保留 `DEPLOY <full-sha>` 输入确认。
-- deployment branches 只允许 `dev`。
-- Production secrets 放入 `production` environment，不放普通 repository secrets。
-
-## 必须执行的发布链路
-
-1. 创建或复用 GitHub Issue。
-2. 从最新 `dev` 创建功能分支或修复分支。
-3. 提交 PR 到 `dev`。
-4. PR body 使用 `Refs #<issue>`，不得使用 `Closes`、`Fixes`、`Resolves`。
-5. PR checks 通过。
-6. 人工审核并合并 PR。
-7. PR 合并后，执行后续检查的 agent 必须先同步本地 `dev`，并用
-   `git status --short --branch`、`git log -1 --oneline` 确认本地 HEAD 已包含 merge
-   commit。
-8. GitHub Actions 从 `dev` 构建不可变镜像
-   `gpustack-custom:<full-40-character-sha>`。
-9. 部署前审查 image digest/size、生产目标磁盘余量、dependency profile，以及
-   production compose/manifest。
-10. 人工明确确认是否将该完整 SHA 镜像部署到生产。
-11. 手动触发生产部署 workflow，生产服务器只拉取镜像并执行
-   `docker compose up -d --no-build`。
-12. 验证 `/healthz`、`/readyz` 和必要业务路径。
-13. 记录发布证据和上一版可回滚完整 SHA。
-14. 生产验证和回滚准备证据齐全后，AI 可按人类明确指令关闭 Issue。
+`docker-compose/grafana/**` 会被 `pack/Dockerfile` 复制进镜像，所以按 runtime 构建；其余
+compose 文件只影响部署配置，改动后复用既有镜像重新部署即可。
 
 ## Workflow 分工
 
 ### `.github/workflows/pr-check.yml`
 
-- 触发：PR to `dev`。
-- 校验 PR body 必须包含 `Refs #<issue>`。
-- 拒绝 `Closes`、`Fixes`、`Resolves` 自动关闭关键词。
-- 要求摘要、验证、部署影响、回滚、上游冲突风险等章节。
-- 编译 `scripts/` 下的流程脚本，避免脚本语法错误进入 PR。
+- 触发：PR to `dev`（含编辑 PR 描述后重跑）。
+- `Detect change scope`：读取 PR 实际改动文件（含重命名前路径）并分类。
+- `PR process lint`：读取实时 PR 描述；禁止 `Closes`/`Fixes`/`Resolves`；runtime/unknown
+  要求 `Refs #<issue>` 和完整章节，普通文档与流程改动只要求「修改」「验证」。
+- `Repository checks`（非 docs-only）：process 脚本单测、`deploy-images.sh` 语法检查、
+  对改动文件运行 pre-commit（flake8、black、shellcheck、check-yaml）。
+- `PR check passed`：ruleset 绑定的必需检查。应运行的 job 失败、取消或被意外跳过都会失败；
+  docs-only 跳过 `Repository checks` 属于合法跳过。
 
 ### `.github/workflows/build-images.yml`
 
-- 触发：push to `dev` 或手动 `workflow_dispatch`。
-- 只接受完整 40 位 commit SHA。
-- 校验 SHA 位于 `dev`，并关联到已合并到 `dev` 的 PR。
-- 从 `qq281541534/gpustack-ui` 构建二开前端。
-- 构建并推送
-  `registry.cn-chengdu.aliyuncs.com/lmzjai/gpustack-custom:<full-sha>`。
-- 默认传入 `GPUSTACK_PACKAGE_EXTRAS=audio`，构建 slim server 镜像，避免把
-  `vllm`、PyTorch/CUDA/xformers 等推理运行栈打进生产 control-plane 镜像。
-- 如确需 full runtime 镜像，手动触发时可设置 `package_extras=all`，但该镜像不得
-  替代默认生产 server 镜像，部署前必须单独评估磁盘容量和回滚空间。
-- `AGENTS.md`、`CLAUDE.md`、`.claude/**`、`.trae/**`、`.cursor/**`、`README*`、`docs/**`、`lmzj-docs/**`、
-  `skills/**`、`.github/workflows/**`、Issue template、PR template、deploy script、production
-  compose/manifest 和纯 process/lint 脚本变更属于 non-runtime，不得触发或执行生产镜像
-  build/push。
+- 触发：push to `dev` 自动触发；也可 `workflow_dispatch` 指定 `backend_sha`。
+- push 时先用分类器判断本次合并是否包含镜像输入，没有则不构建。
+- 只接受位于 `dev`、关联已合并 PR 的完整 40 位 SHA。
+- 前端版本固定在 `pack/frontend-ref`（`qq281541534/gpustack-ui` 完整 SHA），镜像内容由后端
+  SHA 唯一确定。更新前端 = 提 PR 修改该文件，合并后产生新的后端 SHA 和新镜像。
+- 生产镜像：`registry.cn-chengdu.aliyuncs.com/lmzjai/gpustack-custom:<full-sha>`，
+  `GPUSTACK_PACKAGE_EXTRAS=audio`。其他 extras（如 `all`）只能手动触发，tag 为
+  `<full-sha>-<extras>`，不可被生产部署 workflow 接受。
+- tag 不可变：registry 已存在同名 tag 时复用，不覆盖。Job summary 记录镜像、digest、
+  前端 SHA 和是否复用。
 
 ### `.github/workflows/deploy-production.yml`
 
-- 只允许手动触发。
-- 绑定 `environment: production`，使用 production environment secrets。
-- 部署前把仓库中的 `docker-compose/<compose_file>` 同步到生产服务器
-  `PROD_DEPLOY_PATH`，避免服务器残留旧 compose 文件。
-- `image_tag` 必须是完整 40 位 SHA。
-- `confirm_production_deploy` 必须精确输入 `DEPLOY <image_tag>`。
-- 通过 SSH 在生产服务器执行 `scripts/deploy-images.sh`。
-- 部署脚本必须拒绝 `latest`、`dev`、版本别名和短 SHA。
+- `workflow_dispatch` 触发，输入完整 SHA `image_tag`；绑定 `environment: production`。
+- 部署前校验：SHA 位于 `dev`；registry 中存在该 tag 并解析 digest；读取服务器
+  `.lmzj-current-image-tag`，目标版本不比线上新时拒绝，回滚需显式 `rollback=true`。
+- `concurrency: deploy-production`：同一时间只有一个生产部署，不取消进行中的部署。
+- 同步 `docker-compose/<compose_file>` 到 `PROD_DEPLOY_PATH`，通过 SSH 执行
+  `scripts/deploy-images.sh`。
+- `deploy-images.sh`：检查 Docker 数据盘剩余空间（默认至少 10 GiB，`MIN_FREE_GB` 可调）→
+  pull → 核对 digest → `docker compose up -d --no-build` → 核对运行容器镜像 → 等待
+  `/healthz`、`/readyz` → 写入当前 tag → 清理本仓库旧镜像（保留当前和上一版）。
+- 拒绝 `latest`、`dev`、版本别名和短 SHA；服务器不构建镜像。
 
-## Post-Merge Local Sync
+## 部署前检查
 
-PR 合并后继续 image build、deploy inspection 或 production verification 前，不得假设本地
-worktree 自动跟随远程 `dev`。执行后续检查的 agent 必须先运行：
+每次部署核对当前目标的实时状态；依赖 profile 和 compose 未变化时复用上次审查结论。
 
-```bash
-git fetch origin dev
-git switch dev
-git pull --ff-only origin dev
-git status --short --branch
-git log -1 --oneline
-```
+- 镜像身份：完整 SHA tag、digest、前端 SHA（build job summary）。
+- 目标磁盘：由 `deploy-images.sh` 预检。
+- dependency profile：生产 server 为 `audio`。
+- compose 有变化时审查：不可变镜像、无 `build:`、secrets、volumes、ports、health checks、
+  restart policy 和部署路径。
+- 回滚版本：部署前服务器记录的上一版 tag（deploy job summary 输出）。
+- 含数据库迁移时：确认上一版镜像能否在新 schema 上运行；不能时按迁移的恢复方案处理。
 
-如果当前是 Codex worktree、detached HEAD 或需要保留当前分支，至少要 fetch 后明确检查
-`origin/dev` 的最新 merge commit。未确认本地 HEAD 包含 merge commit 前，不继续构建或部署判断。
+## 回滚
 
-## Pre-Deploy Review
+1. 从 deploy job summary 或 `release-log.md` 找到上一版完整 SHA。
+2. 以该 SHA 和 `rollback=true` 触发 `deploy-production.yml`（服务器本地保留上一版镜像，
+   通常无需重新下载）。
+3. 验证 `/healthz`、`/readyz` 和公网 UI，并在 Issue 和 `release-log.md` 记录。
 
-`image_built` 只表示镜像已构建和推送，不表示可部署。请求生产部署确认前必须完成：
+## 中断恢复
 
-- Image tag 是完整 40 位 SHA，记录 digest 和 size。
-- 目标生产机器磁盘余量足够 pull、解压、启动新容器，并保留必要回滚空间。
-- dependency profile 已确认；生产 server 默认使用 `audio`，不得误用 `all`/full runtime
-  作为默认生产 control-plane 镜像。
-- production compose/manifest 已审查，确认使用不可变镜像、无 `build:`、无 `latest`/短 SHA，
-  secrets、volumes、ports、health checks、restart policy 和部署路径适合生产。
-
-审查失败或仍有 unknown/unresolved 项时，不得请求生产部署确认。
-
-## Workflow Resume
-
-长耗时 workflow 中断、会话恢复或上下文丢失后，先重新查询 run 状态，而不是沿用上一轮口头结论：
+先读 PR、run 和 `release-log.md` 已有记录，只查询未决阶段：
 
 ```bash
-gh run list --workflow "<workflow>" --branch dev
-gh run view <run-id> --json status,conclusion,jobs,url
+gh pr view <pr> --json state,headRefOid,baseRefName,mergeCommit,statusCheckRollup
+gh run view <run-id> --json status,conclusion,jobs,url,headSha
 ```
 
-恢复时必须报告 final conclusion、job log 摘要和 health check 证据。没有 final conclusion 或
-health check 证据时，状态只能是 `workflow_in_progress`、`verification missing` 或
-`unresolved`，不得写成“部署成功”。
+没有 final conclusion 或健康检查证据时记为 `unresolved`，不要重复 dispatch 状态不明的部署。
 
 ## GitHub 配置
 
-Production environment secrets:
+Production environment secrets：`ALIYUN_ACR_USERNAME`、`ALIYUN_ACR_PASSWORD`、
+`PROD_SSH_HOST`、`PROD_SSH_PORT`、`PROD_SSH_USER`、`PROD_SSH_KEY`、`PROD_DEPLOY_PATH`。
 
-- `ALIYUN_ACR_USERNAME`
-- `ALIYUN_ACR_PASSWORD`
-- `PROD_SSH_HOST`
-- `PROD_SSH_PORT`
-- `PROD_SSH_USER`
-- `PROD_SSH_KEY`
-- `PROD_DEPLOY_PATH`
+Repository variables：`ACR_REGISTRY`、`ACR_NAMESPACE`、`ACR_REPOSITORY`、`FRONTEND_REPOSITORY`。
 
-Repository variables:
+## 发布记录
 
-- `ACR_REGISTRY`
-- `ACR_NAMESPACE`
-- `ACR_REPOSITORY`
-- `FRONTEND_REPOSITORY`
-
-建议变量:
-
-- `PROD_COMPOSE_FILES`
-- `PROD_HEALTHCHECK_BASE_URL`
-
-## 发布证据模板
+每次生产发布在 `release-log.md` 追加一段，引用已有 run，不另建证据文档：
 
 ```markdown
-## Release Evidence
+## <版本> — <日期>（<short-sha>，已部署）
 
-- Issue:
-- PR:
-- Merge commit:
-- Build workflow:
-- Deploy workflow:
-- Pre-deploy review: passed/failed/unresolved
-
-## Images
-
-- GPUStack: registry.cn-chengdu.aliyuncs.com/lmzjai/gpustack-custom:<full-sha>
-- Digest:
-- Image size:
-- Dependency profile:
-
-## Validation
-
-- PR checks:
-- Build:
-- /healthz:
-- /readyz:
-- Public URL:
-
-## Deployment Decision
-
-- Production deployed: yes/no
-- Human approver:
-- Deployment time:
-
-## Rollback
-
-- Previous tag:
-- Rollback input: deploy previous full SHA with deploy-production workflow
+- 后端 / 前端：<PR、Issue、前端 SHA>
+- 构建：<build run>，digest `<sha256:…>`
+- 部署：<deploy run>
+- 验证：<healthz/readyz、公网 UI>
+- 回滚：<上一版完整 SHA>
 ```
-
-## 旧流程兼容说明
-
-现有 `.github/workflows/build-custom-image.yml` 是历史手动构建入口，可作为迁移期
-legacy workflow 保留，但它不得用于 `dev`、`latest`、版本别名或短 SHA 镜像；只能接受位于
-`dev` 且关联到已合并 PR 的完整 40 位 SHA。生产发布优先使用 `build-images.yml` 产出的完整
-SHA 镜像。

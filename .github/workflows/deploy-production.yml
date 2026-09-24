@@ -4,11 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Full 40-character image tag to deploy"
+        description: "Full 40-character backend commit SHA (image tag) from dev"
         required: true
-      confirm_production_deploy:
-        description: "Type DEPLOY <image_tag>"
+      rollback:
+        description: "Allow deploying a version that is not newer than the running one (rollback)"
+        type: boolean
         required: true
+        default: false
       compose_files:
         description: "Space-separated compose files on the production server"
         required: true
@@ -21,6 +23,16 @@ on:
 permissions:
   contents: read
 
+# One production deploy at a time; never cancel a running deploy.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  ACR_REGISTRY: ${{ vars.ACR_REGISTRY || 'registry.cn-chengdu.aliyuncs.com' }}
+  ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE || 'lmzjai' }}
+  ACR_REPOSITORY: ${{ vars.ACR_REPOSITORY || 'gpustack-custom' }}
+
 jobs:
   deploy:
     name: Pull-only deploy
@@ -32,23 +44,47 @@ jobs:
         run: |
           set -euo pipefail
           image_tag="${{ github.event.inputs.image_tag }}"
-          confirmation="${{ github.event.inputs.confirm_production_deploy }}"
           if [[ ! "${image_tag}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "image_tag must be a full 40-character lowercase git SHA." >&2
             exit 1
           fi
-          if [[ "${image_tag}" == "latest" || "${image_tag}" == "dev" || "${image_tag}" == v* ]]; then
-            echo "latest, dev, and version alias tags are not allowed." >&2
-            exit 1
-          fi
-          if [[ "${confirmation}" != "DEPLOY ${image_tag}" ]]; then
-            echo "confirm_production_deploy must be exactly: DEPLOY ${image_tag}" >&2
-            exit 1
-          fi
           echo "image_tag=${image_tag}" >> "${GITHUB_OUTPUT}"
+          echo "image=${ACR_REGISTRY}/${ACR_NAMESPACE}/${ACR_REPOSITORY}:${image_tag}" >> "${GITHUB_OUTPUT}"
 
       - name: Checkout deployment script
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Confirm SHA belongs to dev
+        run: |
+          set -euo pipefail
+          git fetch origin dev
+          git merge-base --is-ancestor "${{ steps.input.outputs.image_tag }}" origin/dev
+
+      - name: Setup Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ALIYUN_ACR_USERNAME }}
+          password: ${{ secrets.ALIYUN_ACR_PASSWORD }}
+
+      - name: Resolve image digest
+        id: image
+        env:
+          IMAGE: ${{ steps.input.outputs.image }}
+        run: |
+          set -euo pipefail
+          if ! manifest="$(docker buildx imagetools inspect "${IMAGE}" --format '{{json .Manifest}}')"; then
+            echo "Image ${IMAGE} is not in the registry; run build-images.yml for this SHA first." >&2
+            exit 1
+          fi
+          digest="$(jq -r '.digest' <<< "${manifest}")"
+          echo "Deploying ${IMAGE}@${digest}"
+          echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
 
       - name: Configure SSH
         env:
@@ -62,6 +98,37 @@ jobs:
           printf '%s\n' "${PROD_SSH_KEY}" > ~/.ssh/gpustack_prod
           chmod 600 ~/.ssh/gpustack_prod
           ssh-keyscan -p "${PROD_SSH_PORT:-22}" "${PROD_SSH_HOST}" >> ~/.ssh/known_hosts
+
+      # Refuse to replace a newer running version unless this is a rollback,
+      # so a late or stale dispatch cannot overwrite a newer release.
+      - name: Check running version
+        id: running
+        env:
+          PROD_DEPLOY_PATH: ${{ secrets.PROD_DEPLOY_PATH }}
+          PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
+          PROD_SSH_PORT: ${{ secrets.PROD_SSH_PORT }}
+          PROD_SSH_USER: ${{ secrets.PROD_SSH_USER }}
+          TARGET: ${{ steps.input.outputs.image_tag }}
+          ROLLBACK: ${{ github.event.inputs.rollback }}
+        run: |
+          set -euo pipefail
+          tag_file="$(printf '%q' "${PROD_DEPLOY_PATH%/}/.lmzj-current-image-tag")"
+          current="$(ssh -i ~/.ssh/gpustack_prod -p "${PROD_SSH_PORT:-22}" \
+            "${PROD_SSH_USER}@${PROD_SSH_HOST}" "cat ${tag_file} 2>/dev/null || true" | tr -d '[:space:]')"
+          echo "previous_tag=${current}" >> "${GITHUB_OUTPUT}"
+          if [[ -z "${current}" ]]; then
+            echo "No recorded running version; continuing."
+          elif [[ "${current}" == "${TARGET}" ]]; then
+            echo "Redeploying the running version ${current}."
+          elif git merge-base --is-ancestor "${current}" "${TARGET}" 2>/dev/null; then
+            echo "Upgrading ${current} -> ${TARGET}."
+          elif [[ "${ROLLBACK}" == "true" ]]; then
+            echo "Rollback requested: ${current} -> ${TARGET}."
+          else
+            echo "Running version ${current} is not an ancestor of ${TARGET}." >&2
+            echo "Refusing to overwrite it; dispatch with rollback=true to deploy an older version." >&2
+            exit 1
+          fi
 
       - name: Sync production compose files
         env:
@@ -90,10 +157,11 @@ jobs:
       - name: Deploy image on production server
         env:
           IMAGE_TAG: ${{ steps.input.outputs.image_tag }}
-          IMAGE_REGISTRY: ${{ vars.ACR_REGISTRY || 'registry.cn-chengdu.aliyuncs.com' }}
-          IMAGE_NAMESPACE: ${{ vars.ACR_NAMESPACE || 'lmzjai' }}
-          GPUSTACK_IMAGE_NAMESPACE: ${{ vars.ACR_NAMESPACE || 'lmzjai' }}
-          IMAGE_REPOSITORY: ${{ vars.ACR_REPOSITORY || 'gpustack-custom' }}
+          EXPECTED_DIGEST: ${{ steps.image.outputs.digest }}
+          IMAGE_REGISTRY: ${{ env.ACR_REGISTRY }}
+          IMAGE_NAMESPACE: ${{ env.ACR_NAMESPACE }}
+          GPUSTACK_IMAGE_NAMESPACE: ${{ env.ACR_NAMESPACE }}
+          IMAGE_REPOSITORY: ${{ env.ACR_REPOSITORY }}
           PROD_DEPLOY_PATH: ${{ secrets.PROD_DEPLOY_PATH }}
           PROD_SSH_HOST: ${{ secrets.PROD_SSH_HOST }}
           PROD_SSH_PORT: ${{ secrets.PROD_SSH_PORT }}
@@ -103,14 +171,31 @@ jobs:
         run: |
           set -euo pipefail
           remote_env=$(printf \
-            'IMAGE_REGISTRY=%q IMAGE_NAMESPACE=%q GPUSTACK_IMAGE_NAMESPACE=%q IMAGE_REPOSITORY=%q PROD_DEPLOY_PATH=%q COMPOSE_FILES=%q HEALTHCHECK_BASE_URL=%q' \
+            'IMAGE_REGISTRY=%q IMAGE_NAMESPACE=%q GPUSTACK_IMAGE_NAMESPACE=%q IMAGE_REPOSITORY=%q EXPECTED_DIGEST=%q PROD_DEPLOY_PATH=%q COMPOSE_FILES=%q HEALTHCHECK_BASE_URL=%q' \
             "${IMAGE_REGISTRY}" \
             "${IMAGE_NAMESPACE}" \
             "${GPUSTACK_IMAGE_NAMESPACE}" \
             "${IMAGE_REPOSITORY}" \
+            "${EXPECTED_DIGEST}" \
             "${PROD_DEPLOY_PATH}" \
             "${COMPOSE_FILES}" \
             "${HEALTHCHECK_BASE_URL}")
           ssh -i ~/.ssh/gpustack_prod -p "${PROD_SSH_PORT:-22}" \
             "${PROD_SSH_USER}@${PROD_SSH_HOST}" \
             "${remote_env} bash -s -- '${IMAGE_TAG}'" < scripts/deploy-images.sh
+
+      - name: Record deployment
+        env:
+          IMAGE: ${{ steps.input.outputs.image }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+          PREVIOUS_TAG: ${{ steps.running.outputs.previous_tag }}
+          ROLLBACK: ${{ github.event.inputs.rollback }}
+        run: |
+          {
+            echo "## Production deployment"
+            echo
+            echo "- Image: \`${IMAGE}\`"
+            echo "- Digest: \`${DIGEST}\`"
+            echo "- Previous tag (rollback target): \`${PREVIOUS_TAG:-unknown}\`"
+            echo "- Rollback dispatch: ${ROLLBACK}"
+          } >> "${GITHUB_STEP_SUMMARY}"
