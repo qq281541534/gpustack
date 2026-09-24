@@ -2,6 +2,7 @@ name: AI Issue to Production PR Check
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
     branches:
       - dev
 
@@ -14,111 +15,22 @@ jobs:
     name: Detect change scope
     runs-on: ubuntu-latest
     outputs:
-      runtime_changed: ${{ steps.scope.outputs.runtime_changed }}
-      unknown_changed: ${{ steps.scope.outputs.unknown_changed }}
+      scope: ${{ steps.scope.outputs.scope }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Detect change scope
+      - name: Classify changed files
         id: scope
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          NON_RUNTIME_PATTERNS=(
-            "AGENTS.md"
-            "CLAUDE.md"
-            ".claude/**"
-            ".trae/**"
-            ".cursor/**"
-            "README"
-            "README.*"
-            "**.md"
-            "**.mdx"
-            "docs/**"
-            "lmzj-docs/**"
-            "skills/**"
-            ".github/ISSUE_TEMPLATE/**"
-            ".github/pull_request_template.md"
-            ".github/labeler.yml"
-            ".github/labeler.yaml"
-            "scripts/ai_process_lint.py"
-            "scripts/verify_image_build_source.py"
-            "scripts/*audit*.py"
-          )
-          RELEASE_GOVERNANCE_PATTERNS=(
-            ".github/workflows/**"
-            "scripts/deploy-images.sh"
-            "docker-compose/**"
-          )
-          RUNTIME_PATTERNS=(
-            "gpustack/**"
-            "pack/**"
-            "Dockerfile"
-            "**/Dockerfile"
-            "docker-compose.yml"
-            "docker-compose.*.yml"
-            "requirements*.txt"
-            "pyproject.toml"
-            "poetry.lock"
-            "setup.py"
-            "setup.cfg"
-            "Makefile"
-          )
-
-          # Use GitHub API to list changed files (avoids merge-base issues)
-          CHANGED_FILES=$(
-            gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
-              --paginate --jq '.[].filename'
-          )
-
-          if [ -z "${CHANGED_FILES}" ]; then
-            echo "No changed files detected, defaulting to runtime_changed=true."
-            echo "runtime_changed=true" >> "${GITHUB_OUTPUT}"
-            echo "unknown_changed=true" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
-          runtime_changed="false"
-          unknown_changed="false"
-
-          while IFS= read -r file; do
-            [ -z "${file}" ] && continue
-
-            is_non_runtime="false"
-            for pattern in "${NON_RUNTIME_PATTERNS[@]}"; do
-              if [[ "${file}" == ${pattern} ]]; then
-                is_non_runtime="true"
-                break
-              fi
-            done
-
-            is_release_gov="false"
-            for pattern in "${RELEASE_GOVERNANCE_PATTERNS[@]}"; do
-              if [[ "${file}" == ${pattern} ]]; then
-                is_release_gov="true"
-                break
-              fi
-            done
-
-            is_runtime="false"
-            for pattern in "${RUNTIME_PATTERNS[@]}"; do
-              if [[ "${file}" == ${pattern} ]]; then
-                is_runtime="true"
-                break
-              fi
-            done
-
-            if [ "${is_runtime}" = "true" ]; then
-              runtime_changed="true"
-            elif [ "${is_non_runtime}" = "false" ] && [ "${is_release_gov}" = "false" ]; then
-              unknown_changed="true"
-            fi
-          done <<< "${CHANGED_FILES}"
-
-          echo "runtime_changed=${runtime_changed}" >> "${GITHUB_OUTPUT}"
-          echo "unknown_changed=${unknown_changed}" >> "${GITHUB_OUTPUT}"
+          # Include the old path of renamed files so moving a runtime file
+          # out of a runtime directory is still classified as runtime.
+          gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --paginate --jq '.[] | .filename, (.previous_filename // empty)' > changed-files.txt
+          python scripts/classify_change_scope.py --files-from changed-files.txt --github-output
 
   process-check:
     name: PR process lint
@@ -129,41 +41,74 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Validate PR process
-        run: python scripts/ai_process_lint.py --event-path "$GITHUB_EVENT_PATH" --target-branch dev
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/ai_process_lint.py \
+            --pr-number "${{ github.event.pull_request.number }}" \
+            --target-branch dev \
+            --scope "${{ needs.detect-change-scope.outputs.scope }}"
 
-  runtime-check:
-    name: Runtime validation
+  repo-checks:
+    name: Repository checks
     runs-on: ubuntu-latest
     needs: detect-change-scope
-    if: needs.detect-change-scope.outputs.runtime_changed == 'true' || needs.detect-change-scope.outputs.unknown_changed == 'true'
+    if: needs.detect-change-scope.outputs.scope != 'docs-only'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Compile release scripts
-        run: python -m compileall scripts
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
-      - name: Shellcheck deploy script
-        run: bash -n scripts/deploy-images.sh
+      - name: Process script tests
+        run: |
+          set -euo pipefail
+          python -m compileall -q scripts
+          bash -n scripts/deploy-images.sh
+          python -m unittest discover -s scripts/tests -v
+
+      - name: Lint changed files
+        run: |
+          set -euo pipefail
+          pip install --quiet pre-commit
+          pre-commit run --show-diff-on-failure \
+            --from-ref "${{ github.event.pull_request.base.sha }}" \
+            --to-ref "${{ github.event.pull_request.head.sha }}"
 
   pr-check:
     name: PR check passed
     runs-on: ubuntu-latest
-    needs: [detect-change-scope, process-check, runtime-check]
+    needs: [detect-change-scope, process-check, repo-checks]
     if: always()
     steps:
       - name: Evaluate results
+        env:
+          SCOPE: ${{ needs.detect-change-scope.outputs.scope }}
+          DETECT_RESULT: ${{ needs.detect-change-scope.result }}
+          PROCESS_RESULT: ${{ needs.process-check.result }}
+          REPO_RESULT: ${{ needs.repo-checks.result }}
         run: |
           set -euo pipefail
-          if [ "${{ needs.process-check.result }}" = "failure" ]; then
-            echo "Process check failed."
+          echo "scope=${SCOPE} detect=${DETECT_RESULT} process=${PROCESS_RESULT} repo=${REPO_RESULT}"
+          # Every job that should run must succeed; cancelled or unexpectedly
+          # skipped jobs fail this check instead of passing silently.
+          if [ "${DETECT_RESULT}" != "success" ]; then
+            echo "Change scope detection did not succeed." >&2
             exit 1
           fi
-          if [ "${{ needs.runtime-check.result }}" = "failure" ]; then
-            echo "Runtime check failed."
+          if [ "${PROCESS_RESULT}" != "success" ]; then
+            echo "PR process lint did not succeed." >&2
             exit 1
           fi
-          if [ "${{ needs.runtime-check.result }}" = "skipped" ]; then
-            echo "Runtime check skipped (non-runtime changes only)."
+          if [ "${REPO_RESULT}" = "skipped" ] && [ "${SCOPE}" = "docs-only" ]; then
+            echo "Repository checks skipped for docs-only change."
+          elif [ "${REPO_RESULT}" != "success" ]; then
+            echo "Repository checks did not succeed." >&2
+            exit 1
           fi
           echo "All PR checks passed."

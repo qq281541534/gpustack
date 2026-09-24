@@ -4,56 +4,28 @@ on:
   push:
     branches:
       - dev
-    paths-ignore:
-      - "AGENTS.md"
-      - "CLAUDE.md"
-      - ".claude/**"
-      - ".trae/**"
-      - ".cursor/**"
-      - "mkdocs.yml"
-      - "README"
-      - "README.*"
-      - "docs/**"
-      - "lmzj-docs/**"
-      - "skills/**"
-      - ".github/workflows/**"
-      - ".github/ISSUE_TEMPLATE/**"
-      - ".github/pull_request_template.md"
-      - ".github/labeler.yml"
-      - ".github/labeler.yaml"
-      - "scripts/ai_process_lint.py"
-      - "scripts/verify_image_build_source.py"
-      - "scripts/*audit*.py"
-      - "scripts/deploy-images.sh"
-      - "docker-compose/**"
-      - "**.md"
-      - "**.mdx"
-      - "**.png"
-      - "**.jpg"
-      - "**.gif"
   workflow_dispatch:
     inputs:
       backend_sha:
         description: "Full 40-character backend commit SHA from dev"
         required: true
-      frontend_ref:
-        description: "Frontend repository branch, tag, or full SHA"
-        required: true
-        default: "dev"
       push_image:
         description: "Push image to registry"
         type: boolean
         required: true
         default: true
       package_extras:
-        description: "Python package extras for the server image: audio for production slim, all for full runtime"
+        description: "Python package extras: audio = production slim (tag <sha>); others get tag <sha>-<extras> and are not deployable"
         required: true
         default: "audio"
 
 permissions:
   contents: read
   pull-requests: read
-  packages: write
+
+concurrency:
+  group: build-image-${{ github.event.inputs.backend_sha || github.sha }}-${{ github.event.inputs.package_extras || 'audio' }}
+  cancel-in-progress: false
 
 env:
   ACR_REGISTRY: ${{ vars.ACR_REGISTRY || 'registry.cn-chengdu.aliyuncs.com' }}
@@ -62,38 +34,65 @@ env:
   FRONTEND_REPOSITORY: ${{ vars.FRONTEND_REPOSITORY || 'qq281541534/gpustack-ui' }}
 
 jobs:
+  detect-change-scope:
+    name: Detect change scope
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    outputs:
+      needs_build: ${{ steps.scope.outputs.needs_build }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify pushed changes
+        id: scope
+        run: |
+          python scripts/classify_change_scope.py \
+            --base "${{ github.event.before }}" \
+            --head "${GITHUB_SHA}" \
+            --github-output
+
   build-image:
     name: Build immutable image
+    needs: detect-change-scope
+    if: ${{ !cancelled() && (github.event_name == 'workflow_dispatch' || needs.detect-change-scope.outputs.needs_build == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Resolve release SHA
+      - name: Resolve release identity
         id: release
         run: |
           set -euo pipefail
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
             sha="${{ github.event.inputs.backend_sha }}"
+            package_extras="${{ github.event.inputs.package_extras }}"
+            push_image="${{ github.event.inputs.push_image }}"
           else
             sha="${GITHUB_SHA}"
+            package_extras="audio"
+            push_image="true"
           fi
           if [[ ! "${sha}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "backend_sha must be a full 40-character lowercase git SHA." >&2
             exit 1
           fi
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            package_extras="${{ github.event.inputs.package_extras }}"
-          else
-            package_extras="audio"
-          fi
           case "${package_extras}" in
-            ""|audio|all|vllm) ;;
+            audio) tag="${sha}" ;;
+            ""|all|vllm) tag="${sha}-${package_extras:-none}" ;;
             *)
               echo "package_extras must be empty, audio, all, or vllm." >&2
               exit 1
               ;;
           esac
-          echo "sha=${sha}" >> "${GITHUB_OUTPUT}"
-          echo "package_extras=${package_extras}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "sha=${sha}"
+            echo "package_extras=${package_extras}"
+            echo "push_image=${push_image}"
+            echo "tag=${tag}"
+            echo "image=${ACR_REGISTRY}/${ACR_NAMESPACE}/${ACR_REPOSITORY}:${tag}"
+          } >> "${GITHUB_OUTPUT}"
 
       - name: Checkout GPUStack Backend
         uses: actions/checkout@v4
@@ -112,38 +111,16 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python scripts/verify_image_build_source.py --sha "${{ steps.release.outputs.sha }}" --base-branch dev
 
-      - name: Checkout GPUStack UI
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ env.FRONTEND_REPOSITORY }}
-          ref: ${{ github.event.inputs.frontend_ref || 'dev' }}
-          path: gpustack-ui
-
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: "pnpm"
-          cache-dependency-path: gpustack-ui/pnpm-lock.yaml
-
-      - name: Build Frontend
+      - name: Resolve pinned frontend commit
+        id: frontend
         run: |
           set -euo pipefail
-          cd gpustack-ui
-          pnpm install --frozen-lockfile
-          pnpm build
-
-      - name: Copy Frontend to Backend
-        run: |
-          set -euo pipefail
-          rm -rf gpustack/ui
-          mkdir -p gpustack/ui
-          cp -r gpustack-ui/dist/* gpustack/ui/
+          ref="$(grep -Ev '^[[:space:]]*(#|$)' pack/frontend-ref)"
+          if [[ ! "${ref}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "pack/frontend-ref must contain exactly one full 40-character SHA." >&2
+            exit 1
+          fi
+          echo "sha=${ref}" >> "${GITHUB_OUTPUT}"
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -153,35 +130,89 @@ jobs:
             env.BUILDKIT_STEP_LOG_MAX_SPEED=-1
 
       - name: Login to Aliyun ACR
-        if: ${{ github.event_name == 'push' || github.event.inputs.push_image == 'true' }}
+        if: steps.release.outputs.push_image == 'true'
         uses: docker/login-action@v3
         with:
           registry: ${{ env.ACR_REGISTRY }}
           username: ${{ secrets.ALIYUN_ACR_USERNAME }}
           password: ${{ secrets.ALIYUN_ACR_PASSWORD }}
 
-      - name: Docker Metadata
-        id: meta
-        uses: docker/metadata-action@v5
+      # Tags are immutable: an existing tag is reused, never overwritten.
+      - name: Check for existing image
+        id: existing
+        if: steps.release.outputs.push_image == 'true'
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+        run: |
+          set -euo pipefail
+          if output="$(docker buildx imagetools inspect "${IMAGE}" --format '{{json .Manifest}}' 2>&1)"; then
+            digest="$(jq -r '.digest' <<< "${output}")"
+            echo "Image ${IMAGE} already exists (${digest}); reusing it."
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            echo "digest=${digest}" >> "${GITHUB_OUTPUT}"
+          elif grep -qiE 'not found|manifest unknown|404' <<< "${output}"; then
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Cannot determine whether ${IMAGE} exists:" >&2
+            echo "${output}" >&2
+            exit 1
+          fi
+
+      - name: Checkout GPUStack UI
+        if: steps.existing.outputs.exists != 'true'
+        uses: actions/checkout@v4
         with:
-          images: ${{ env.ACR_REGISTRY }}/${{ env.ACR_NAMESPACE }}/${{ env.ACR_REPOSITORY }}
-          tags: |
-            type=raw,value=${{ steps.release.outputs.sha }}
-          labels: |
-            org.opencontainers.image.revision=${{ steps.release.outputs.sha }}
+          repository: ${{ env.FRONTEND_REPOSITORY }}
+          ref: ${{ steps.frontend.outputs.sha }}
+          path: gpustack-ui
+
+      - name: Setup pnpm
+        if: steps.existing.outputs.exists != 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        if: steps.existing.outputs.exists != 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: gpustack-ui/pnpm-lock.yaml
+
+      - name: Build Frontend
+        if: steps.existing.outputs.exists != 'true'
+        run: |
+          set -euo pipefail
+          cd gpustack-ui
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Copy Frontend to Backend
+        if: steps.existing.outputs.exists != 'true'
+        run: |
+          set -euo pipefail
+          rm -rf gpustack/ui
+          mkdir -p gpustack/ui
+          cp -r gpustack-ui/dist/* gpustack/ui/
 
       - name: Build and Push Docker Image
+        id: build
+        if: steps.existing.outputs.exists != 'true'
         uses: docker/build-push-action@v6
         with:
           context: .
           file: pack/Dockerfile
           platforms: linux/amd64
-          push: ${{ github.event_name == 'push' || github.event.inputs.push_image == 'true' }}
+          push: ${{ steps.release.outputs.push_image == 'true' }}
           # Aliyun ACR rejects buildx provenance attestation manifests
           # (unknown manifest class for application/vnd.oci.empty.v1+json).
           provenance: false
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.release.outputs.image }}
+          labels: |
+            org.opencontainers.image.revision=${{ steps.release.outputs.sha }}
+            ai.lmzj.frontend.revision=${{ steps.frontend.outputs.sha }}
+            ai.lmzj.package-extras=${{ steps.release.outputs.package_extras }}
           build-args: |
             UI_DOWNLOAD=true
             VERSION=0.0.0+${{ steps.release.outputs.sha }}
@@ -189,3 +220,22 @@ jobs:
             GPUSTACK_PACKAGE_EXTRAS=${{ steps.release.outputs.package_extras }}
           cache-from: type=gha,scope=gpustack-image-linux-amd64-${{ steps.release.outputs.package_extras || 'none' }}
           cache-to: type=gha,mode=max,scope=gpustack-image-linux-amd64-${{ steps.release.outputs.package_extras || 'none' }}
+
+      - name: Record image identity
+        env:
+          IMAGE: ${{ steps.release.outputs.image }}
+          DIGEST: ${{ steps.existing.outputs.digest || steps.build.outputs.digest }}
+          REUSED: ${{ steps.existing.outputs.exists == 'true' }}
+          PUSHED: ${{ steps.release.outputs.push_image }}
+          FRONTEND_SHA: ${{ steps.frontend.outputs.sha }}
+          PACKAGE_EXTRAS: ${{ steps.release.outputs.package_extras }}
+        run: |
+          {
+            echo "## Image"
+            echo
+            echo "- Image: \`${IMAGE}\`"
+            echo "- Digest: \`${DIGEST:-n/a}\`"
+            echo "- Pushed: ${PUSHED}; reused existing tag: ${REUSED}"
+            echo "- Frontend: \`${FRONTEND_REPOSITORY}@${FRONTEND_SHA}\`"
+            echo "- Package extras: \`${PACKAGE_EXTRAS:-none}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
