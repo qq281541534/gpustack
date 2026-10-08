@@ -14,6 +14,7 @@ HEALTHCHECK_BASE_URL="${HEALTHCHECK_BASE_URL:-http://127.0.0.1:8080}"
 CURRENT_TAG_FILE="${CURRENT_TAG_FILE:-.lmzj-current-image-tag}"
 EXPECTED_DIGEST="${EXPECTED_DIGEST:-}"
 MIN_FREE_GB="${MIN_FREE_GB:-10}"
+MIN_FREE_GB_AFTER_CLEANUP="${MIN_FREE_GB_AFTER_CLEANUP:-5}"
 
 if [[ ! "${IMAGE_TAG}" =~ ^[0-9a-f]{40}$ ]]; then
   echo "ERROR: image tag must be a full 40-character lowercase git SHA." >&2
@@ -52,8 +53,23 @@ docker_root="$(docker info --format '{{.DockerRootDir}}')"
 free_gb="$(df -Pk "${docker_root}" | awk 'NR==2 {print int($4 / 1024 / 1024)}')"
 echo "Free disk under ${docker_root}: ${free_gb} GiB (minimum ${MIN_FREE_GB} GiB)"
 if [[ "${free_gb}" -lt "${MIN_FREE_GB}" ]]; then
-  echo "ERROR: not enough free disk to pull ${image_ref}:${IMAGE_TAG}." >&2
-  exit 1
+  # Remove-first fallback (owner-authorized 2026-10-08, Issue #41): with the
+  # disk nearly full, stop and remove the server container and all local
+  # images of this repository before pulling. Registry keeps every SHA tag,
+  # so rollback remains possible by re-pulling. Volumes are never touched.
+  echo "Low disk: remove-first deploy (stop container, remove local ${image_ref} images)."
+  docker compose "${compose_args[@]}" stop gpustack-server >/dev/null 2>&1 || true
+  docker compose "${compose_args[@]}" rm -f gpustack-server >/dev/null 2>&1 || true
+  docker images --format '{{.Repository}}:{{.Tag}} {{.ID}}' \
+    | awk -v repo="${image_ref}" '$1 ~ "^" repo ":" {print $2}' \
+    | sort -u \
+    | xargs -r docker image rm >/dev/null || true
+  free_gb="$(df -Pk "${docker_root}" | awk 'NR==2 {print int($4 / 1024 / 1024)}')"
+  echo "Free disk after remove-first cleanup: ${free_gb} GiB (minimum ${MIN_FREE_GB_AFTER_CLEANUP} GiB)"
+  if [[ "${free_gb}" -lt "${MIN_FREE_GB_AFTER_CLEANUP}" ]]; then
+    echo "ERROR: not enough free disk to pull ${image_ref}:${IMAGE_TAG} even after remove-first cleanup." >&2
+    exit 1
+  fi
 fi
 
 echo "Deploying ${image_ref}:${IMAGE_TAG}"
